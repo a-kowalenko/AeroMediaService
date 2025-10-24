@@ -41,7 +41,7 @@ class EmailClient:
             msg['From'] = formataddr((sender_name, sender_addr))
             msg['To'] = to_recipient
             msg['Subject'] = subject
-            msg.attach(MIMEText(body, 'plain'))
+            msg.attach(MIMEText(body, 'html'))
 
             # Verbindung zum Server
             # Wir gehen von STARTTLS aus, was der Standard für Port 587 ist

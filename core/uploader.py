@@ -77,7 +77,7 @@ class UploaderThread(QThread):
                     self.email_client.send_upload_success_email(dir_name, share_link)
 
                 # 4. In Archiv-Ordner verschieben
-                self.archive_directory(local_dir_path, "archive")
+                self.archive_directory(local_dir_path, "erfolg")
 
                 signals.upload_status_update.emit(f"Erfolgreich: {dir_name}")
 
@@ -85,7 +85,7 @@ class UploaderThread(QThread):
                 self.log.error(f"Fehler bei der Verarbeitung von {local_dir_path}: {e}")
                 signals.upload_status_update.emit(f"Fehler: {dir_name}")
                 # 5. Bei Fehler in Fehler-Ordner verschieben
-                self.archive_directory(local_dir_path, "error")
+                self.archive_directory(local_dir_path, "fehler")
                 # 6. Fehler-E-Mail senden
                 self.email_client.send_upload_failure_email(dir_name, str(e))
 

@@ -1,4 +1,3 @@
-import os
 import sys
 import logging
 import queue
@@ -20,6 +19,7 @@ from core.uploader import UploaderThread
 from services.dropbox_client import DropboxClient
 from services.email_client import EmailClient
 from settings import SettingsDialog
+from utils.constants import ICON_PATH
 
 
 class MainWindow(QMainWindow):
@@ -35,8 +35,7 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 800, 600)
 
         # App-Icon laden
-        project_root = os.path.dirname(__file__)
-        icon_path = os.path.join(project_root, "assets", "icon.ico")
+        icon_path = ICON_PATH
         self.app_icon = QIcon(icon_path)
         self.setWindowIcon(self.app_icon)
 
