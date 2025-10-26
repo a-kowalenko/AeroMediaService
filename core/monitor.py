@@ -1,8 +1,11 @@
+import json
 import logging
 import os
 import time
 import shutil
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
+
+from models.kunde import Kunde
 
 
 class MonitorThread(QThread):
@@ -67,6 +70,31 @@ class MonitorThread(QThread):
                     if os.path.isdir(full_dir_path) and os.path.exists(marker_file_path):
                         self.log.info(f"Neues Verzeichnis gefunden: {dir_name}")
 
+                        # Ziehe Kundendaten aus Marker-Datei (optional)
+                        try:
+                            with open(marker_file_path, 'r', encoding='utf-8') as marker_file:
+                                kundendaten = marker_file.read().strip()
+                                self.log.debug(f"Kundendaten für '{dir_name}': {kundendaten}")
+                        except Exception as e:
+                            self.log.error(f"Fehler beim Lesen der Marker-Datei für '{dir_name}': {e}")
+
+                        # Parse Kundendaten in Kunde Object (optional)
+                        kunde = None
+                        if kundendaten:
+                            data = json.loads(kundendaten)
+                            kunde = Kunde(
+                                kunde_id=int(data.get('kunde_id')),
+                                email=str(data.get('email')),
+                                vorname=str(data.get('vorname')),
+                                nachname=str(data.get('nachname')),
+                                telefon=str(data.get('telefon')),
+                                foto=bool(data.get('foto')),
+                                video=bool(data.get('video'))
+                            )
+                            self.log.info(f"Kundendaten geparst für '{dir_name}': {kunde}")
+                        else:
+                            self.log.warning(f"Keine Kundendaten in Marker-Datei für '{dir_name}' gefunden.")
+
                         # Wir fügen den Pfad direkt zur Queue hinzu.
                         # Der Uploader ist dafür verantwortlich, ihn nach dem Upload zu verschieben.
                         # Um ein doppeltes Hinzufügen zu verhindern, benennen wir die Marker-Datei um.
@@ -75,7 +103,10 @@ class MonitorThread(QThread):
                             os.rename(marker_file_path, processing_marker_path)
 
                             # Verzeichnis zur Upload-Warteschlange hinzufügen
-                            self.upload_queue.put(full_dir_path)
+                            self.upload_queue.put({
+                                "dir_path": full_dir_path,
+                                "kunde": kunde
+                            })
                             self.log.info(f"'{dir_name}' zur Upload-Warteschlange hinzugefügt.")
                             found_items += 1
                         except OSError as e:

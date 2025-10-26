@@ -2,7 +2,8 @@ import logging
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
-    QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog
+    QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog,
+    QCheckBox  # HINZUGEFÜGT
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
@@ -14,7 +15,7 @@ from core.signals import signals
 class SettingsDialog(QDialog):
     """
     Der Einstellungsdialog, der dem Benutzer die Konfiguration
-    der Anwendung in Tabs (Allgemein, Dropbox, E-Mail) ermöglicht.
+    der Anwendung in Tabs (Allgemein, Dropbox, E-Mail, SMS) ermöglicht.
     """
 
     def __init__(self, config_manager: ConfigManager, client: BaseClient, parent=None):
@@ -35,6 +36,9 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.create_general_tab(), "Allgemein")
         self.tabs.addTab(self.create_cloud_tab(), "Cloud-Dienst")
         self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP)")
+        # --- NEUER TAB ---
+        self.tabs.addTab(self.create_sms_tab(), "SMS (Seven.io)")
+        # -----------------
 
         # Standard-Buttons (Speichern, Abbrechen)
         button_layout = QVBoxLayout()  # Eigener Layout-Container für Buttons
@@ -164,6 +168,34 @@ class SettingsDialog(QDialog):
 
         return widget
 
+    def create_sms_tab(self):
+        """Erstellt den Tab 'SMS (Seven.io)'."""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+
+        # API Key
+        self.sms_api_key_edit = QLineEdit()
+        self.sms_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addRow("Seven.io API Key:", self.sms_api_key_edit)
+
+        # Absender
+        self.sms_sender_edit = QLineEdit()
+        self.sms_sender_edit.setPlaceholderText("z.B. AERO oder +49...")
+        layout.addRow("Absender (max. 11 Zeichen):", self.sms_sender_edit)
+
+        # Sandbox-Modus
+        self.sms_sandbox_check = QCheckBox("Sandbox-Modus aktivieren (simuliert Versand, keine Kosten)")
+        layout.addRow("Test-Modus:", self.sms_sandbox_check)
+
+        # Link
+        api_link = QLabel('<a href="https://www.seven.io">seven.io Website (API-Keys)</a>')
+        api_link.setOpenExternalLinks(True)
+        layout.addRow("", api_link)
+
+        return widget
+
+    # --------------------
+
     # --- Hilfsfunktionen ---
 
     def create_path_widget(self, line_edit, button):
@@ -205,6 +237,15 @@ class SettingsDialog(QDialog):
         self.smtp_sender_name_edit.setText(self.config.get_setting("smtp_sender_name", "Dropbox Uploader"))
         self.smtp_fallback_recipient_edit.setText(self.config.get_setting("smtp_fallback_recipient"))
 
+        # SMS
+        self.sms_api_key_edit.setText(self.config.get_secret("seven_api_key"))
+        self.sms_sender_edit.setText(self.config.get_setting("seven_sender"))
+
+        # Sandbox-Modus (als String "true"/"false" gespeichert)
+        sandbox_mode_str = self.config.get_setting("seven_sandbox_mode", "false")
+        self.sms_sandbox_check.setChecked(sandbox_mode_str.lower() == "true")
+        # -----------------------
+
     def save_settings(self):
         """Speichert alle Einstellungen aus den GUI-Feldern im ConfigManager."""
         self.log.info("Speichere Einstellungen...")
@@ -226,6 +267,13 @@ class SettingsDialog(QDialog):
         self.config.save_setting("smtp_sender_addr", self.smtp_sender_addr_edit.text())
         self.config.save_setting("smtp_sender_name", self.smtp_sender_name_edit.text())
         self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
+
+        # SMS
+        self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
+        self.config.save_setting("seven_sender", self.sms_sender_edit.text())
+
+        sandbox_mode_str = "true" if self.sms_sandbox_check.isChecked() else "false"
+        self.config.save_setting("seven_sandbox_mode", sandbox_mode_str)
 
         self.log.info("Einstellungen gespeichert.")
         self.accept()  # Schließt den Dialog mit "OK"

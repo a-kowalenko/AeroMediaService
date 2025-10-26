@@ -251,7 +251,8 @@ class DropboxClient(BaseClient):
             return link.url
 
         except dropbox.exceptions.ApiError as e:
-            if e.error.is_shared_link_already_exists():
+            error_message = str(e)
+            if "shared_link_already_exists" in error_message:
                 self.log.warning("API-Fehler 'Link existiert bereits', versuche Abruf...")
                 try:
                     # Workaround: Manchmal schlägt der erste Check fehl

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import shutil
@@ -8,6 +9,7 @@ from PySide6.QtCore import QThread
 from core.config import ConfigManager
 from services.base_client import BaseClient
 from services.email_client import EmailClient
+from services.sms_client import SmsClient
 from core.signals import signals
 
 
@@ -18,12 +20,13 @@ class UploaderThread(QThread):
     """
 
     def __init__(self, config_manager: ConfigManager, upload_queue: queue.Queue, client: BaseClient,
-                 email_client: EmailClient):
+                 email_client: EmailClient, sms_client: SmsClient):
         super().__init__()
         self.config = config_manager
         self.upload_queue = upload_queue
         self.client = client
         self.email_client = email_client
+        self.sms_client = sms_client
         self.log = logging.getLogger('uploader')  # Spezieller Logger
 
         self._is_running = False
@@ -43,7 +46,10 @@ class UploaderThread(QThread):
         while self._is_running:
             try:
                 # Warte blockierend auf ein Item in der Queue
-                local_dir_path = self.upload_queue.get()
+                current_queue_item = self.upload_queue.get()
+                print('current_queue_item', current_queue_item)
+                local_dir_path = current_queue_item['dir_path']
+                kunde = current_queue_item['kunde']
 
                 if local_dir_path is None or not self._is_running:
                     # 'None' ist das Signal zum Beenden
@@ -74,7 +80,11 @@ class UploaderThread(QThread):
 
                 # 3. Erfolgs-E-Mail senden
                 if share_link:
-                    self.email_client.send_upload_success_email(dir_name, share_link)
+                    self.email_client.send_upload_success_email(dir_name, share_link, kunde.email)
+                    try:
+                        asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
+                    except Exception as sms_e:
+                        self.log.error(f"SMS-Versand für {kunde.vorname} {kunde.nachname} fehlgeschlagen: {sms_e}")
 
                 # 4. In Archiv-Ordner verschieben
                 self.archive_directory(local_dir_path, "erfolg")
