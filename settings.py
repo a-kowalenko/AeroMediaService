@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
     QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog,
-    QCheckBox  # HINZUGEFÜGT
+    QCheckBox
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
@@ -36,13 +36,11 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.create_general_tab(), "Allgemein")
         self.tabs.addTab(self.create_cloud_tab(), "Cloud-Dienst")
         self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP)")
-        # --- NEUER TAB ---
-        self.tabs.addTab(self.create_sms_tab(), "SMS (Seven.io)")
-        # -----------------
+        self.tabs.addTab(self.create_sms_tab(), "SMS-Dienst")  # Geändert
 
         # Standard-Buttons (Speichern, Abbrechen)
         button_layout = QVBoxLayout()  # Eigener Layout-Container für Buttons
-        self.save_button = QPushButton("Speichern & Übernehmen")
+        self.save_button = QPushButton("Speichern")
         self.save_button.clicked.connect(self.save_settings)
         button_layout.addWidget(self.save_button)
         main_layout.addLayout(button_layout)
@@ -129,6 +127,22 @@ class SettingsDialog(QDialog):
         self.dropbox_group.setLayout(db_layout)
         layout.addWidget(self.dropbox_group)
 
+        # --- SkyLink Shortener Einstellungen (NEUE GRUPPE) ---
+        self.skylink_group = QGroupBox("SkyLink API (Link Shortener)")
+        skylink_layout = QFormLayout()
+
+        self.skylink_url_edit = QLineEdit()
+        self.skylink_url_edit.setPlaceholderText("z.B. https://skydive.de/api/create")
+        skylink_layout.addRow("SkyLink API URL:", self.skylink_url_edit)
+
+        self.skylink_key_edit = QLineEdit()
+        self.skylink_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        skylink_layout.addRow("SkyLink API Key:", self.skylink_key_edit)
+
+        self.skylink_group.setLayout(skylink_layout)
+        layout.addWidget(self.skylink_group)
+        # --- ENDE ---
+
         # Initialen Status setzen
         self.update_dropbox_status()
         self.update_connect_button_state()
@@ -171,26 +185,58 @@ class SettingsDialog(QDialog):
     def create_sms_tab(self):
         """Erstellt den Tab 'SMS (Seven.io)'."""
         widget = QWidget()
-        layout = QFormLayout(widget)
+        # Hauptlayout ist QVBoxLayout, um Gruppen zu stapeln
+        layout = QVBoxLayout(widget)
 
-        # API Key
+        # --- Gruppe 1: SMS-Dienst auswählen ---
+        service_group = QGroupBox("SMS-Dienst auswählen")
+        service_layout = QVBoxLayout()
+
+        self.radio_seven = QRadioButton("Seven.io")
+        self.radio_seven.setChecked(True)  # Standard
+
+        self.sms_radio_group = QButtonGroup()
+        self.sms_radio_group.addButton(self.radio_seven)
+
+        service_layout.addWidget(self.radio_seven)
+        service_group.setLayout(service_layout)
+        layout.addWidget(service_group)
+
+        # --- Gruppe 2: Seven.io-Einstellungen ---
+        self.seven_group = QGroupBox("Seven.io-Einstellungen")
+        seven_layout = QFormLayout()
+
+        # API Key (Produktion)
         self.sms_api_key_edit = QLineEdit()
         self.sms_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("Seven.io API Key:", self.sms_api_key_edit)
+        seven_layout.addRow("Production API Key:", self.sms_api_key_edit)
+
+        # API Key (Sandbox)
+        self.sms_sandbox_api_key_edit = QLineEdit()
+        self.sms_sandbox_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        seven_layout.addRow("Sandbox API Key:", self.sms_sandbox_api_key_edit)
 
         # Absender
         self.sms_sender_edit = QLineEdit()
         self.sms_sender_edit.setPlaceholderText("z.B. AERO oder +49...")
-        layout.addRow("Absender (max. 11 Zeichen):", self.sms_sender_edit)
+        seven_layout.addRow("Absender (max. 11 Zeichen):", self.sms_sender_edit)
 
         # Sandbox-Modus
         self.sms_sandbox_check = QCheckBox("Sandbox-Modus aktivieren (simuliert Versand, keine Kosten)")
-        layout.addRow("Test-Modus:", self.sms_sandbox_check)
+        seven_layout.addRow("Test-Modus:", self.sms_sandbox_check)
 
         # Link
         api_link = QLabel('<a href="https://www.seven.io">seven.io Website (API-Keys)</a>')
         api_link.setOpenExternalLinks(True)
-        layout.addRow("", api_link)
+        seven_layout.addRow("", api_link)
+
+        self.seven_group.setLayout(seven_layout)
+        layout.addWidget(self.seven_group)
+
+        # TODO: Später hier Logik hinzufügen, um Gruppen basierend auf
+        # self.sms_radio_group Auswahl ein-/auszublenden
+
+        layout.addStretch(1) # Füllt den restlichen Platz nach unten auf
 
         return widget
 
@@ -228,6 +274,10 @@ class SettingsDialog(QDialog):
         self.db_app_key_edit.setText(self.config.get_secret("db_app_key"))
         self.db_app_secret_edit.setText(self.config.get_secret("db_app_secret"))
 
+        # SkyLink
+        self.skylink_url_edit.setText(self.config.get_secret("skylink_api_url"))
+        self.skylink_key_edit.setText(self.config.get_secret("skylink_api_key"))
+
         # E-Mail
         self.smtp_host_edit.setText(self.config.get_setting("smtp_host"))
         self.smtp_port_edit.setValue(int(self.config.get_setting("smtp_port", 587)))
@@ -239,6 +289,7 @@ class SettingsDialog(QDialog):
 
         # SMS
         self.sms_api_key_edit.setText(self.config.get_secret("seven_api_key"))
+        self.sms_sandbox_api_key_edit.setText(self.config.get_secret("seven_sandbox_api_key"))
         self.sms_sender_edit.setText(self.config.get_setting("seven_sender"))
 
         # Sandbox-Modus (als String "true"/"false" gespeichert)
@@ -259,6 +310,11 @@ class SettingsDialog(QDialog):
         self.config.save_secret("db_app_key", self.db_app_key_edit.text())
         self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
 
+        # SkyLink
+        # Wir verwenden save_secret, da der dropbox_uploader get_secret erwartet.
+        self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
+        self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
+
         # E-Mail
         self.config.save_setting("smtp_host", self.smtp_host_edit.text())
         self.config.save_setting("smtp_port", self.smtp_port_edit.value())
@@ -270,6 +326,7 @@ class SettingsDialog(QDialog):
 
         # SMS
         self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
+        self.config.save_secret("seven_sandbox_api_key", self.sms_sandbox_api_key_edit.text())
         self.config.save_setting("seven_sender", self.sms_sender_edit.text())
 
         sandbox_mode_str = "true" if self.sms_sandbox_check.isChecked() else "false"
@@ -354,3 +411,4 @@ class SettingsDialog(QDialog):
             return code.strip()
         else:
             return None
+

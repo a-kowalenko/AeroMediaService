@@ -21,21 +21,30 @@ class SmsClient:
 
         # Lade API-Einstellungen
         try:
-            # Wir verwenden simple Keys, analog zu "smtp_user" etc.
-            api_key = self.config.get_secret("seven_api_key")
-            sender = self.config.get_setting("seven_sender")
-
             # Sandbox-Modus aus Config lesen (standardmäßig 'false')
             sandbox_str = self.config.get_setting("seven_sandbox_mode", "false")
             sandbox = 1 if sandbox_str.lower() == 'true' else 0
             mode = "SANDBOX" if sandbox == 1 else "LIVE"
+
+            if sandbox == 1:
+                # Verwende den Sandbox-Key
+                api_key = self.config.get_secret("seven_sandbox_api_key")
+                self.log.debug("Verwende Seven.io Sandbox API Key.")
+            else:
+                # Verwende den Produktions-Key
+                api_key = self.config.get_secret("seven_api_key")
+                self.log.debug("Verwende Seven.io Production API Key.")
+
+            sender = self.config.get_setting("seven_sender")
 
         except Exception as e:
             self.log.error(f"Fehler beim Laden der SMS-Konfiguration: {e}")
             return False
 
         if not all([api_key, sender]):
-            self.log.error("SMS-Versand fehlgeschlagen: 'seven_api_key' oder 'seven_sender' unvollständig.")
+            # Logik angepasst, um den spezifischen Key-Namen anzuzeigen
+            key_name = "seven_sandbox_api_key" if sandbox == 1 else "seven_api_key"
+            self.log.error(f"SMS-Versand fehlgeschlagen: '{key_name}' oder 'seven_sender' unvollständig.")
             return False
 
         if not to_recipient:
@@ -104,4 +113,3 @@ class SmsClient:
 
         # Rufe die zentrale Versandmethode auf
         return await self.send_sms(phone_number, text)
-
