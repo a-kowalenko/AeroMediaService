@@ -73,7 +73,7 @@ class SmsClient:
 
                     if resp.status == 200:
                         self.log.info(
-                            f"({mode}) SMS an {to_recipient} erfolgreich verarbeitet. Response: {response_text[:80]}...")
+                            f"({mode}) SMS an {to_recipient} erfolgreich verarbeitet. Response: {response_text[:80]}{'...' if len(response_text) > 80 else ''}")
                         return True
                     else:
                         # Logge den API-Fehler

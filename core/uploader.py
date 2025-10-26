@@ -47,7 +47,7 @@ class UploaderThread(QThread):
             try:
                 # Warte blockierend auf ein Item in der Queue
                 current_queue_item = self.upload_queue.get()
-                print('current_queue_item', current_queue_item)
+                self.log.debug(f"current_queue_item: {current_queue_item}")
                 local_dir_path = current_queue_item['dir_path']
                 kunde = current_queue_item['kunde']
 

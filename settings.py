@@ -36,11 +36,11 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.create_general_tab(), "Allgemein")
         self.tabs.addTab(self.create_cloud_tab(), "Cloud-Dienst")
         self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP)")
-        self.tabs.addTab(self.create_sms_tab(), "SMS-Dienst")  # Geändert
+        self.tabs.addTab(self.create_sms_tab(), "SMS-Dienst")
 
         # Standard-Buttons (Speichern, Abbrechen)
         button_layout = QVBoxLayout()  # Eigener Layout-Container für Buttons
-        self.save_button = QPushButton("Speichern")
+        self.save_button = QPushButton("Speichern & Übernehmen")
         self.save_button.clicked.connect(self.save_settings)
         button_layout.addWidget(self.save_button)
         main_layout.addLayout(button_layout)
@@ -311,7 +311,7 @@ class SettingsDialog(QDialog):
         self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
 
         # SkyLink
-        # Wir verwenden save_secret, da der dropbox_uploader get_secret erwartet.
+        # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
         self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
         self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
 
