@@ -165,7 +165,6 @@ class SettingsDialog(QDialog):
 
         # Initialen Status setzen
         self.update_dropbox_status()
-        self.update_connect_button_state()
 
         return widget
 
@@ -284,7 +283,18 @@ class SettingsDialog(QDialog):
     def load_settings(self):
         """Lädt alle Einstellungen aus dem ConfigManager in die GUI-Felder."""
         self.log.debug("Lade Einstellungen in den Dialog...")
-        # Allgemein
+
+        # Signale der Cloud-Textfelder blockieren,
+        # um textChanged-Spam beim Laden zu verhindern.
+        try:
+            self.db_app_key_edit.blockSignals(True)
+            self.db_app_secret_edit.blockSignals(True)
+        except AttributeError:
+            # Passiert, wenn load_settings vor create_cloud_tab aufgerufen würde
+            self.log.warning("Cloud-Tab-Widgets noch nicht initialisiert beim Laden.")
+            pass
+
+            # Allgemein
         self.monitor_path_edit.setText(self.config.get_setting("monitor_path"))
         self.archive_path_edit.setText(self.config.get_setting("archive_path"))
         self.log_path_edit.setText(self.config.get_setting("log_file_path"))
@@ -315,7 +325,15 @@ class SettingsDialog(QDialog):
         # Sandbox-Modus (als String "true"/"false" gespeichert)
         sandbox_mode_str = self.config.get_setting("seven_sandbox_mode", "false")
         self.sms_sandbox_check.setChecked(sandbox_mode_str.lower() == "true")
+
         # -----------------------
+
+        # Signale wieder freigeben
+        try:
+            self.db_app_key_edit.blockSignals(False)
+            self.db_app_secret_edit.blockSignals(False)
+        except AttributeError:
+            pass  # Fehler wurde bereits geloggt
 
     def save_settings(self):
         """Speichert alle Einstellungen aus den GUI-Feldern im ConfigManager."""
@@ -363,11 +381,14 @@ class SettingsDialog(QDialog):
             self.config.save_setting("seven_sandbox_mode", sandbox_mode_str)
 
         finally:
+            # Signale in jedem Fall wieder freigeben
             try:
                 self.config.blockSignals(False)
             except AttributeError:
                 pass  # Fehler wurde bereits oben geloggt
 
+        # Das Signal manuell *einmal* auslösen,
+        # damit MainWindow.on_settings_changed() genau einmal aufgerufen wird.
         try:
             self.config.settings_changed.emit()
             self.log.info("Einstellungen gespeichert und Signal 'settings_changed' einmal ausgelöst.")
@@ -453,3 +474,4 @@ class SettingsDialog(QDialog):
             return code.strip()
         else:
             return None
+
