@@ -9,7 +9,6 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
 from core.config import ConfigManager
 from services.base_client import BaseClient
-from core.signals import signals
 
 
 class SettingsDialog(QDialog):
@@ -45,8 +44,11 @@ class SettingsDialog(QDialog):
         button_layout.addWidget(self.save_button)
         main_layout.addLayout(button_layout)
 
-        # Einstellungen laden, wenn der Dialog geöffnet wird
+        # 1. Einstellungen laden (blockiert Signale)
         self.load_settings()
+
+        # 2. Initialen Status setzen (fragt API 1x ab)
+        self.update_dropbox_status()
 
     # --- Tab-Erstellung ---
 
@@ -126,12 +128,16 @@ class SettingsDialog(QDialog):
         db_layout = QFormLayout()
 
         self.db_app_key_edit = QLineEdit()
-        self.db_app_key_edit.textChanged.connect(self.update_connect_button_state)
+
+        # Lambda stellt sicher, dass update_connect_button_state ohne Parameter (None) aufgerufen wird
+        self.db_app_key_edit.textChanged.connect(lambda: self.update_connect_button_state(is_connected=None))
         db_layout.addRow("App Key:", self.db_app_key_edit)
 
         self.db_app_secret_edit = QLineEdit()
         self.db_app_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.db_app_secret_edit.textChanged.connect(self.update_connect_button_state)
+
+        # Lambda stellt sicher, dass update_connect_button_state ohne Parameter (None) aufgerufen wird
+        self.db_app_secret_edit.textChanged.connect(lambda: self.update_connect_button_state(is_connected=None))
         db_layout.addRow("App Secret:", self.db_app_secret_edit)
 
         dev_console_link = QLabel(
@@ -162,9 +168,6 @@ class SettingsDialog(QDialog):
 
         self.skylink_group.setLayout(skylink_layout)
         layout.addWidget(self.skylink_group)
-
-        # Initialen Status setzen
-        self.update_dropbox_status()
 
         return widget
 
@@ -391,7 +394,7 @@ class SettingsDialog(QDialog):
         # damit MainWindow.on_settings_changed() genau einmal aufgerufen wird.
         try:
             self.config.settings_changed.emit()
-            self.log.info("Einstellungen gespeichert und Signal 'settings_changed' einmal ausgelöst.")
+            self.log.info("Einstellungen gespeichert.")
         except AttributeError:
             self.log.error("Konnte 'settings_changed' Signal nicht manuell auslösen. "
                            "Hauptfenster wurde nicht benachrichtigt.")
@@ -401,11 +404,16 @@ class SettingsDialog(QDialog):
     # --- Dropbox-Verbindungslogik ---
 
     def update_dropbox_status(self):
-        """Aktualisiert die GUI (Button-Text, Status-Label) basierend auf dem Client-Status."""
-        status = self.client.get_connection_status()
+        """
+        Aktualisiert die GUI und ruft update_connect_button_state
+        mit dem bereits abgerufenen Status auf.
+        """
+        status = self.client.get_connection_status()  # ERSTER UND EINZIGER AUFRUF
         self.db_status_label.setText(f"Status: {status}")
 
-        if status == "Verbunden":
+        is_connected = (status == "Verbunden")
+
+        if is_connected:
             self.db_connect_button.setText("Verbindung trennen")
             self.db_app_key_edit.setEnabled(False)
             self.db_app_secret_edit.setEnabled(False)
@@ -414,11 +422,18 @@ class SettingsDialog(QDialog):
             self.db_app_key_edit.setEnabled(True)
             self.db_app_secret_edit.setEnabled(True)
 
-        self.update_connect_button_state()
+        # Ruft die Helferfunktion mit dem Ergebnis auf, um zweiten API-Call zu vermeiden
+        self.update_connect_button_state(is_connected)
 
-    def update_connect_button_state(self):
-        """Aktiviert/Deaktiviert den 'Verbinden'-Button."""
-        is_connected = self.client.get_connection_status() == "Verbunden"
+    def update_connect_button_state(self, is_connected=None):
+        """
+        Akzeptiert einen optionalen Status, um API-Calls zu vermeiden.
+        Wenn 'is_connected' None ist (z.B. bei textChanged), wird der Status neu abgerufen.
+        """
+        if is_connected is None:
+            # Wird nur noch von textChanged aufgerufen, nicht mehr beim Start
+            is_connected = self.client.get_connection_status() == "Verbunden"
+
         if is_connected:
             self.db_connect_button.setEnabled(True)
         else:
