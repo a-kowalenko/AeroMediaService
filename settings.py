@@ -2,7 +2,8 @@ import logging
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
-    QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog
+    QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog,
+    QFrame
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
@@ -79,6 +80,27 @@ class SettingsDialog(QDialog):
         self.scan_interval_spin.setRange(5, 3600)
         self.scan_interval_spin.setSuffix(" Sekunden")
         layout.addRow("Scan-Intervall:", self.scan_interval_spin)
+
+        # Separator (horizontale Linie)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addRow(separator)
+
+        # Update-Button
+        self.update_check_button = QPushButton("Jetzt auf Updates prüfen")
+
+        # Verbinde mit der 'check_for_updates_manual'-Methode des Parent-Widgets (MainWindow)
+        if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
+            self.update_check_button.clicked.connect(self.parent().check_for_updates_manual)
+            # Optional: Dialog nach Klick schließen, damit man das Ergebnis sieht
+            self.update_check_button.clicked.connect(self.accept)
+        else:
+            # Fallback, falls die Methode nicht gefunden wird
+            self.update_check_button.setEnabled(False)
+            self.update_check_button.setToolTip("Konnte keine Update-Funktion im Hauptfenster finden.")
+
+        layout.addRow("Software-Update:", self.update_check_button)
 
         return widget
 
@@ -306,3 +328,4 @@ class SettingsDialog(QDialog):
             return code.strip()
         else:
             return None
+

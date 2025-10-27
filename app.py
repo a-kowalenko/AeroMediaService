@@ -5,7 +5,8 @@ import queue
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar
+    QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
+    QMessageBox
 )
 from PySide6.QtCore import QCoreApplication, QProcess, Slot
 
@@ -20,6 +21,7 @@ from services.dropbox_client import DropboxClient
 from services.email_client import EmailClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
+from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
 
 
 class MainWindow(QMainWindow):
@@ -58,6 +60,10 @@ class MainWindow(QMainWindow):
         # (Threads benötigen Config, Queue und Clients)
         self.monitor_thread = None  # Wird bei Bedarf gestartet
         self.uploader_thread = UploaderThread(self.config, self.upload_queue, self.db_client, self.email_client)
+
+        # --- Update-Worker ---
+        self.update_thread = None
+        self.update_worker = None
 
         # --- GUI Erstellen ---
         self.init_ui()
@@ -163,8 +169,8 @@ class MainWindow(QMainWindow):
 
     def auto_connect_and_start(self):
         """
-        Versucht beim Start, automatisch eine Verbindung herzustellen
-        und das Monitoring zu starten, wenn ein Token vorhanden ist.
+        Versucht beim Start, automatisch eine Verbindung herzustellen,
+        das Monitoring zu starten und auf Updates zu prüfen.
         """
         self.log.info("Prüfe auf Auto-Verbindung...")
         if self.config.get_secret("db_refresh_token"):
@@ -177,6 +183,9 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Automatische Verbindung fehlgeschlagen.")
         else:
             self.log.info("Keine gespeicherten Tokens, kein Auto-Start.")
+
+        self.log.info("Starte automatische Update-Prüfung im Hintergrund...")
+        initialize_updater(self, APP_VERSION, self.config, show_no_update_message=False)
 
     # --- Slot-Funktionen (Reaktionen auf Events) ---
 
@@ -319,5 +328,63 @@ class MainWindow(QMainWindow):
         self.uploader_thread.stop()
         self.uploader_thread.wait(5000)  # Warte max 5 Sek.
 
+        # Sicherstellen, dass der Update-Thread auch beendet wird
+        if self.update_thread and self.update_thread.isRunning():
+            self.log.debug("Stoppe Update-Thread...")
+            self.update_thread.quit()
+            self.update_thread.wait(1000)
+
         self.log.info("Auf Wiedersehen!")
         event.accept()
+
+
+    @Slot()
+    def check_for_updates_manual(self):
+        """Startet die manuelle Update-Prüfung (mit Feedback)."""
+        self.log.info("Manuelle Update-Prüfung wird gestartet...")
+        self.status_label.setText("Suche nach Updates...")
+        initialize_updater(self, APP_VERSION, self.config, show_no_update_message=True)
+
+    @Slot(str, str, str)
+    def on_update_available(self, latest_version, release_notes, installer_url):
+        """Slot, der aufgerufen wird, wenn ein Update gefunden wurde."""
+        self.log.info(f"Update verfügbar: {latest_version}")
+        self.status_label.setText(f"Update auf Version {latest_version} verfügbar!")
+
+        # Stoppe Monitoring, um Konflikte zu vermeiden
+        if self.monitor_thread and self.monitor_thread.isRunning():
+            self.log.warning("Update gefunden. Stoppe Monitoring temporär.")
+            self.stop_monitoring()
+
+        dialog = AskUpdateDialog(self, APP_VERSION, latest_version, release_notes, self.config)
+
+        if dialog.exec():
+            # Benutzer hat "Jetzt aktualisieren" gewählt
+            self.log.info("Starte Download des Updates...")
+            progress_dialog = UpdateProgressDialog(self, installer_url)
+            progress_dialog.exec()
+            # Die App wird durch den Progress-Dialog beendet, wenn 'EXIT_APP' kommt
+        else:
+            # Benutzer hat "Später" gewählt
+            self.log.info("Update auf 'Später' verschoben.")
+            self.status_label.setText("Bereit.")
+
+    @Slot(str)
+    def on_no_update(self, message):
+        """Slot, der aufgerufen wird, wenn kein Update verfügbar ist."""
+        self.log.info(f"Update-Prüfung: {message}")
+        self.status_label.setText("Bereit.")
+        # Zeige Feedback nur bei manueller Prüfung
+        if self.sender() and self.sender().show_no_update_message:
+            QMessageBox.information(self, "Update-Prüfung", message)
+
+    @Slot(str)
+    def on_update_error(self, message):
+        """Slot, der bei einem Fehler der Update-Prüfung aufgerufen wird."""
+        self.log.error(f"Fehler bei Update-Prüfung: {message}")
+        self.status_label.setText("Update-Prüfung fehlgeschlagen.")
+        # Zeige Feedback nur bei manueller Prüfung
+        if self.sender() and self.sender().show_no_update_message:
+            QMessageBox.critical(self, "Update-Fehler", message)
+
+

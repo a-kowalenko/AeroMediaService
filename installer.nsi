@@ -1,7 +1,8 @@
 ﻿; --- NSIS Installer Skript für Aero Media Service ---
 
 !define APP_NAME "Aero Media Service"
-!define APP_VERSION "0.0.1.1337"
+# Liest die Version direkt aus der Textdatei
+!define /file APP_VERSION "VERSION.txt"
 !define APP_EXE "Aero Media Service.exe"
 !define APP_PUBLISHER "Andreas Kowalenko"
 !define APP_WEBSITE "kowalenko.io"
@@ -68,7 +69,7 @@ VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 Section "Aero Media Service (erforderlich)" SecApp
   SetOutPath $INSTDIR
 
-  ; HIER PASSIERT DIE MAGIE (NEU):
+  ; HIER PASSIERT DIE MAGIE:
   ; 1. Kopiere den gesamten Inhalt des PyInstaller-Ordners
   ; Dies kopiert Aero Media Service.exe und alle Python-DLLs/Abhängigkeiten
   File /r "dist\Aero Media Service\*"
@@ -130,15 +131,29 @@ SectionEnd
 
 Function .onInstSuccess
     IfFileExists "$INSTDIR\${APP_EXE}" installed missing
+
     installed:
+        DetailPrint "${APP_NAME} wurde installiert."
+
+        ; --- App nach Silent-Update neu starten ---
+        ; Prüft, ob der Installer im Silent-Modus (/S) aufgerufen wurde.
+        IfSilent silent_restart
+        Goto not_silent ; Nicht-silent, also nicht neustarten
+
+        silent_restart:
+            DetailPrint "Starte ${APP_NAME} nach Update neu..."
+            Exec '"$INSTDIR\${APP_EXE}"'
+
+        not_silent:
+
         Return
+
     missing:
         MessageBox MB_ICONEXCLAMATION "Warnung: Die Hauptanwendung wurde möglicherweise nicht korrekt installiert."
 FunctionEnd
 
 Function .onInit
     ; Prüfe auf bereits laufende Instanzen der App (robust, sprachunabhängig)
-    ; wir verwenden cmd /C mit findstr: wenn der Prozess gefunden wird, gibt findstr eine Zeile aus
     nsExec::ExecToStack 'cmd /C tasklist /FI "IMAGENAME eq ${APP_EXE}" | findstr /I /C:"${APP_EXE}"'
     Pop $0
     Pop $1
@@ -146,17 +161,30 @@ Function .onInit
     StrCmp $1 "" continue_install found_running
 
     found_running:
-        MessageBox MB_YESNO|MB_ICONEXCLAMATION \
-            "${APP_NAME} scheint bereits zu laufen.$\r$\nBitte beenden Sie die Anwendung vor der Installation.$\r$\n$\r$\nJetzt beenden und fortfahren?" \
-            /SD IDYES IDYES kill_app IDNO cancel_install
+        ; Läuft der Installer silent? (d.h. als Update)
+        IfSilent silent_kill normal_kill
 
-        kill_app:
+        silent_kill:
+            ; Im Silent-Modus (Update): App einfach beenden, nicht fragen.
+            ; Der Updater hat die App bereits beendet, dies ist ein Fallback.
             nsExec::Exec 'taskkill /F /IM "${APP_EXE}"'
             Sleep 2000
             Goto continue_install
 
-        cancel_install:
-            Abort
+        normal_kill:
+            ; Normaler Modus (Manuelle Installation): Benutzer fragen.
+            MessageBox MB_YESNO|MB_ICONEXCLAMATION \
+                "${APP_NAME} scheint bereits zu laufen.$\r$\nBitte beenden Sie die Anwendung vor der Installation.$\r$\n$\r$\nJetzt beenden und fortfahren?" \
+                /SD IDYES IDYES kill_app IDNO cancel_install
+
+            kill_app:
+                nsExec::Exec 'taskkill /F /IM "${APP_EXE}"'
+                Sleep 2000
+                Goto continue_install
+
+            cancel_install:
+                Abort
 
     continue_install:
 FunctionEnd
+
