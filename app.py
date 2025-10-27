@@ -2,13 +2,15 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon
+# MODIFIZIERT: QPainter, QColor für das Ampellicht hinzugefügt
+from PySide6.QtGui import QIcon, QPainter, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
     QMessageBox
 )
-from PySide6.QtCore import QCoreApplication, QProcess, Slot
+# MODIFIZIERT: QCoreApplication, QProcess, Slot, QSize, Qt hinzugefügt
+from PySide6.QtCore import QCoreApplication, QProcess, Slot, QSize, Qt
 
 # Importiere alle Komponenten des Projekts
 from core import APP_VERSION
@@ -23,6 +25,42 @@ from services.sms_client import SmsClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
 from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
+
+
+
+class StatusLight(QWidget):
+    """
+    Ein einfacher runder Indikator (Ampellicht), der die Farbe ändern kann.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)  # Feste Größe für das Licht
+        self._color = QColor(Qt.GlobalColor.red)  # Standardmäßig rot (keine Verbindung)
+
+    def paintEvent(self, event):
+        """Zeichnet den farbigen Kreis."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)  # Kantenglättung
+        painter.setBrush(self._color)
+        painter.setPen(Qt.GlobalColor.transparent)  # Kein Rand
+
+        # Berechne den Radius und das Zentrum
+        radius = min(self.width(), self.height()) / 2.0
+        center = self.rect().center()
+
+        painter.drawEllipse(center, radius, radius)
+
+    def setColor(self, color):
+        """Setzt die Farbe des Lichts und zeichnet es neu."""
+        if isinstance(color, str):
+            self._color = QColor(color)
+        elif isinstance(color, QColor):
+            self._color = color
+        else:
+            self._color = QColor(Qt.GlobalColor.gray)  # Fallback
+
+        self.update()  # Löst ein paintEvent aus
 
 
 class MainWindow(QMainWindow):
@@ -61,11 +99,19 @@ class MainWindow(QMainWindow):
         # --- Worker-Threads ---
         # (Threads benötigen Config, Queue und Clients)
         self.monitor_thread = None  # Wird bei Bedarf gestartet
-        self.uploader_thread = UploaderThread(self.config, self.upload_queue, self.db_client, self.email_client, self.sms_client)
+        self.uploader_thread = UploaderThread(self.config,
+                                              self.upload_queue,
+                                              self.db_client,
+                                              self.email_client,
+                                              self.sms_client)
 
         # --- Update-Worker ---
         self.update_thread = None
         self.update_worker = None
+
+        # --- GUI-Komponenten (Platzhalter) ---
+        self.status_light = None
+        self.monitor_button = None
 
         # --- GUI Erstellen ---
         self.init_ui()
@@ -89,9 +135,14 @@ class MainWindow(QMainWindow):
 
         # 1. Button-Leiste (oben)
         button_layout = QHBoxLayout()
+
         self.monitor_button = QPushButton("Monitoring starten")
         self.monitor_button.setCheckable(True)  # Macht ihn zu einem Toggle-Button
         self.monitor_button.clicked.connect(self.toggle_monitoring)
+
+        self.status_light = StatusLight(self)
+        self.status_light.setToolTip(
+            "Status:\nRot: Nicht verbunden\nGelb: Verbunden, Monitoring aus\nGrün: Verbunden, Monitoring aktiv")
 
         self.settings_button = QPushButton("Einstellungen")
         self.settings_button.clicked.connect(self.open_settings)
@@ -100,6 +151,7 @@ class MainWindow(QMainWindow):
         self.restart_button.clicked.connect(self.restart_app)
 
         button_layout.addWidget(self.monitor_button)
+        button_layout.addWidget(self.status_light)
         button_layout.addStretch()
         button_layout.addWidget(self.settings_button)
         button_layout.addWidget(self.restart_button)
@@ -163,7 +215,10 @@ class MainWindow(QMainWindow):
         signals.upload_progress_total.connect(self.update_total_progress)
         signals.upload_status_update.connect(self.status_label.setText)
         signals.monitoring_status_changed.connect(self.update_monitoring_status)
+
         signals.connection_status_changed.connect(self.connection_status_label.setText)
+        signals.connection_status_changed.connect(self.update_status_light)
+
         signals.stop_monitoring.connect(self.stop_monitoring)
 
         # Einstellungsänderungen abfangen
@@ -188,6 +243,8 @@ class MainWindow(QMainWindow):
 
         self.log.info("Starte automatische Update-Prüfung im Hintergrund...")
         initialize_updater(self, APP_VERSION, self.config, show_no_update_message=False)
+
+        self.update_status_light()
 
     # --- Slot-Funktionen (Reaktionen auf Events) ---
 
@@ -218,6 +275,30 @@ class MainWindow(QMainWindow):
             self.monitor_button.setText("Monitoring starten")
             self.status_label.setText("Überwachung gestoppt.")
 
+        # NEU: Ampelstatus nach jeder Monitoring-Änderung aktualisieren
+        self.update_status_light()
+
+    @Slot()
+    def update_status_light(self):
+        """
+        Aktualisiert die Farbe der Status-Ampel basierend auf
+        Verbindungs- und Monitoring-Status.
+        """
+        if not self.status_light:  # Sicherstellen, dass die UI initialisiert ist
+            return
+
+        # Status abfragen
+        is_connected = (self.db_client.get_connection_status() == "Verbunden")
+        is_monitoring = (self.monitor_button and self.monitor_button.isChecked())
+
+        # Logik für die Ampel
+        if not is_connected:
+            self.status_light.setColor("red")  # Rot: Keine Verbindung
+        elif is_connected and not is_monitoring:
+            self.status_light.setColor("yellow")  # Gelb: Verbunden, aber Monitoring aus
+        elif is_connected and is_monitoring:
+            self.status_light.setColor("green")  # Grün: Verbunden und Monitoring aktiv
+
     @Slot()
     def on_settings_changed(self):
         """Wird aufgerufen, wenn Einstellungen gespeichert wurden."""
@@ -230,7 +311,7 @@ class MainWindow(QMainWindow):
 
         # Logging neu konfigurieren, falls sich der Pfad geändert hat
         # (Einfacher Ansatz: Logging beim Start konfigurieren.
-        # Für dynamische Änderung wäre mehr Aufwand nötig, z.B. Handler entfernen/hinzufügen)
+        # Für dynamische Änderung wäre mehr Aufwand nötig, z.B. Handler entfernen/hinzufügen)
         self.log.warning("Log-Pfad-Änderungen erfordern einen Neustart.")
 
     @Slot()
@@ -339,7 +420,6 @@ class MainWindow(QMainWindow):
         self.log.info("Auf Wiedersehen!")
         event.accept()
 
-
     @Slot()
     def check_for_updates_manual(self):
         """Startet die manuelle Update-Prüfung (mit Feedback)."""
@@ -388,5 +468,3 @@ class MainWindow(QMainWindow):
         # Zeige Feedback nur bei manueller Prüfung
         if self.sender() and self.sender().show_no_update_message:
             QMessageBox.critical(self, "Update-Fehler", message)
-
-
