@@ -98,8 +98,6 @@ class UpdateCheckWorker(QObject):
                 message_text = ""
                 if is_new_version and is_ignored and not is_manual_check:
                     message_text = f"Version {latest_version_str} ist verfügbar, wurde aber ignoriert."
-                elif not is_new_version:
-                    message_text = f"Sie haben bereits die neueste Version ({self.app_version})."
                 else:
                     message_text = f"Sie haben bereits die neueste Version ({self.app_version})."
 
