@@ -19,6 +19,7 @@ from core.monitor import MonitorThread
 from core.uploader import UploaderThread
 from services.dropbox_client import DropboxClient
 from services.email_client import EmailClient
+from services.sms_client import SmsClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
 from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
@@ -55,11 +56,12 @@ class MainWindow(QMainWindow):
         # (Clients benötigen ConfigManager)
         self.db_client = DropboxClient(self.config)
         self.email_client = EmailClient(self.config)
+        self.sms_client = SmsClient(self.config)
 
         # --- Worker-Threads ---
         # (Threads benötigen Config, Queue und Clients)
         self.monitor_thread = None  # Wird bei Bedarf gestartet
-        self.uploader_thread = UploaderThread(self.config, self.upload_queue, self.db_client, self.email_client)
+        self.uploader_thread = UploaderThread(self.config, self.upload_queue, self.db_client, self.email_client, self.sms_client)
 
         # --- Update-Worker ---
         self.update_thread = None
