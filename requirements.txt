@@ -3,3 +3,4 @@ aiohttp
 PySide6
 dropbox
 keyring
+packaging

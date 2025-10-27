@@ -6,10 +6,9 @@ from PySide6.QtWidgets import (
     QCheckBox
 )
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Slot
 from core.config import ConfigManager
 from services.base_client import BaseClient
-from core.signals import signals
 
 
 class SettingsDialog(QDialog):
@@ -18,7 +17,8 @@ class SettingsDialog(QDialog):
     der Anwendung in Tabs (Allgemein, Dropbox, E-Mail, SMS) ermöglicht.
     """
 
-    def __init__(self, config_manager: ConfigManager, client: BaseClient, parent=None):
+    def __init__(self, config_manager: ConfigManager, client: BaseClient,
+                 app_version: str, latest_version_info: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Einstellungen")
         self.setMinimumWidth(500)
@@ -26,6 +26,10 @@ class SettingsDialog(QDialog):
         self.config = config_manager
         self.client = client
         self.log = logging.getLogger(__name__)
+
+        # Versionsinformationen speichern
+        self.app_version = app_version
+        self.latest_version_info = latest_version_info or "Noch nicht geprüft."
 
         # Hauptlayout
         main_layout = QVBoxLayout(self)
@@ -45,42 +49,79 @@ class SettingsDialog(QDialog):
         button_layout.addWidget(self.save_button)
         main_layout.addLayout(button_layout)
 
-        # Einstellungen laden, wenn der Dialog geöffnet wird
+        # 1. Einstellungen laden (blockiert Signale)
         self.load_settings()
+
+        # 2. Initialen Status setzen (fragt API 1x ab)
+        self.update_dropbox_status()
 
     # --- Tab-Erstellung ---
 
     def create_general_tab(self):
         """Erstellt den Tab 'Allgemein'."""
         widget = QWidget()
-        layout = QFormLayout(widget)
-        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        layout = QVBoxLayout(widget)
+
+        # --- Gruppe 1: Überwachungs-Einstellungen ---
+        monitor_group = QGroupBox("Überwachungs-Einstellungen")
+        monitor_layout = QFormLayout(monitor_group)
+        monitor_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         # Überwachungsordner
         self.monitor_path_edit = QLineEdit()
         self.monitor_path_button = QPushButton("Durchsuchen...")
         self.monitor_path_button.clicked.connect(lambda: self.select_directory(self.monitor_path_edit))
-        layout.addRow("Zu überwachender Ordner:",
-                      self.create_path_widget(self.monitor_path_edit, self.monitor_path_button))
+        monitor_layout.addRow("Zu überwachender Ordner:",
+                              self.create_path_widget(self.monitor_path_edit, self.monitor_path_button))
 
         # Archivordner
         self.archive_path_edit = QLineEdit()
         self.archive_path_button = QPushButton("Durchsuchen...")
         self.archive_path_button.clicked.connect(lambda: self.select_directory(self.archive_path_edit))
-        layout.addRow("Archiv-Ordner (für 'erfolgreich' / 'fehler'):",
-                      self.create_path_widget(self.archive_path_edit, self.archive_path_button))
+        monitor_layout.addRow("Archiv-Ordner (für 'erfolgreich' / 'fehler'):",
+                              self.create_path_widget(self.archive_path_edit, self.archive_path_button))
 
         # Log-Ordner
         self.log_path_edit = QLineEdit()
         self.log_path_button = QPushButton("Durchsuchen...")
         self.log_path_button.clicked.connect(lambda: self.select_directory(self.log_path_edit))
-        layout.addRow("Log-Datei-Ordner:", self.create_path_widget(self.log_path_edit, self.log_path_button))
+        monitor_layout.addRow("Log-Datei-Ordner:", self.create_path_widget(self.log_path_edit, self.log_path_button))
 
         # Scan-Intervall
         self.scan_interval_spin = QSpinBox()
         self.scan_interval_spin.setRange(5, 3600)
         self.scan_interval_spin.setSuffix(" Sekunden")
-        layout.addRow("Scan-Intervall:", self.scan_interval_spin)
+        monitor_layout.addRow("Scan-Intervall:", self.scan_interval_spin)
+
+        layout.addWidget(monitor_group)
+
+        # --- Gruppe 2: Software-Update ---
+        update_group = QGroupBox("Software-Update")
+        update_layout = QFormLayout(update_group)  # QFormLayout, damit der Button eine ganze Zeile einnimmt
+
+        # Aktuelle Version anzeigen
+        self.current_version_label = QLabel(f"Aktuell installierte Version: <b>{self.app_version}</b>")
+        update_layout.addRow(self.current_version_label)
+
+        # Letzten bekannten Update-Status anzeigen
+        self.update_status_label = QLabel(f"Update-Status: <b>{self.latest_version_info}</b>")
+        update_layout.addRow(self.update_status_label)
+
+        # Update-Button
+        self.update_check_button = QPushButton("Jetzt auf Updates prüfen")
+
+        # Verbinde mit der 'check_for_updates_manual'-Methode des Parent-Widgets (MainWindow)
+        if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
+            self.update_check_button.clicked.connect(self.on_check_for_updates_clicked)
+        else:
+            # Fallback, falls die Methode nicht gefunden wird
+            self.update_check_button.setEnabled(False)
+            self.update_check_button.setToolTip("Konnte keine Update-Funktion im Hauptfenster finden.")
+
+        update_layout.addRow(self.update_check_button)
+        layout.addWidget(update_group)
+
+        layout.addStretch(1)  # Schiebt alles nach oben
 
         return widget
 
@@ -105,12 +146,16 @@ class SettingsDialog(QDialog):
         db_layout = QFormLayout()
 
         self.db_app_key_edit = QLineEdit()
-        self.db_app_key_edit.textChanged.connect(self.update_connect_button_state)
+
+        # Lambda stellt sicher, dass update_connect_button_state ohne Parameter (None) aufgerufen wird
+        self.db_app_key_edit.textChanged.connect(lambda: self.update_connect_button_state(is_connected=None))
         db_layout.addRow("App Key:", self.db_app_key_edit)
 
         self.db_app_secret_edit = QLineEdit()
         self.db_app_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.db_app_secret_edit.textChanged.connect(self.update_connect_button_state)
+
+        # Lambda stellt sicher, dass update_connect_button_state ohne Parameter (None) aufgerufen wird
+        self.db_app_secret_edit.textChanged.connect(lambda: self.update_connect_button_state(is_connected=None))
         db_layout.addRow("App Secret:", self.db_app_secret_edit)
 
         dev_console_link = QLabel(
@@ -127,7 +172,7 @@ class SettingsDialog(QDialog):
         self.dropbox_group.setLayout(db_layout)
         layout.addWidget(self.dropbox_group)
 
-        # --- SkyLink Shortener Einstellungen (NEUE GRUPPE) ---
+        # --- SkyLink Shortener Einstellungen ---
         self.skylink_group = QGroupBox("SkyLink API (Link Shortener)")
         skylink_layout = QFormLayout()
 
@@ -141,51 +186,59 @@ class SettingsDialog(QDialog):
 
         self.skylink_group.setLayout(skylink_layout)
         layout.addWidget(self.skylink_group)
-        # --- ENDE ---
 
-        # Initialen Status setzen
-        self.update_dropbox_status()
-        self.update_connect_button_state()
+        layout.addStretch(1)  # Schiebt alles nach oben
 
         return widget
 
     def create_email_tab(self):
         """Erstellt den Tab 'E-Mail (SMTP)'."""
         widget = QWidget()
-        layout = QFormLayout(widget)
+        layout = QVBoxLayout(widget)
+
+        # --- Gruppe 1: SMTP-Server-Verbindung ---
+        conn_group = QGroupBox("SMTP-Server-Verbindung")
+        conn_layout = QFormLayout(conn_group)
 
         self.smtp_host_edit = QLineEdit()
-        layout.addRow("SMTP-Host:", self.smtp_host_edit)
+        conn_layout.addRow("SMTP-Host:", self.smtp_host_edit)
 
         self.smtp_port_edit = QSpinBox()
         self.smtp_port_edit.setRange(1, 65535)
         self.smtp_port_edit.setValue(587)
-        layout.addRow("SMTP-Port:", self.smtp_port_edit)
+        conn_layout.addRow("SMTP-Port:", self.smtp_port_edit)
 
         self.smtp_user_edit = QLineEdit()
-        layout.addRow("Benutzername:", self.smtp_user_edit)
+        conn_layout.addRow("Benutzername:", self.smtp_user_edit)
 
         self.smtp_pass_edit = QLineEdit()
         self.smtp_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("Passwort:", self.smtp_pass_edit)
+        conn_layout.addRow("Passwort:", self.smtp_pass_edit)
 
-        layout.addRow(QLabel("---"))
+        layout.addWidget(conn_group)
+
+        # --- Gruppe 2: Absender-Konfiguration ---
+        sender_group = QGroupBox("Absender-Konfiguration")
+        sender_layout = QFormLayout(sender_group)
 
         self.smtp_sender_addr_edit = QLineEdit()
-        layout.addRow("Absender-Adresse:", self.smtp_sender_addr_edit)
+        sender_layout.addRow("Absender-Adresse:", self.smtp_sender_addr_edit)
 
         self.smtp_sender_name_edit = QLineEdit()
-        layout.addRow("Absender-Name:", self.smtp_sender_name_edit)
+        sender_layout.addRow("Absender-Name:", self.smtp_sender_name_edit)
 
         self.smtp_fallback_recipient_edit = QLineEdit()
-        layout.addRow("Fallback-Empfänger (für Status-Mails):", self.smtp_fallback_recipient_edit)
+        sender_layout.addRow("Fallback-Empfänger (für Status-Mails):", self.smtp_fallback_recipient_edit)
+
+        layout.addWidget(sender_group)
+
+        layout.addStretch(1)  # Schiebt alles nach oben
 
         return widget
 
     def create_sms_tab(self):
         """Erstellt den Tab 'SMS (Seven.io)'."""
         widget = QWidget()
-        # Hauptlayout ist QVBoxLayout, um Gruppen zu stapeln
         layout = QVBoxLayout(widget)
 
         # --- Gruppe 1: SMS-Dienst auswählen ---
@@ -233,10 +286,7 @@ class SettingsDialog(QDialog):
         self.seven_group.setLayout(seven_layout)
         layout.addWidget(self.seven_group)
 
-        # TODO: Später hier Logik hinzufügen, um Gruppen basierend auf
-        # self.sms_radio_group Auswahl ein-/auszublenden
-
-        layout.addStretch(1) # Füllt den restlichen Platz nach unten auf
+        layout.addStretch(1)  # Füllt den restlichen Platz nach unten auf
 
         return widget
 
@@ -264,7 +314,18 @@ class SettingsDialog(QDialog):
     def load_settings(self):
         """Lädt alle Einstellungen aus dem ConfigManager in die GUI-Felder."""
         self.log.debug("Lade Einstellungen in den Dialog...")
-        # Allgemein
+
+        # Signale der Cloud-Textfelder blockieren,
+        # um textChanged-Spam beim Laden zu verhindern.
+        try:
+            self.db_app_key_edit.blockSignals(True)
+            self.db_app_secret_edit.blockSignals(True)
+        except AttributeError:
+            # Passiert, wenn load_settings vor create_cloud_tab aufgerufen würde
+            self.log.warning("Cloud-Tab-Widgets noch nicht initialisiert beim Laden.")
+            pass
+
+            # Allgemein
         self.monitor_path_edit.setText(self.config.get_setting("monitor_path"))
         self.archive_path_edit.setText(self.config.get_setting("archive_path"))
         self.log_path_edit.setText(self.config.get_setting("log_file_path"))
@@ -295,54 +356,92 @@ class SettingsDialog(QDialog):
         # Sandbox-Modus (als String "true"/"false" gespeichert)
         sandbox_mode_str = self.config.get_setting("seven_sandbox_mode", "false")
         self.sms_sandbox_check.setChecked(sandbox_mode_str.lower() == "true")
+
         # -----------------------
+
+        # Signale wieder freigeben
+        try:
+            self.db_app_key_edit.blockSignals(False)
+            self.db_app_secret_edit.blockSignals(False)
+        except AttributeError:
+            pass  # Fehler wurde bereits geloggt
 
     def save_settings(self):
         """Speichert alle Einstellungen aus den GUI-Feldern im ConfigManager."""
         self.log.info("Speichere Einstellungen...")
-        # Allgemein
-        self.config.save_setting("monitor_path", self.monitor_path_edit.text())
-        self.config.save_setting("archive_path", self.archive_path_edit.text())
-        self.config.save_setting("log_file_path", self.log_path_edit.text())
-        self.config.save_setting("scan_interval", self.scan_interval_spin.value())
 
-        # Dropbox (Key/Secret werden nur gespeichert, nicht der Token)
-        self.config.save_secret("db_app_key", self.db_app_key_edit.text())
-        self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
+        # Signale des ConfigManagers blockieren, um Signal-Sturm zu verhindern
+        try:
+            self.config.blockSignals(True)
+        except AttributeError:
+            self.log.warning("Konnte Signale des ConfigManagers nicht blockieren. "
+                             "Signal-Sturm ist möglich.")
 
-        # SkyLink
-        # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
-        self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
-        self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
+        # --- Alle save_setting/save_secret Aufrufe ---
+        try:
+            # Allgemein
+            self.config.save_setting("monitor_path", self.monitor_path_edit.text())
+            self.config.save_setting("archive_path", self.archive_path_edit.text())
+            self.config.save_setting("log_file_path", self.log_path_edit.text())
+            self.config.save_setting("scan_interval", self.scan_interval_spin.value())
 
-        # E-Mail
-        self.config.save_setting("smtp_host", self.smtp_host_edit.text())
-        self.config.save_setting("smtp_port", self.smtp_port_edit.value())
-        self.config.save_secret("smtp_user", self.smtp_user_edit.text())
-        self.config.save_secret("smtp_pass", self.smtp_pass_edit.text())
-        self.config.save_setting("smtp_sender_addr", self.smtp_sender_addr_edit.text())
-        self.config.save_setting("smtp_sender_name", self.smtp_sender_name_edit.text())
-        self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
+            # Dropbox (Key/Secret werden nur gespeichert, nicht der Token)
+            self.config.save_secret("db_app_key", self.db_app_key_edit.text())
+            self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
 
-        # SMS
-        self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
-        self.config.save_secret("seven_sandbox_api_key", self.sms_sandbox_api_key_edit.text())
-        self.config.save_setting("seven_sender", self.sms_sender_edit.text())
+            # SkyLink
+            # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
+            self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
+            self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
 
-        sandbox_mode_str = "true" if self.sms_sandbox_check.isChecked() else "false"
-        self.config.save_setting("seven_sandbox_mode", sandbox_mode_str)
+            # E-Mail
+            self.config.save_setting("smtp_host", self.smtp_host_edit.text())
+            self.config.save_setting("smtp_port", self.smtp_port_edit.value())
+            self.config.save_secret("smtp_user", self.smtp_user_edit.text())
+            self.config.save_secret("smtp_pass", self.smtp_pass_edit.text())
+            self.config.save_setting("smtp_sender_addr", self.smtp_sender_addr_edit.text())
+            self.config.save_setting("smtp_sender_name", self.smtp_sender_name_edit.text())
+            self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
 
-        self.log.info("Einstellungen gespeichert.")
+            # SMS
+            self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
+            self.config.save_secret("seven_sandbox_api_key", self.sms_sandbox_api_key_edit.text())
+            self.config.save_setting("seven_sender", self.sms_sender_edit.text())
+
+            sandbox_mode_str = "true" if self.sms_sandbox_check.isChecked() else "false"
+            self.config.save_setting("seven_sandbox_mode", sandbox_mode_str)
+
+        finally:
+            # Signale in jedem Fall wieder freigeben
+            try:
+                self.config.blockSignals(False)
+            except AttributeError:
+                pass  # Fehler wurde bereits oben geloggt
+
+        # Das Signal manuell *einmal* auslösen,
+        # damit MainWindow.on_settings_changed() genau einmal aufgerufen wird.
+        try:
+            self.config.settings_changed.emit()
+            self.log.info("Einstellungen gespeichert.")
+        except AttributeError:
+            self.log.error("Konnte 'settings_changed' Signal nicht manuell auslösen. "
+                           "Hauptfenster wurde nicht benachrichtigt.")
+
         self.accept()  # Schließt den Dialog mit "OK"
 
     # --- Dropbox-Verbindungslogik ---
 
     def update_dropbox_status(self):
-        """Aktualisiert die GUI (Button-Text, Status-Label) basierend auf dem Client-Status."""
-        status = self.client.get_connection_status()
+        """
+        Aktualisiert die GUI und ruft update_connect_button_state
+        mit dem bereits abgerufenen Status auf.
+        """
+        status = self.client.get_connection_status()  # ERSTER UND EINZIGER AUFRUF
         self.db_status_label.setText(f"Status: {status}")
 
-        if status == "Verbunden":
+        is_connected = (status == "Verbunden")
+
+        if is_connected:
             self.db_connect_button.setText("Verbindung trennen")
             self.db_app_key_edit.setEnabled(False)
             self.db_app_secret_edit.setEnabled(False)
@@ -351,11 +450,18 @@ class SettingsDialog(QDialog):
             self.db_app_key_edit.setEnabled(True)
             self.db_app_secret_edit.setEnabled(True)
 
-        self.update_connect_button_state()
+        # Ruft die Helferfunktion mit dem Ergebnis auf, um zweiten API-Call zu vermeiden
+        self.update_connect_button_state(is_connected)
 
-    def update_connect_button_state(self):
-        """Aktiviert/Deaktiviert den 'Verbinden'-Button."""
-        is_connected = self.client.get_connection_status() == "Verbunden"
+    def update_connect_button_state(self, is_connected=None):
+        """
+        Akzeptiert einen optionalen Status, um API-Calls zu vermeiden.
+        Wenn 'is_connected' None ist (z.B. bei textChanged), wird der Status neu abgerufen.
+        """
+        if is_connected is None:
+            # Wird nur noch von textChanged aufgerufen, nicht mehr beim Start
+            is_connected = self.client.get_connection_status() == "Verbunden"
+
         if is_connected:
             self.db_connect_button.setEnabled(True)
         else:
@@ -411,4 +517,33 @@ class SettingsDialog(QDialog):
             return code.strip()
         else:
             return None
+
+    # Slot für den Klick auf "Updates prüfen"
+    @Slot()
+    def on_check_for_updates_clicked(self):
+        """
+        Startet die Update-Prüfung im Hauptfenster und informiert den Benutzer,
+        dass das Ergebnis (aufgrund des modalen Dialogs) eventuell erst
+        nach dem Schließen des Dialogs erscheint.
+        """
+        self.log.info("Manuelle Update-Prüfung initialisiert.")
+
+        # Deaktiviere Button, um doppeltes Klicken zu verhindern
+        self.update_check_button.setEnabled(False)
+        self.update_check_button.setText("Prüfe...")
+
+        # Rufe die Methode des Parents auf (MainWindow.check_for_updates_manual)
+        if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
+            self.parent().check_for_updates_manual()
+
+    # Slot, der das Signal vom MainWindow empfängt
+    @Slot(str)
+    def on_update_check_finished(self, status_message):
+        """Aktualisiert das Update-Status-Label, während der Dialog geöffnet ist."""
+        self.log.debug(f"Empfange Update-Status im Einstellungsdialog: {status_message}")
+        self.update_status_label.setText(f"Update-Status: <b>{status_message}</b>")
+
+        # Button wieder aktivieren
+        self.update_check_button.setEnabled(True)
+        self.update_check_button.setText("Jetzt auf Updates prüfen")
 
