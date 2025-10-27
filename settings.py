@@ -256,7 +256,7 @@ class SettingsDialog(QDialog):
         # TODO: Später hier Logik hinzufügen, um Gruppen basierend auf
         # self.sms_radio_group Auswahl ein-/auszublenden
 
-        layout.addStretch(1) # Füllt den restlichen Platz nach unten auf
+        layout.addStretch(1)  # Füllt den restlichen Platz nach unten auf
 
         return widget
 
@@ -320,39 +320,61 @@ class SettingsDialog(QDialog):
     def save_settings(self):
         """Speichert alle Einstellungen aus den GUI-Feldern im ConfigManager."""
         self.log.info("Speichere Einstellungen...")
-        # Allgemein
-        self.config.save_setting("monitor_path", self.monitor_path_edit.text())
-        self.config.save_setting("archive_path", self.archive_path_edit.text())
-        self.config.save_setting("log_file_path", self.log_path_edit.text())
-        self.config.save_setting("scan_interval", self.scan_interval_spin.value())
 
-        # Dropbox (Key/Secret werden nur gespeichert, nicht der Token)
-        self.config.save_secret("db_app_key", self.db_app_key_edit.text())
-        self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
+        # Signale des ConfigManagers blockieren, um Signal-Sturm zu verhindern
+        try:
+            self.config.blockSignals(True)
+        except AttributeError:
+            self.log.warning("Konnte Signale des ConfigManagers nicht blockieren. "
+                             "Signal-Sturm ist möglich.")
 
-        # SkyLink
-        # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
-        self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
-        self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
+        # --- Alle save_setting/save_secret Aufrufe ---
+        try:
+            # Allgemein
+            self.config.save_setting("monitor_path", self.monitor_path_edit.text())
+            self.config.save_setting("archive_path", self.archive_path_edit.text())
+            self.config.save_setting("log_file_path", self.log_path_edit.text())
+            self.config.save_setting("scan_interval", self.scan_interval_spin.value())
 
-        # E-Mail
-        self.config.save_setting("smtp_host", self.smtp_host_edit.text())
-        self.config.save_setting("smtp_port", self.smtp_port_edit.value())
-        self.config.save_secret("smtp_user", self.smtp_user_edit.text())
-        self.config.save_secret("smtp_pass", self.smtp_pass_edit.text())
-        self.config.save_setting("smtp_sender_addr", self.smtp_sender_addr_edit.text())
-        self.config.save_setting("smtp_sender_name", self.smtp_sender_name_edit.text())
-        self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
+            # Dropbox (Key/Secret werden nur gespeichert, nicht der Token)
+            self.config.save_secret("db_app_key", self.db_app_key_edit.text())
+            self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
 
-        # SMS
-        self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
-        self.config.save_secret("seven_sandbox_api_key", self.sms_sandbox_api_key_edit.text())
-        self.config.save_setting("seven_sender", self.sms_sender_edit.text())
+            # SkyLink
+            # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
+            self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
+            self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
 
-        sandbox_mode_str = "true" if self.sms_sandbox_check.isChecked() else "false"
-        self.config.save_setting("seven_sandbox_mode", sandbox_mode_str)
+            # E-Mail
+            self.config.save_setting("smtp_host", self.smtp_host_edit.text())
+            self.config.save_setting("smtp_port", self.smtp_port_edit.value())
+            self.config.save_secret("smtp_user", self.smtp_user_edit.text())
+            self.config.save_secret("smtp_pass", self.smtp_pass_edit.text())
+            self.config.save_setting("smtp_sender_addr", self.smtp_sender_addr_edit.text())
+            self.config.save_setting("smtp_sender_name", self.smtp_sender_name_edit.text())
+            self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
 
-        self.log.info("Einstellungen gespeichert.")
+            # SMS
+            self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
+            self.config.save_secret("seven_sandbox_api_key", self.sms_sandbox_api_key_edit.text())
+            self.config.save_setting("seven_sender", self.sms_sender_edit.text())
+
+            sandbox_mode_str = "true" if self.sms_sandbox_check.isChecked() else "false"
+            self.config.save_setting("seven_sandbox_mode", sandbox_mode_str)
+
+        finally:
+            try:
+                self.config.blockSignals(False)
+            except AttributeError:
+                pass  # Fehler wurde bereits oben geloggt
+
+        try:
+            self.config.settings_changed.emit()
+            self.log.info("Einstellungen gespeichert und Signal 'settings_changed' einmal ausgelöst.")
+        except AttributeError:
+            self.log.error("Konnte 'settings_changed' Signal nicht manuell auslösen. "
+                           "Hauptfenster wurde nicht benachrichtigt.")
+
         self.accept()  # Schließt den Dialog mit "OK"
 
     # --- Dropbox-Verbindungslogik ---
@@ -431,4 +453,3 @@ class SettingsDialog(QDialog):
             return code.strip()
         else:
             return None
-
