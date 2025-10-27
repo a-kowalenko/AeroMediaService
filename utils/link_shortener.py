@@ -10,23 +10,29 @@ class LinkShortener:
 
     def shorten(self, long_url):
         """Kürzt eine URL mit dem SkyLink-Shortener."""
+
+        self.log.info(f"Versuche, URL zu kürzen: {long_url}")
+
         api_url = self.config.get_secret("skylink_api_url")
         api_key = self.config.get_secret("skylink_api_key")
 
-        if not api_url or not api_key:
+        if not api_url:
             self.log.error("SkyLink API URL oder Key fehlt in der Konfiguration!")
             return long_url
 
         headers = {
-            'X-API-Key': api_key,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
         }
-        data = {'url': long_url}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+
+        data = {'long_url': long_url}
 
         try:
             response = requests.post(api_url, json=data, headers=headers, timeout=5)
 
-            if response.status_code == 201:
+            if response.status_code == 201 or response.status_code == 200:
                 short_url = response.json().get('short_url')
                 self.log.info(f"Link erfolgreich gekürzt: {short_url}")
                 return short_url

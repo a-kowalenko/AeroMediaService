@@ -6,7 +6,7 @@ from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
 
-# Schwellenwert für Upload-Sessions (150 MB)
+# Maximale Chunk-Größe für Dropbox-Uploads (8 MB)
 CHUNK_SIZE = 8 * 1024 * 1024
 
 
