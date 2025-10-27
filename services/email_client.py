@@ -65,9 +65,11 @@ class EmailClient:
 
         return False
 
-    def send_upload_success_email(self, directory_name, share_link):
+    def send_upload_success_email(self, directory_name, share_link, email):
         """Sendet eine Erfolgs-E-Mail mit dem Freigabelink."""
-        recipient = self.config.get_setting("smtp_fallback_recipient")
+        recipient = email
+        if not recipient:
+            recipient = self.config.get_setting("smtp_fallback_recipient")
         if not recipient:
             self.log.warning("Kein Fallback-Empfänger für Erfolgs-Mail konfiguriert.")
             return

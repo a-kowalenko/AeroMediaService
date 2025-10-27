@@ -4,6 +4,7 @@ import logging
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
+from utils.link_shortener import LinkShortener
 
 # Schwellenwert für Upload-Sessions (150 MB)
 CHUNK_SIZE = 8 * 1024 * 1024
@@ -16,6 +17,7 @@ class DropboxClient(BaseClient):
         self.config = config_manager
         self.dbx: dropbox.Dropbox = None
         self.log = logging.getLogger(__name__)
+        self.link_shortener = LinkShortener(config_manager)
 
     def connect(self, auth_callback=None):
         """
@@ -104,7 +106,11 @@ class DropboxClient(BaseClient):
         """Trennt die Verbindung und löscht den Refresh-Token."""
         self.log.info("Trenne Verbindung zu Dropbox...")
         self.config.delete_secret("db_refresh_token")
-        self.dbx.auth_token_revoke()
+        if self.dbx:
+            try:
+                self.dbx.auth_token_revoke()
+            except Exception as e:
+                self.log.warning(f"Fehler beim Revoken des Tokens (Token evtl. schon ungültig): {e}")
         self.dbx = None
         signals.connection_status_changed.emit("Nicht verbunden")
         self.log.info("Verbindung getrennt.")
@@ -241,26 +247,30 @@ class DropboxClient(BaseClient):
             links = self.dbx.sharing_list_shared_links(path=remote_path).links
             if links:
                 self.log.debug("Link existiert bereits, verwende existierenden Link.")
-                return links[0].url
+                # Link kürzen und zurückgeben
+                return self.link_shortener.shorten(links[0].url)
 
             # Neuen Link erstellen
             settings = dropbox.sharing.SharedLinkSettings(
                 requested_visibility=dropbox.sharing.RequestedVisibility.public)
             link = self.dbx.sharing_create_shared_link_with_settings(remote_path, settings=settings)
             self.log.info(f"Link erfolgreich erstellt: {link.url}")
-            return link.url
+            # Link kürzen und zurückgeben
+            return self.link_shortener.shorten(link.url)
 
         except dropbox.exceptions.ApiError as e:
-            if e.error.is_shared_link_already_exists():
+            error_message = str(e)
+            if "shared_link_already_exists" in error_message:
                 self.log.warning("API-Fehler 'Link existiert bereits', versuche Abruf...")
                 try:
                     # Workaround: Manchmal schlägt der erste Check fehl
                     links = self.dbx.sharing_list_shared_links(path=remote_path).links
                     if links:
-                        return links[0].url
+                        # Link kürzen und zurückgeben
+                        return self.link_shortener.shorten(links[0].url)
                 except Exception as e2:
                     self.log.error(f"Fehler beim Abrufen des existierenden Links: {e2}")
-                    return None
+                    return None # Bei Fehler den Kürzer nicht aufrufen
             self.log.error(f"Dropbox API Fehler bei Link-Erstellung: {e}")
             return None
         except Exception as e:
