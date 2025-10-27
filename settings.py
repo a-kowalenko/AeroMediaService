@@ -3,10 +3,10 @@ from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
     QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog,
-    QFrame, QCheckBox
+    QCheckBox
 )
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Slot
 from core.config import ConfigManager
 from services.base_client import BaseClient
 
@@ -17,7 +17,8 @@ class SettingsDialog(QDialog):
     der Anwendung in Tabs (Allgemein, Dropbox, E-Mail, SMS) ermöglicht.
     """
 
-    def __init__(self, config_manager: ConfigManager, client: BaseClient, parent=None):
+    def __init__(self, config_manager: ConfigManager, client: BaseClient,
+                 app_version: str, latest_version_info: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Einstellungen")
         self.setMinimumWidth(500)
@@ -25,6 +26,10 @@ class SettingsDialog(QDialog):
         self.config = config_manager
         self.client = client
         self.log = logging.getLogger(__name__)
+
+        # Versionsinformationen speichern
+        self.app_version = app_version
+        self.latest_version_info = latest_version_info or "Noch nicht geprüft."
 
         # Hauptlayout
         main_layout = QVBoxLayout(self)
@@ -55,55 +60,68 @@ class SettingsDialog(QDialog):
     def create_general_tab(self):
         """Erstellt den Tab 'Allgemein'."""
         widget = QWidget()
-        layout = QFormLayout(widget)
-        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        layout = QVBoxLayout(widget)
+
+        # --- Gruppe 1: Überwachungs-Einstellungen ---
+        monitor_group = QGroupBox("Überwachungs-Einstellungen")
+        monitor_layout = QFormLayout(monitor_group)
+        monitor_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         # Überwachungsordner
         self.monitor_path_edit = QLineEdit()
         self.monitor_path_button = QPushButton("Durchsuchen...")
         self.monitor_path_button.clicked.connect(lambda: self.select_directory(self.monitor_path_edit))
-        layout.addRow("Zu überwachender Ordner:",
-                      self.create_path_widget(self.monitor_path_edit, self.monitor_path_button))
+        monitor_layout.addRow("Zu überwachender Ordner:",
+                              self.create_path_widget(self.monitor_path_edit, self.monitor_path_button))
 
         # Archivordner
         self.archive_path_edit = QLineEdit()
         self.archive_path_button = QPushButton("Durchsuchen...")
         self.archive_path_button.clicked.connect(lambda: self.select_directory(self.archive_path_edit))
-        layout.addRow("Archiv-Ordner (für 'erfolgreich' / 'fehler'):",
-                      self.create_path_widget(self.archive_path_edit, self.archive_path_button))
+        monitor_layout.addRow("Archiv-Ordner (für 'erfolgreich' / 'fehler'):",
+                              self.create_path_widget(self.archive_path_edit, self.archive_path_button))
 
         # Log-Ordner
         self.log_path_edit = QLineEdit()
         self.log_path_button = QPushButton("Durchsuchen...")
         self.log_path_button.clicked.connect(lambda: self.select_directory(self.log_path_edit))
-        layout.addRow("Log-Datei-Ordner:", self.create_path_widget(self.log_path_edit, self.log_path_button))
+        monitor_layout.addRow("Log-Datei-Ordner:", self.create_path_widget(self.log_path_edit, self.log_path_button))
 
         # Scan-Intervall
         self.scan_interval_spin = QSpinBox()
         self.scan_interval_spin.setRange(5, 3600)
         self.scan_interval_spin.setSuffix(" Sekunden")
-        layout.addRow("Scan-Intervall:", self.scan_interval_spin)
+        monitor_layout.addRow("Scan-Intervall:", self.scan_interval_spin)
 
-        # Separator (horizontale Linie)
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addRow(separator)
+        layout.addWidget(monitor_group)
+
+        # --- Gruppe 2: Software-Update ---
+        update_group = QGroupBox("Software-Update")
+        update_layout = QFormLayout(update_group)  # QFormLayout, damit der Button eine ganze Zeile einnimmt
+
+        # Aktuelle Version anzeigen
+        self.current_version_label = QLabel(f"Aktuell installierte Version: <b>{self.app_version}</b>")
+        update_layout.addRow(self.current_version_label)
+
+        # Letzten bekannten Update-Status anzeigen
+        self.update_status_label = QLabel(f"Update-Status: <b>{self.latest_version_info}</b>")
+        update_layout.addRow(self.update_status_label)
 
         # Update-Button
         self.update_check_button = QPushButton("Jetzt auf Updates prüfen")
 
         # Verbinde mit der 'check_for_updates_manual'-Methode des Parent-Widgets (MainWindow)
         if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
-            self.update_check_button.clicked.connect(self.parent().check_for_updates_manual)
-            # Optional: Dialog nach Klick schließen, damit man das Ergebnis sieht
-            self.update_check_button.clicked.connect(self.accept)
+            self.update_check_button.clicked.connect(self.on_check_for_updates_clicked)
         else:
             # Fallback, falls die Methode nicht gefunden wird
             self.update_check_button.setEnabled(False)
             self.update_check_button.setToolTip("Konnte keine Update-Funktion im Hauptfenster finden.")
 
-        layout.addRow("Software-Update:", self.update_check_button)
+        update_layout.addRow(self.update_check_button)
+        layout.addWidget(update_group)
+
+        layout.addStretch(1)  # Schiebt alles nach oben
 
         return widget
 
@@ -169,45 +187,58 @@ class SettingsDialog(QDialog):
         self.skylink_group.setLayout(skylink_layout)
         layout.addWidget(self.skylink_group)
 
+        layout.addStretch(1)  # Schiebt alles nach oben
+
         return widget
 
     def create_email_tab(self):
         """Erstellt den Tab 'E-Mail (SMTP)'."""
         widget = QWidget()
-        layout = QFormLayout(widget)
+        layout = QVBoxLayout(widget)
+
+        # --- Gruppe 1: SMTP-Server-Verbindung ---
+        conn_group = QGroupBox("SMTP-Server-Verbindung")
+        conn_layout = QFormLayout(conn_group)
 
         self.smtp_host_edit = QLineEdit()
-        layout.addRow("SMTP-Host:", self.smtp_host_edit)
+        conn_layout.addRow("SMTP-Host:", self.smtp_host_edit)
 
         self.smtp_port_edit = QSpinBox()
         self.smtp_port_edit.setRange(1, 65535)
         self.smtp_port_edit.setValue(587)
-        layout.addRow("SMTP-Port:", self.smtp_port_edit)
+        conn_layout.addRow("SMTP-Port:", self.smtp_port_edit)
 
         self.smtp_user_edit = QLineEdit()
-        layout.addRow("Benutzername:", self.smtp_user_edit)
+        conn_layout.addRow("Benutzername:", self.smtp_user_edit)
 
         self.smtp_pass_edit = QLineEdit()
         self.smtp_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("Passwort:", self.smtp_pass_edit)
+        conn_layout.addRow("Passwort:", self.smtp_pass_edit)
 
-        layout.addRow(QLabel("---"))
+        layout.addWidget(conn_group)
+
+        # --- Gruppe 2: Absender-Konfiguration ---
+        sender_group = QGroupBox("Absender-Konfiguration")
+        sender_layout = QFormLayout(sender_group)
 
         self.smtp_sender_addr_edit = QLineEdit()
-        layout.addRow("Absender-Adresse:", self.smtp_sender_addr_edit)
+        sender_layout.addRow("Absender-Adresse:", self.smtp_sender_addr_edit)
 
         self.smtp_sender_name_edit = QLineEdit()
-        layout.addRow("Absender-Name:", self.smtp_sender_name_edit)
+        sender_layout.addRow("Absender-Name:", self.smtp_sender_name_edit)
 
         self.smtp_fallback_recipient_edit = QLineEdit()
-        layout.addRow("Fallback-Empfänger (für Status-Mails):", self.smtp_fallback_recipient_edit)
+        sender_layout.addRow("Fallback-Empfänger (für Status-Mails):", self.smtp_fallback_recipient_edit)
+
+        layout.addWidget(sender_group)
+
+        layout.addStretch(1)  # Schiebt alles nach oben
 
         return widget
 
     def create_sms_tab(self):
         """Erstellt den Tab 'SMS (Seven.io)'."""
         widget = QWidget()
-        # Hauptlayout ist QVBoxLayout, um Gruppen zu stapeln
         layout = QVBoxLayout(widget)
 
         # --- Gruppe 1: SMS-Dienst auswählen ---
@@ -254,9 +285,6 @@ class SettingsDialog(QDialog):
 
         self.seven_group.setLayout(seven_layout)
         layout.addWidget(self.seven_group)
-
-        # TODO: Später hier Logik hinzufügen, um Gruppen basierend auf
-        # self.sms_radio_group Auswahl ein-/auszublenden
 
         layout.addStretch(1)  # Füllt den restlichen Platz nach unten auf
 
@@ -489,4 +517,33 @@ class SettingsDialog(QDialog):
             return code.strip()
         else:
             return None
+
+    # Slot für den Klick auf "Updates prüfen"
+    @Slot()
+    def on_check_for_updates_clicked(self):
+        """
+        Startet die Update-Prüfung im Hauptfenster und informiert den Benutzer,
+        dass das Ergebnis (aufgrund des modalen Dialogs) eventuell erst
+        nach dem Schließen des Dialogs erscheint.
+        """
+        self.log.info("Manuelle Update-Prüfung initialisiert.")
+
+        # Deaktiviere Button, um doppeltes Klicken zu verhindern
+        self.update_check_button.setEnabled(False)
+        self.update_check_button.setText("Prüfe...")
+
+        # Rufe die Methode des Parents auf (MainWindow.check_for_updates_manual)
+        if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
+            self.parent().check_for_updates_manual()
+
+    # Slot, der das Signal vom MainWindow empfängt
+    @Slot(str)
+    def on_update_check_finished(self, status_message):
+        """Aktualisiert das Update-Status-Label, während der Dialog geöffnet ist."""
+        self.log.debug(f"Empfange Update-Status im Einstellungsdialog: {status_message}")
+        self.update_status_label.setText(f"Update-Status: <b>{status_message}</b>")
+
+        # Button wieder aktivieren
+        self.update_check_button.setEnabled(True)
+        self.update_check_button.setText("Jetzt auf Updates prüfen")
 

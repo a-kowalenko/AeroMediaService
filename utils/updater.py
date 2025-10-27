@@ -87,8 +87,9 @@ class UpdateCheckWorker(QObject):
 
                 if not installer_url:
                     log.warning("Update gefunden, aber keine .exe-Datei im Release.")
-                    if self.show_no_update_message:
-                        self.error.emit(f"Update {latest_version_str} verfügbar, aber kein Installer (.exe) gefunden.")
+                    # Signal immer senden. Der Empfänger (app.py)
+                    # entscheidet, ob eine Message-Box angezeigt wird.
+                    self.error.emit(f"Update {latest_version_str} verfügbar, aber kein Installer (.exe) gefunden.")
                 else:
                     self.updateAvailable.emit(latest_version_str, release_notes, installer_url)
 
@@ -102,21 +103,16 @@ class UpdateCheckWorker(QObject):
                 else:
                     message_text = f"Sie haben bereits die neueste Version ({self.app_version})."
 
-                log.info(message_text)
-                if self.show_no_update_message:
-                    # Zeige die Info-Box nur bei manuellem Check
-                    self.noUpdateAvailable.emit(message_text)
+                self.noUpdateAvailable.emit(message_text)
 
         except requests.RequestException as e:
             error_msg = f"Netzwerkfehler bei Update-Prüfung: {e}"
             log.error(error_msg)
-            if self.show_no_update_message:
-                self.error.emit("Update-Prüfung fehlgeschlagen: Netzwerkfehler.")
+            self.error.emit("Update-Prüfung fehlgeschlagen: Netzwerkfehler.")
         except Exception as e:
             error_msg = f"Fehler bei Update-Prüfung: {e}"
             log.error(error_msg)
-            if self.show_no_update_message:
-                self.error.emit(f"Update-Prüfung fehlgeschlagen: {e}")
+            self.error.emit(f"Update-Prüfung fehlgeschlagen: {e}")
 
         finally:
             self.finished.emit()
@@ -145,10 +141,9 @@ class AskUpdateDialog(QDialog):
 
         self.release_notes_display = QTextEdit()
         self.release_notes_display.setReadOnly(True)
-        # Markdown-Parsing (vereinfacht)
-        plain_notes = release_notes.replace("### ", "").replace("## ", "").replace("# ", "")
-        plain_notes = plain_notes.replace("**", "").replace("* ", "- ")
-        self.release_notes_display.setPlainText(plain_notes)
+
+        self.release_notes_display.setMarkdown(release_notes)
+
         self.release_notes_display.setMaximumHeight(200)
         layout.addWidget(self.release_notes_display)
 

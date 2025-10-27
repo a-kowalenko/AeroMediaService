@@ -2,15 +2,14 @@ import sys
 import logging
 import queue
 
-# MODIFIZIERT: QPainter, QColor für das Ampellicht hinzugefügt
 from PySide6.QtGui import QIcon, QPainter, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
     QMessageBox
 )
-# MODIFIZIERT: QCoreApplication, QProcess, Slot, QSize, Qt hinzugefügt
-from PySide6.QtCore import QCoreApplication, QProcess, Slot, QSize, Qt
+
+from PySide6.QtCore import QCoreApplication, QProcess, Slot, Qt, Signal
 
 # Importiere alle Komponenten des Projekts
 from core import APP_VERSION
@@ -25,7 +24,6 @@ from services.sms_client import SmsClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
 from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
-
 
 
 class StatusLight(QWidget):
@@ -70,6 +68,8 @@ class MainWindow(QMainWindow):
     Es verwaltet die Lebenszyklen der Worker-Threads.
     """
 
+    update_check_finished_signal = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Aero Media Service")
@@ -108,6 +108,9 @@ class MainWindow(QMainWindow):
         # --- Update-Worker ---
         self.update_thread = None
         self.update_worker = None
+
+        # Member-Variable für den letzten Update-Status
+        self.latest_version_info = "Noch nicht geprüft."
 
         # --- GUI-Komponenten (Platzhalter) ---
         self.status_light = None
@@ -311,20 +314,28 @@ class MainWindow(QMainWindow):
 
         # Logging neu konfigurieren, falls sich der Pfad geändert hat
         # (Einfacher Ansatz: Logging beim Start konfigurieren.
-        # Für dynamische Änderung wäre mehr Aufwand nötig, z.B. Handler entfernen/hinzufügen)
+        # Für dynamische Änderung wäre mehr Aufwand nötig, z.B. Handler entfernen/hinzufügen)
         self.log.warning("Log-Pfad-Änderungen erfordern einen Neustart.")
 
     @Slot()
     def open_settings(self):
         """Öffnet den Einstellungsdialog."""
         self.log.debug("Öffne Einstellungsdialog...")
-        dialog = SettingsDialog(self.config, self.db_client, self)
 
-        # Wir verbinden das 'accepted'-Signal des Dialogs (wenn "Speichern" geklickt wird)
-        # mit unserem 'on_settings_changed'-Slot.
-        # (Alternativ: Das 'settings_changed'-Signal des ConfigManagers nutzen)
+        dialog = SettingsDialog(self.config,
+                                self.db_client,
+                                APP_VERSION,
+                                self.latest_version_info,
+                                self)
+
+        # Verbinde das Signal, um Update-Status zu empfangen
+        self.update_check_finished_signal.connect(dialog.on_update_check_finished)
 
         dialog.exec()  # Öffnet den Dialog modal (blockierend)
+
+        # Trennt das Signal wieder, wenn der Dialog geschlossen wird,
+        # um Speicherlecks zu vermeiden.
+        self.update_check_finished_signal.disconnect(dialog.on_update_check_finished)
 
         # Nach dem Schließen des Dialogs den Status aktualisieren
         self.log.debug("Einstellungsdialog geschlossen.")
@@ -423,7 +434,6 @@ class MainWindow(QMainWindow):
     @Slot()
     def check_for_updates_manual(self):
         """Startet die manuelle Update-Prüfung (mit Feedback)."""
-        self.log.info("Manuelle Update-Prüfung wird gestartet...")
         self.status_label.setText("Suche nach Updates...")
         initialize_updater(self, APP_VERSION, self.config, show_no_update_message=True)
 
@@ -432,6 +442,12 @@ class MainWindow(QMainWindow):
         """Slot, der aufgerufen wird, wenn ein Update gefunden wurde."""
         self.log.info(f"Update verfügbar: {latest_version}")
         self.status_label.setText(f"Update auf Version {latest_version} verfügbar!")
+
+        # Status für Einstellungsdialog speichern
+        self.latest_version_info = f"Neue Version {latest_version} verfügbar!"
+
+        # Signal an den (evtl. offenen) Einstellungsdialog senden
+        self.update_check_finished_signal.emit(self.latest_version_info)
 
         # Stoppe Monitoring, um Konflikte zu vermeiden
         if self.monitor_thread and self.monitor_thread.isRunning():
@@ -456,6 +472,13 @@ class MainWindow(QMainWindow):
         """Slot, der aufgerufen wird, wenn kein Update verfügbar ist."""
         self.log.info(f"Update-Prüfung: {message}")
         self.status_label.setText("Bereit.")
+
+        # Status für Einstellungsdialog speichern
+        self.latest_version_info = message  # z.B. "Sie sind auf dem neuesten Stand."
+
+        # Signal an den (evtl. offenen) Einstellungsdialog senden
+        self.update_check_finished_signal.emit(self.latest_version_info)
+
         # Zeige Feedback nur bei manueller Prüfung
         if self.sender() and self.sender().show_no_update_message:
             QMessageBox.information(self, "Update-Prüfung", message)
@@ -465,6 +488,13 @@ class MainWindow(QMainWindow):
         """Slot, der bei einem Fehler der Update-Prüfung aufgerufen wird."""
         self.log.error(f"Fehler bei Update-Prüfung: {message}")
         self.status_label.setText("Update-Prüfung fehlgeschlagen.")
+
+        # Status für Einstellungsdialog speichern
+        self.latest_version_info = message  # z.B. "Fehler: Netzwerk nicht erreichbar."
+
+        # Signal an den (evtl. offenen) Einstellungsdialog senden
+        self.update_check_finished_signal.emit(self.latest_version_info)
+
         # Zeige Feedback nur bei manueller Prüfung
         if self.sender() and self.sender().show_no_update_message:
             QMessageBox.critical(self, "Update-Fehler", message)

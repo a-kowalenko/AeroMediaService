@@ -44,18 +44,27 @@ class UploaderThread(QThread):
         self.log.info("Uploader-Thread gestartet. Warte auf Upload-Aufträge.")
 
         while self._is_running:
+            # Variablen *vor* dem try-Block initialisieren,
+            # damit sie im except-Block garantiert existieren.
+            local_dir_path = None
+            dir_name = "unbekannt"
+            kunde = None
+
             try:
                 # Warte blockierend auf ein Item in der Queue
                 current_queue_item = self.upload_queue.get()
-                self.log.debug(f"current_queue_item: {current_queue_item}")
-                local_dir_path = current_queue_item['dir_path']
-                kunde = current_queue_item['kunde']
 
-                if local_dir_path is None or not self._is_running:
+                # Prüfung auf 'None' (Stopp-Signal) MUSS VOR dem Zugriff erfolgen!
+                if current_queue_item is None or not self._is_running:
                     # 'None' ist das Signal zum Beenden
                     break
 
-                dir_name = os.path.basename(local_dir_path)
+                # Ab hier ist sicher, dass current_queue_item kein None ist.
+                self.log.debug(f"current_queue_item: {current_queue_item}")
+                local_dir_path = current_queue_item['dir_path']
+                kunde = current_queue_item['kunde']
+                dir_name = os.path.basename(local_dir_path)  # dir_name hier setzen
+
                 self.log.info(f"Beginne Verarbeitung von: {dir_name}")
                 signals.upload_status_update.emit(f"Starte Upload: {dir_name}")
                 signals.upload_progress_file.emit(0, 0, 0)
@@ -79,12 +88,14 @@ class UploaderThread(QThread):
                     self.log.error(f"Konnte Freigabelink für {dir_name} nicht erstellen.")
 
                 # 3. Erfolgs-E-Mail senden
-                if share_link:
+                if share_link and kunde and kunde.email:
                     self.email_client.send_upload_success_email(dir_name, share_link, kunde.email)
                     try:
                         asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
                     except Exception as sms_e:
                         self.log.error(f"SMS-Versand für {kunde.vorname} {kunde.nachname} fehlgeschlagen: {sms_e}")
+                elif not kunde:
+                    self.log.warning(f"Keine Kundendaten für {dir_name} gefunden. Benachrichtigungen übersprungen.")
 
                 # 4. In Archiv-Ordner verschieben
                 self.archive_directory(local_dir_path, "erfolg")
@@ -92,10 +103,14 @@ class UploaderThread(QThread):
                 signals.upload_status_update.emit(f"Erfolgreich: {dir_name}")
 
             except Exception as e:
-                self.log.error(f"Fehler bei der Verarbeitung von {local_dir_path}: {e}")
+                self.log.error(f"Fehler bei der Verarbeitung von '{dir_name}' (Pfad: {local_dir_path}): {e}")
                 signals.upload_status_update.emit(f"Fehler: {dir_name}")
+
                 # 5. Bei Fehler in Fehler-Ordner verschieben
-                self.archive_directory(local_dir_path, "fehler")
+                # Nur archivieren, wenn local_dir_path auch einen Wert hat.
+                if local_dir_path:
+                    self.archive_directory(local_dir_path, "fehler")
+
                 # 6. Fehler-E-Mail senden
                 self.email_client.send_upload_failure_email(dir_name, str(e))
 
