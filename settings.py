@@ -1,4 +1,5 @@
 import logging
+import requests
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
@@ -577,7 +578,6 @@ class SettingsDialog(QDialog):
 
         # Test-Verbindung (vereinfacht, ohne echten Client-Zugriff)
         try:
-            import requests
             health_endpoint = self.custom_api_health_endpoint_edit.text() or "/health"
             test_url = api_url.rstrip('/') + '/' + health_endpoint.lstrip('/')
 
@@ -592,9 +592,70 @@ class SettingsDialog(QDialog):
             response = requests.get(test_url, headers=headers, timeout=10)
 
             if response.status_code == 200:
-                self.custom_api_status_label.setText("Status: Verbunden ✓")
-                QMessageBox.information(self, "Verbindung erfolgreich",
-                                      "Die Verbindung zur Custom API wurde erfolgreich getestet!")
+                # Teste ob die Response JSON ist und den erwarteten Status hat
+                try:
+                    data = response.json()
+                    status = data.get('status')
+
+                    if status == 'healthy':
+                        self.custom_api_status_label.setText("Status: Verbunden ✓")
+
+                        # Verbinde auch den tatsächlichen Client, falls parent verfügbar ist
+                        if hasattr(self.parent(), 'custom_api_client'):
+                            self.parent().custom_api_client.connect()
+                            self.log.info("Custom API Client wurde erfolgreich verbunden")
+
+                            # Aktualisiere den aktiven Cloud-Client im MainWindow
+                            if hasattr(self.parent(), 'active_cloud_client'):
+                                self.parent().active_cloud_client = self.parent().custom_api_client
+                                self.log.info("Aktiver Cloud-Client wurde auf Custom API gesetzt")
+
+                                # Aktualisiere auch den UploaderThread
+                                if hasattr(self.parent(), 'uploader_thread'):
+                                    self.parent().uploader_thread.client = self.parent().custom_api_client
+                                    self.log.info("UploaderThread wurde aktualisiert")
+
+                                # Aktualisiere das Status-Light im MainWindow
+                                if hasattr(self.parent(), 'update_status_light'):
+                                    self.parent().update_status_light()
+                                    self.log.info("Status-Light wurde aktualisiert")
+
+                        QMessageBox.information(self, "Verbindung erfolgreich",
+                                              "Die Verbindung zur Custom API wurde erfolgreich getestet!")
+                    elif status == 'unauthorized':
+                        self.custom_api_status_label.setText("Status: Ungültiger API-Key")
+                        QMessageBox.warning(self, "Authentifizierung fehlgeschlagen",
+                                          "Der API-Key ist ungültig oder hat keine Berechtigung.")
+                    else:
+                        self.custom_api_status_label.setText(f"Status: {status}")
+                        QMessageBox.warning(self, "Unerwarteter Status",
+                                          f"Die API antwortete mit Status: {status}")
+                except ValueError:
+                    # Response ist kein JSON
+                    self.custom_api_status_label.setText("Status: Verbunden ✓")
+
+                    # Verbinde auch den tatsächlichen Client, falls parent verfügbar ist
+                    if hasattr(self.parent(), 'custom_api_client'):
+                        self.parent().custom_api_client.connect()
+                        self.log.info("Custom API Client wurde erfolgreich verbunden")
+
+                        # Aktualisiere den aktiven Cloud-Client im MainWindow
+                        if hasattr(self.parent(), 'active_cloud_client'):
+                            self.parent().active_cloud_client = self.parent().custom_api_client
+                            self.log.info("Aktiver Cloud-Client wurde auf Custom API gesetzt")
+
+                            # Aktualisiere auch den UploaderThread
+                            if hasattr(self.parent(), 'uploader_thread'):
+                                self.parent().uploader_thread.client = self.parent().custom_api_client
+                                self.log.info("UploaderThread wurde aktualisiert")
+
+                            # Aktualisiere das Status-Light im MainWindow
+                            if hasattr(self.parent(), 'update_status_light'):
+                                self.parent().update_status_light()
+                                self.log.info("Status-Light wurde aktualisiert")
+
+                    QMessageBox.information(self, "Verbindung erfolgreich",
+                                          "Die Verbindung zur Custom API wurde erfolgreich getestet!")
             else:
                 self.custom_api_status_label.setText(f"Status: Fehler HTTP {response.status_code}")
                 QMessageBox.warning(self, "Verbindungsfehler",

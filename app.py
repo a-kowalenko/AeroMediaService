@@ -224,6 +224,12 @@ class MainWindow(QMainWindow):
         signals.upload_status_update.connect(self.status_label.setText)
         signals.monitoring_status_changed.connect(self.update_monitoring_status)
 
+        # Upload-Fortschritt-Signale
+        signals.upload_started.connect(lambda count: self.add_log_message(f"Upload gestartet: {count} Datei(en)"))
+        signals.upload_progress.connect(self.add_log_message)
+        signals.upload_finished.connect(self.add_log_message)
+        signals.upload_failed.connect(lambda msg: self.add_log_message(f"❌ Upload fehlgeschlagen: {msg}"))
+
         signals.connection_status_changed.connect(self.connection_status_label.setText)
         signals.connection_status_changed.connect(self.update_status_light)
 
@@ -443,7 +449,9 @@ class MainWindow(QMainWindow):
             self.update_monitoring_status(False)
             return
 
-        if self.db_client.get_connection_status() != "Verbunden":
+        # Verwende den aktuell aktiven Cloud-Client
+        active_client = self.get_active_cloud_client()
+        if active_client.get_connection_status() != "Verbunden":
             self.log.error("Monitoring nicht gestartet: Keine Cloud-Verbindung.")
             self.update_monitoring_status(False)
             return
