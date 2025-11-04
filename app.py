@@ -19,6 +19,7 @@ from core.signals import signals
 from core.monitor import MonitorThread
 from core.uploader import UploaderThread
 from services.dropbox_client import DropboxClient
+from services.custom_api_client import CustomApiClient
 from services.email_client import EmailClient
 from services.sms_client import SmsClient
 from settings import SettingsDialog
@@ -93,15 +94,19 @@ class MainWindow(QMainWindow):
         # --- Dienste (Clients) ---
         # (Clients benötigen ConfigManager)
         self.db_client = DropboxClient(self.config)
+        self.custom_api_client = CustomApiClient(self.config)
         self.email_client = EmailClient(self.config)
         self.sms_client = SmsClient(self.config)
+
+        # Aktueller aktiver Cloud-Client (wird von get_active_cloud_client() bestimmt)
+        self.active_cloud_client = self.get_active_cloud_client()
 
         # --- Worker-Threads ---
         # (Threads benötigen Config, Queue und Clients)
         self.monitor_thread = None  # Wird bei Bedarf gestartet
         self.uploader_thread = UploaderThread(self.config,
                                               self.upload_queue,
-                                              self.db_client,
+                                              self.active_cloud_client,
                                               self.email_client,
                                               self.sms_client)
 
@@ -227,22 +232,50 @@ class MainWindow(QMainWindow):
         # Einstellungsänderungen abfangen
         self.config.settings_changed.connect(self.on_settings_changed)
 
+    def get_active_cloud_client(self):
+        """
+        Gibt den aktuell ausgewählten Cloud-Client zurück.
+        """
+        selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
+        if selected_cloud == "custom_api":
+            return self.custom_api_client
+        else:
+            return self.db_client
+
     def auto_connect_and_start(self):
         """
         Versucht beim Start, automatisch eine Verbindung herzustellen,
         das Monitoring zu starten und auf Updates zu prüfen.
         """
         self.log.info("Prüfe auf Auto-Verbindung...")
-        if self.config.get_secret("db_refresh_token"):
-            self.status_label.setText("Stelle automatische Verbindung her...")
-            if self.db_client.connect():
-                self.log.info("Automatische Verbindung erfolgreich.")
-                self.start_monitoring()  # Startet automatisch das Monitoring
+
+        # Aktuellen Cloud-Client ermitteln
+        self.active_cloud_client = self.get_active_cloud_client()
+        selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
+
+        # Auto-Verbindung je nach Service
+        if selected_cloud == "dropbox":
+            if self.config.get_secret("db_refresh_token"):
+                self.status_label.setText("Stelle automatische Verbindung her (Dropbox)...")
+                if self.db_client.connect():
+                    self.log.info("Automatische Dropbox-Verbindung erfolgreich.")
+                    self.start_monitoring()  # Startet automatisch das Monitoring
+                else:
+                    self.log.warning("Automatische Dropbox-Verbindung fehlgeschlagen.")
+                    self.status_label.setText("Automatische Verbindung fehlgeschlagen.")
             else:
-                self.log.warning("Automatische Verbindung fehlgeschlagen.")
-                self.status_label.setText("Automatische Verbindung fehlgeschlagen.")
-        else:
-            self.log.info("Keine gespeicherten Tokens, kein Auto-Start.")
+                self.log.info("Keine gespeicherten Dropbox-Tokens, kein Auto-Start.")
+        elif selected_cloud == "custom_api":
+            if self.config.get_secret("custom_api_url") and self.config.get_secret("custom_api_bearer_token"):
+                self.status_label.setText("Stelle automatische Verbindung her (Custom API)...")
+                if self.custom_api_client.connect():
+                    self.log.info("Automatische Custom API-Verbindung erfolgreich.")
+                    self.start_monitoring()  # Startet automatisch das Monitoring
+                else:
+                    self.log.warning("Automatische Custom API-Verbindung fehlgeschlagen.")
+                    self.status_label.setText("Automatische Verbindung fehlgeschlagen.")
+            else:
+                self.log.info("Keine Custom API Konfiguration, kein Auto-Start.")
 
         self.log.info("Starte automatische Update-Prüfung im Hintergrund...")
         initialize_updater(self, APP_VERSION, self.config, show_no_update_message=False)
@@ -290,8 +323,9 @@ class MainWindow(QMainWindow):
         if not self.status_light:  # Sicherstellen, dass die UI initialisiert ist
             return
 
-        # Status abfragen
-        is_connected = (self.db_client.get_connection_status() == "Verbunden")
+        # Status des aktiven Cloud-Clients abfragen
+        active_client = self.get_active_cloud_client()
+        is_connected = (active_client.get_connection_status() == "Verbunden")
         is_monitoring = (self.monitor_button and self.monitor_button.isChecked())
 
         # Logik für die Ampel
@@ -302,10 +336,23 @@ class MainWindow(QMainWindow):
         elif is_connected and is_monitoring:
             self.status_light.setColor("green")  # Grün: Verbunden und Monitoring aktiv
 
+
+        # Aktualisierten aktiven Cloud-Client ermitteln
+        self.active_cloud_client = self.get_active_cloud_client()
+
     @Slot()
     def on_settings_changed(self):
         """Wird aufgerufen, wenn Einstellungen gespeichert wurden."""
         self.log.info("Einstellungen wurden geändert. Wecke Threads auf...")
+
+        # Prüfe, ob der Cloud-Service gewechselt wurde
+        new_active_client = self.get_active_cloud_client()
+        if new_active_client != self.active_cloud_client:
+            self.log.info("Cloud-Service wurde gewechselt. Aktualisiere UploaderThread...")
+            self.active_cloud_client = new_active_client
+            # UploaderThread muss mit neuem Client aktualisiert werden
+            self.uploader_thread.client = self.active_cloud_client
+
         # Die Threads lesen die Konfiguration bei Bedarf neu.
         # Wir müssen den Monitor-Thread aufwecken, falls er auf das Intervall wartet,
         # damit er den neuen Pfad oder das Intervall sofort übernimmt.
@@ -339,8 +386,12 @@ class MainWindow(QMainWindow):
 
         # Nach dem Schließen des Dialogs den Status aktualisieren
         self.log.debug("Einstellungsdialog geschlossen.")
-        # Status der Dropbox-Verbindung im Hauptfenster aktualisieren
-        signals.connection_status_changed.emit(self.db_client.get_connection_status())
+
+        # Aktualisierten aktiven Cloud-Client ermitteln
+        self.active_cloud_client = self.get_active_cloud_client()
+
+        # Status des aktiven Cloud-Clients im Hauptfenster aktualisieren
+        signals.connection_status_changed.emit(self.active_cloud_client.get_connection_status())
 
     @Slot()
     def restart_app(self):

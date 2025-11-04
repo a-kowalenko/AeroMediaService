@@ -55,6 +55,9 @@ class SettingsDialog(QDialog):
         # 2. Initialen Status setzen (fragt API 1x ab)
         self.update_dropbox_status()
 
+        # 3. Initiale Sichtbarkeit der Cloud-Gruppen setzen
+        self.on_cloud_service_changed()
+
     # --- Tab-Erstellung ---
 
     def create_general_tab(self):
@@ -130,14 +133,23 @@ class SettingsDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # Auswahl des Dienstes (momentan nur Dropbox)
+        # Auswahl des Dienstes (Dropbox oder Custom API)
         service_group = QGroupBox("Cloud-Dienst auswählen")
         service_layout = QVBoxLayout()
         self.radio_dropbox = QRadioButton("Dropbox")
+        self.radio_custom_api = QRadioButton("Custom API (Bearer Token)")
         self.radio_dropbox.setChecked(True)  # Standard
         self.radio_group = QButtonGroup()
+        self.radio_group.setExclusive(True)  # Nur ein Button kann ausgewählt sein
         self.radio_group.addButton(self.radio_dropbox)
+        self.radio_group.addButton(self.radio_custom_api)
         service_layout.addWidget(self.radio_dropbox)
+        service_layout.addWidget(self.radio_custom_api)
+
+        # Verbinde Radiobutton-Änderungen mit Handler
+        self.radio_dropbox.toggled.connect(self.on_cloud_service_changed)
+        self.radio_custom_api.toggled.connect(self.on_cloud_service_changed)
+
         service_group.setLayout(service_layout)
         layout.addWidget(service_group)
 
@@ -179,6 +191,41 @@ class SettingsDialog(QDialog):
         self.skylink_url_edit = QLineEdit()
         self.skylink_url_edit.setPlaceholderText("z.B. https://skydive.de/api/create")
         skylink_layout.addRow("SkyLink API URL:", self.skylink_url_edit)
+        # --- Custom API Einstellungen ---
+        self.custom_api_group = QGroupBox("Custom API-Einstellungen")
+        custom_api_layout = QFormLayout()
+
+        self.custom_api_url_edit = QLineEdit()
+        self.custom_api_url_edit.setPlaceholderText("z.B. https://api.meine-cloud.de")
+        custom_api_layout.addRow("API Base URL:", self.custom_api_url_edit)
+
+        self.custom_api_token_edit = QLineEdit()
+        self.custom_api_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.custom_api_token_edit.setPlaceholderText("Bearer Token für Authentifizierung")
+        custom_api_layout.addRow("Bearer Token:", self.custom_api_token_edit)
+
+        # Erweiterte Einstellungen
+        self.custom_api_upload_endpoint_edit = QLineEdit()
+        self.custom_api_upload_endpoint_edit.setPlaceholderText("/upload")
+        custom_api_layout.addRow("Upload Endpoint:", self.custom_api_upload_endpoint_edit)
+
+        self.custom_api_share_endpoint_edit = QLineEdit()
+        self.custom_api_share_endpoint_edit.setPlaceholderText("/share")
+        custom_api_layout.addRow("Share Endpoint:", self.custom_api_share_endpoint_edit)
+
+        self.custom_api_health_endpoint_edit = QLineEdit()
+        self.custom_api_health_endpoint_edit.setPlaceholderText("/health")
+        custom_api_layout.addRow("Health Check Endpoint:", self.custom_api_health_endpoint_edit)
+
+        # Verbindungs-Steuerung für Custom API
+        self.custom_api_connect_button = QPushButton("Mit Custom API verbinden")
+        self.custom_api_connect_button.clicked.connect(self.toggle_custom_api_connection)
+        self.custom_api_status_label = QLabel("Status: Unbekannt")
+        custom_api_layout.addRow(self.custom_api_connect_button, self.custom_api_status_label)
+
+        self.custom_api_group.setLayout(custom_api_layout)
+        layout.addWidget(self.custom_api_group)
+
 
         self.skylink_key_edit = QLineEdit()
         self.skylink_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -296,6 +343,7 @@ class SettingsDialog(QDialog):
 
     def create_path_widget(self, line_edit, button):
         """Erstellt ein kombiniertes Widget aus QLineEdit und QPushButton."""
+
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -320,12 +368,14 @@ class SettingsDialog(QDialog):
         try:
             self.db_app_key_edit.blockSignals(True)
             self.db_app_secret_edit.blockSignals(True)
+            self.radio_dropbox.blockSignals(True)
+            self.radio_custom_api.blockSignals(True)
         except AttributeError:
             # Passiert, wenn load_settings vor create_cloud_tab aufgerufen würde
             self.log.warning("Cloud-Tab-Widgets noch nicht initialisiert beim Laden.")
             pass
 
-            # Allgemein
+        # Allgemein
         self.monitor_path_edit.setText(self.config.get_setting("monitor_path"))
         self.archive_path_edit.setText(self.config.get_setting("archive_path"))
         self.log_path_edit.setText(self.config.get_setting("log_file_path"))
@@ -338,6 +388,20 @@ class SettingsDialog(QDialog):
         # SkyLink
         self.skylink_url_edit.setText(self.config.get_secret("skylink_api_url"))
         self.skylink_key_edit.setText(self.config.get_secret("skylink_api_key"))
+
+        # Custom API
+        self.custom_api_url_edit.setText(self.config.get_secret("custom_api_url"))
+        self.custom_api_token_edit.setText(self.config.get_secret("custom_api_bearer_token"))
+        self.custom_api_upload_endpoint_edit.setText(self.config.get_setting("custom_api_upload_endpoint", "/upload"))
+        self.custom_api_share_endpoint_edit.setText(self.config.get_setting("custom_api_share_endpoint", "/share"))
+        self.custom_api_health_endpoint_edit.setText(self.config.get_setting("custom_api_health_endpoint", "/health"))
+
+        # Cloud-Dienst Auswahl
+        selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
+        if selected_cloud == "custom_api":
+            self.radio_custom_api.setChecked(True)
+        else:
+            self.radio_dropbox.setChecked(True)
 
         # E-Mail
         self.smtp_host_edit.setText(self.config.get_setting("smtp_host"))
@@ -363,6 +427,8 @@ class SettingsDialog(QDialog):
         try:
             self.db_app_key_edit.blockSignals(False)
             self.db_app_secret_edit.blockSignals(False)
+            self.radio_dropbox.blockSignals(False)
+            self.radio_custom_api.blockSignals(False)
         except AttributeError:
             pass  # Fehler wurde bereits geloggt
 
@@ -393,6 +459,19 @@ class SettingsDialog(QDialog):
             # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
             self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
             self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
+
+            # Custom API
+            self.config.save_secret("custom_api_url", self.custom_api_url_edit.text())
+            self.config.save_secret("custom_api_bearer_token", self.custom_api_token_edit.text())
+            self.config.save_setting("custom_api_upload_endpoint", self.custom_api_upload_endpoint_edit.text())
+            self.config.save_setting("custom_api_share_endpoint", self.custom_api_share_endpoint_edit.text())
+            self.config.save_setting("custom_api_health_endpoint", self.custom_api_health_endpoint_edit.text())
+
+            # Cloud-Dienst Auswahl
+            if self.radio_custom_api.isChecked():
+                self.config.save_setting("selected_cloud_service", "custom_api")
+            else:
+                self.config.save_setting("selected_cloud_service", "dropbox")
 
             # E-Mail
             self.config.save_setting("smtp_host", self.smtp_host_edit.text())
@@ -431,6 +510,19 @@ class SettingsDialog(QDialog):
 
     # --- Dropbox-Verbindungslogik ---
 
+    def on_cloud_service_changed(self):
+        """Handler für Änderungen der Cloud-Dienst Auswahl."""
+        if self.radio_dropbox.isChecked():
+            self.dropbox_group.setVisible(True)
+            self.custom_api_group.setVisible(False)
+            self.skylink_group.setVisible(True)  # SkyLink wird für beide angezeigt
+            self.log.info("Cloud-Dienst gewechselt zu: Dropbox")
+        elif self.radio_custom_api.isChecked():
+            self.dropbox_group.setVisible(False)
+            self.custom_api_group.setVisible(True)
+            self.skylink_group.setVisible(True)  # SkyLink wird für beide angezeigt
+            self.log.info("Cloud-Dienst gewechselt zu: Custom API")
+
     def update_dropbox_status(self):
         """
         Aktualisiert die GUI und ruft update_connect_button_state
@@ -452,6 +544,76 @@ class SettingsDialog(QDialog):
 
         # Ruft die Helferfunktion mit dem Ergebnis auf, um zweiten API-Call zu vermeiden
         self.update_connect_button_state(is_connected)
+
+    # --- Custom API Verbindungslogik ---
+
+    def toggle_custom_api_connection(self):
+        """Startet den Verbindungs- oder Trennungsvorgang für Custom API."""
+        # Hinweis: Für Custom API brauchen wir eine separate Client-Instanz
+        # Wir müssen prüfen, ob die MainWindow-Instanz einen custom_api_client hat
+        # Da wir hier im Settings-Dialog sind, müssen wir das über self.client lösen
+        # ODER einen separaten custom_api_client Parameter übergeben
+
+        # Für jetzt: Warnung, dass dies noch nicht implementiert ist
+        # Dies erfordert Änderungen in app.py, um beide Clients zu unterstützen
+
+        api_url = self.custom_api_url_edit.text()
+        bearer_token = self.custom_api_token_edit.text()
+
+        if not api_url or not bearer_token:
+            QMessageBox.warning(self, "Fehlende Daten",
+                              "Bitte geben Sie sowohl die API URL als auch den Bearer Token ein.")
+            return
+
+        # Speichere die Einstellungen
+        self.config.save_secret("custom_api_url", api_url)
+        self.config.save_secret("custom_api_bearer_token", bearer_token)
+        self.config.save_setting("custom_api_upload_endpoint",
+                                self.custom_api_upload_endpoint_edit.text() or "/upload")
+        self.config.save_setting("custom_api_share_endpoint",
+                                self.custom_api_share_endpoint_edit.text() or "/share")
+        self.config.save_setting("custom_api_health_endpoint",
+                                self.custom_api_health_endpoint_edit.text() or "/health")
+
+        # Test-Verbindung (vereinfacht, ohne echten Client-Zugriff)
+        try:
+            import requests
+            health_endpoint = self.custom_api_health_endpoint_edit.text() or "/health"
+            test_url = api_url.rstrip('/') + '/' + health_endpoint.lstrip('/')
+
+            self.custom_api_status_label.setText("Status: Teste Verbindung...")
+            self.custom_api_connect_button.setEnabled(False)
+
+            headers = {
+                "Authorization": f"Bearer {bearer_token}",
+                "User-Agent": "AeroMediaService/1.0"
+            }
+
+            response = requests.get(test_url, headers=headers, timeout=10)
+
+            if response.status_code == 200:
+                self.custom_api_status_label.setText("Status: Verbunden ✓")
+                QMessageBox.information(self, "Verbindung erfolgreich",
+                                      "Die Verbindung zur Custom API wurde erfolgreich getestet!")
+            else:
+                self.custom_api_status_label.setText(f"Status: Fehler HTTP {response.status_code}")
+                QMessageBox.warning(self, "Verbindungsfehler",
+                                  f"Die API antwortete mit HTTP {response.status_code}")
+
+        except requests.exceptions.ConnectionError:
+            self.custom_api_status_label.setText("Status: Verbindungsfehler")
+            QMessageBox.critical(self, "Verbindungsfehler",
+                               "Konnte keine Verbindung zur API herstellen.\nBitte prüfen Sie die URL.")
+        except requests.exceptions.Timeout:
+            self.custom_api_status_label.setText("Status: Timeout")
+            QMessageBox.warning(self, "Timeout",
+                              "Die Verbindung zur API hat zu lange gedauert.")
+        except Exception as e:
+            self.custom_api_status_label.setText(f"Status: Fehler")
+            QMessageBox.critical(self, "Fehler", f"Ein Fehler ist aufgetreten:\n{str(e)}")
+        finally:
+            self.custom_api_connect_button.setEnabled(True)
+
 
     def update_connect_button_state(self, is_connected=None):
         """
