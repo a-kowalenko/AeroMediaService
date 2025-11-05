@@ -1,335 +1,289 @@
-﻿import logging
+﻿import datetime
+import json
+import os
 import requests
-from pathlib import Path
-from typing import Optional
+import logging
+import math
+
+from models.kunde import Kunde
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
-import mimetypes
+
+# Chunk-Größe: 4 MB (unter dem 4.5 MB Limit)
+CHUNK_SIZE = 4 * 1024 * 1024
 
 
 class CustomApiClient(BaseClient):
-    """
-    Implementierung des BaseClient für cloud.kowalenko.io API.
-    Ermöglicht das Hochladen von Dateien mit Bearer Token Authentifizierung.
-    """
+    """Implementierung des BaseClient für Custom Cloud Storage API mit Chunked Upload."""
 
     def __init__(self, config_manager: ConfigManager):
         self.config = config_manager
-        self.session: Optional[requests.Session] = None
+        self.api_base_url = None
+        self.api_key = None
+        self.connected = False
         self.log = logging.getLogger(__name__)
         self.link_shortener = LinkShortener(config_manager)
-        self._is_connected = False
-        self._last_order_id = None  # Speichert die letzte Order-ID für Share-Link
 
     def connect(self, auth_callback=None):
-        """
-        Stellt die Verbindung zur cloud.kowalenko.io API her.
-        Validiert den API-Key durch einen Test-Request.
-        """
-        api_url = self.config.get_secret("custom_api_url")
-        bearer_token = self.config.get_secret("custom_api_bearer_token")
+        """Verbindung zur API herstellen."""
+        self.api_base_url = self.config.get_secret("custom_api_url")
+        self.api_key = self.config.get_secret("custom_api_bearer_token")
 
-        if not api_url or not bearer_token:
-            self.log.warning("Cloud API URL oder Bearer Token fehlen.")
-            signals.connection_status_changed.emit("Fehler: API URL/Token fehlt")
+        if not self.api_base_url or not self.api_key:
+            self.log.warning("API Base URL oder API Key fehlen.")
+            signals.connection_status_changed.emit("Fehler: API Credentials fehlen")
             return False
 
-        # Validiere API-Key Format
-        if not bearer_token.startswith('key_') or '.' not in bearer_token:
-            self.log.warning("Ungültiges API-Key Format. Erwartet: key_xxxxx.secret")
-            signals.connection_status_changed.emit("Fehler: Ungültiger API-Key")
-            return False
-
-        # Session mit Bearer Token initialisieren
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {bearer_token}",
-            "Accept": "application/json",
-            "User-Agent": "AeroMediaService/1.0"
-        })
-
-        # Verbindung testen mit Health-Endpoint
+        # Test-Request zur Validierung
         try:
-            self.log.info("Teste Verbindung zur cloud.kowalenko.io API...")
-
-            # Health-Check Endpoint
-            health_url = api_url.rstrip('/') + '/health'
-
-            response = self.session.get(health_url, timeout=10)
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            response = requests.get(
+                f"{self.api_base_url}/health",
+                headers=headers,
+                timeout=10
+            )
 
             if response.status_code == 200:
-                data = response.json()
-                status = data.get('status')
-
-                if status == 'healthy':
-                    tenant_id = data.get('tenant_id')
-                    self.log.info(f"Erfolgreich mit Cloud API verbunden. Tenant: {tenant_id}")
-                    self._is_connected = True
-                    signals.connection_status_changed.emit("Verbunden")
-                    return True
-                elif status == 'unauthorized':
-                    self.log.warning("API-Key ungültig oder fehlende Berechtigung")
-                    signals.connection_status_changed.emit("Fehler: Ungültiger API-Key")
-                    self._is_connected = False
-                    return False
-                else:
-                    self.log.warning(f"Unerwarteter Status: {status}")
-                    signals.connection_status_changed.emit(f"Fehler: {status}")
-                    self._is_connected = False
-                    return False
+                self.connected = True
+                self.log.info("Erfolgreich mit Custom API verbunden.")
+                signals.connection_status_changed.emit("Verbunden")
+                return True
             else:
-                self.log.warning(f"Cloud API antwortet mit Status {response.status_code}")
+                self.log.error(f"API Connection fehlgeschlagen: {response.status_code}")
                 signals.connection_status_changed.emit(f"Fehler: HTTP {response.status_code}")
-                self._is_connected = False
                 return False
 
-        except requests.exceptions.ConnectionError as e:
-            self.log.error(f"Verbindungsfehler zur Cloud API: {e}")
-            signals.connection_status_changed.emit("Verbindungsfehler")
-            self._is_connected = False
-            return False
-        except requests.exceptions.Timeout:
-            self.log.error("Timeout bei der Verbindung zur Cloud API")
-            signals.connection_status_changed.emit("Timeout")
-            self._is_connected = False
-            return False
-        except Exception as e:
-            self.log.error(f"Unerwarteter Fehler bei API Verbindung: {e}")
-            signals.connection_status_changed.emit(f"Fehler: {e}")
-            self._is_connected = False
+        except requests.exceptions.RequestException as e:
+            self.log.error(f"Verbindungsfehler zur API: {e}")
+            signals.connection_status_changed.emit(f"Verbindungsfehler: {e}")
             return False
 
     def disconnect(self):
-        """Trennt die Verbindung zur cloud.kowalenko.io API."""
-        if self.session:
-            self.session.close()
-            self.session = None
-
-        self._is_connected = False
-        self._last_order_id = None
-        self.log.info("Cloud API Verbindung getrennt.")
+        """Verbindung trennen."""
+        self.log.info("Trenne Verbindung zur Custom API...")
+        self.connected = False
         signals.connection_status_changed.emit("Nicht verbunden")
+        signals.stop_monitoring.emit()
 
     def get_connection_status(self):
-        """Gibt einen String zurück, der den aktuellen Verbindungsstatus beschreibt."""
-        if self._is_connected and self.session:
-            return "Verbunden"
-        else:
-            return "Nicht verbunden"
+        """Verbindungsstatus zurückgeben."""
+        return "Verbunden" if self.connected else "Nicht verbunden"
 
-    def upload_directory(self, local_dir_path, remote_base_path, kunde=None):
-        """
-        Lädt ein komplettes Verzeichnis zur cloud.kowalenko.io API hoch.
-
-        Die cloud.kowalenko.io API erwartet:
-        - Multipart/form-data mit mehreren 'files' Einträgen
-        - Dateinamen müssen den relativen Pfad enthalten (wie webkitRelativePath)
-        - Endpoint: /api/upload
-
-        Verwendet Signale aus core.signals, um den Fortschritt zu melden.
-        """
-        if not self._is_connected or not self.session:
-            self.log.error("Nicht mit Cloud API verbunden. Upload abgebrochen.")
-            signals.upload_failed.emit("Nicht verbunden")
+    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde=None):
+        """Lädt ein Verzeichnis mit Chunked Upload hoch."""
+        if not self.connected:
+            self.log.error("Upload fehlgeschlagen: Nicht verbunden.")
             return False
 
-        api_url = self.config.get_secret("custom_api_url")
-        upload_url = api_url.rstrip('/') + '/upload'
+        self.log.info(f"Beginne Chunked Upload von '{local_dir_path}'")
+
+        # 1. Dateien sammeln
+        files_to_upload = []
+        total_size = 0
+
+        for root, _, files in os.walk(local_dir_path):
+            for file in files:
+                if file in ["_fertig.txt", "_in_verarbeitung.txt"]:
+                    continue
+
+                local_path = os.path.join(root, file)
+                relative_path = os.path.relpath(local_path, local_dir_path)
+
+                try:
+                    file_size = os.path.getsize(local_path)
+                    mime_type = self._get_mime_type(local_path)
+
+                    files_to_upload.append({
+                        "name": relative_path.replace(os.path.sep, '/'),
+                        "size": file_size,
+                        "type": mime_type,
+                        "local_path": local_path
+                    })
+                    total_size += file_size
+                except FileNotFoundError:
+                    self.log.warning(f"Datei nicht gefunden: {local_path}")
+
+        if not files_to_upload:
+            self.log.warning("Keine Dateien zum Hochladen gefunden.")
+            return True
+
+        # 2. Upload-Session initialisieren
+        try:
+            session_data = self._initialize_session(files_to_upload, kunde)
+            session_id = session_data["session_id"]
+            order_id = session_data["order_id"]
+            chunk_size = session_data.get("chunk_size", CHUNK_SIZE)
+
+            self.log.info(f"Session initialisiert: {session_id}, Order: {order_id}")
+
+        except Exception as e:
+            self.log.error(f"Session-Initialisierung fehlgeschlagen: {e}")
+            signals.upload_status_update.emit(f"Fehler: {e}")
+            return False
+
+        # 3. Dateien chunked hochladen
+        bytes_uploaded = 0
 
         try:
-            local_path = Path(local_dir_path)
-            if not local_path.exists():
-                self.log.error(f"Lokaler Pfad existiert nicht: {local_dir_path}")
-                signals.upload_failed.emit("Pfad existiert nicht")
-                return False
+            for file_info in files_to_upload:
+                file_name = file_info["name"]
+                file_size = file_info["size"]
+                local_path = file_info["local_path"]
 
-            # Alle Dateien im Verzeichnis sammeln
-            all_files = []
-            for file_path in local_path.rglob('*'):
-                if file_path.is_file():
-                    # Ignoriere Marker-Dateien
-                    if file_path.name in ("_in_verarbeitung.txt", "_fertig.txt"):
-                        continue
-                    all_files.append(file_path)
+                status_msg = f"Lade hoch: {os.path.basename(file_name)} ({file_size / 1024 ** 2:.2f} MB)"
+                signals.upload_status_update.emit(status_msg)
+                self.log.debug(status_msg)
 
-            if not all_files:
-                self.log.warning(f"Keine Dateien im Verzeichnis gefunden: {local_dir_path}")
-                signals.upload_failed.emit("Keine Dateien gefunden")
-                return False
-
-            total_files = len(all_files)
-            self.log.info(f"Starte Upload von {total_files} Datei(en) zur cloud.kowalenko.io...")
-            signals.upload_started.emit(total_files)
-
-            # Bereite alle Dateien für Multipart-Upload vor
-            files_to_upload = []
-            try:
-                for idx, file_path in enumerate(all_files, start=1):
-                    # Relativen Pfad berechnen (vom Parent des local_path)
-                    # z.B. local_path = "20251031_Event" -> parent ist das Verzeichnis darüber
-                    # Relativer Pfad enthält dann "20251031_Event/Outside_Foto/1.png"
-                    rel_path = file_path.relative_to(local_path.parent)
-
-                    # MIME-Type ermitteln
-                    mime_type, _ = mimetypes.guess_type(str(file_path))
-
-                    self.log.info(f"Bereite Datei vor ({idx}/{total_files}): {rel_path}")
-                    signals.upload_progress.emit(f"Datei {idx}/{total_files}: {file_path.name}")
-
-                    # Datei öffnen und zur Liste hinzufügen
-                    # Format: ('files', (filename_mit_pfad, file_object, mime_type))
-                    files_to_upload.append((
-                        'files',
-                        (str(rel_path), open(file_path, 'rb'), mime_type or 'application/octet-stream')
-                    ))
-
-                # ALLE Dateien auf einmal hochladen (cloud.kowalenko.io erwartet das so)
-                self.log.info(f"Sende {total_files} Dateien zum Server...")
-                signals.upload_progress.emit(f"Sende {total_files} Dateien...")
-
-                # Bereite FormData vor mit optionalen Metadaten
-                form_data = {}
-                if kunde:
-                    import json
-                    from dataclasses import asdict, is_dataclass
-
-                    # Konvertiere Kunde-Objekt zu Dictionary
-                    if is_dataclass(kunde):
-                        kunde_dict = asdict(kunde)
-                    elif isinstance(kunde, dict):
-                        kunde_dict = kunde
-                    else:
-                        kunde_dict = vars(kunde)  # Fallback für normale Objekte
-
-                    form_data['metadata'] = json.dumps(kunde_dict)
-                    self.log.info(f"Sende Metadata: {kunde_dict}")
-
-                response = self.session.post(
-                    upload_url,
-                    files=files_to_upload,
-                    data=form_data if form_data else None,
-                    timeout=600  # 10 Minuten für große Uploads
+                # Datei chunked hochladen
+                success = self._upload_file_chunked(
+                    session_id, local_path, file_name, file_size,
+                    chunk_size, bytes_uploaded, total_size
                 )
 
-                if response.status_code not in [200, 201]:
-                    error_msg = response.text
-                    try:
-                        error_data = response.json()
-                        error_msg = error_data.get('error', error_msg)
-                    except:
-                        pass
+                if not success:
+                    raise Exception(f"Upload von {file_name} fehlgeschlagen")
 
-                    self.log.error(f"Upload fehlgeschlagen: HTTP {response.status_code} - {error_msg}")
-                    signals.upload_failed.emit(f"HTTP {response.status_code}: {error_msg}")
-                    return False
+                bytes_uploaded += file_size
 
-                # Erfolgreiche Antwort verarbeiten
-                result = response.json()
-                self._last_order_id = result.get('order_id')
-                customer_url = result.get('customer_url')
-                session_id = result.get('session_id')
+            # 4. Upload abschließen
+            result = self._complete_upload(session_id)
+            customer_url = result.get("customer_url")
 
-                self.log.info(f"Upload erfolgreich abgeschlossen!")
-                self.log.info(f"  Order ID: {self._last_order_id}")
-                self.log.info(f"  Session ID: {session_id}")
-                self.log.info(f"  Customer URL: {customer_url}")
-
-                signals.upload_finished.emit(f"Upload erfolgreich: {total_files} Dateien")
-
-                # Optional: Customer URL in die Zwischenablage oder zurückgeben
-                if customer_url:
-                    signals.upload_progress.emit(f"Customer URL: {customer_url}")
-
-                return True
-
-            finally:
-                # Alle geöffneten Dateien schließen
-                for _, file_tuple in files_to_upload:
-                    try:
-                        file_tuple[1].close()
-                    except:
-                        pass
+            signals.upload_status_update.emit(f"Upload abgeschlossen.")
+            self.log.info(f"Upload erfolgreich: {customer_url}")
+            return True
 
         except Exception as e:
-            self.log.error(f"Fehler beim Verzeichnis-Upload: {e}", exc_info=True)
-            signals.upload_failed.emit(str(e))
+            self.log.error(f"Upload fehlgeschlagen: {e}")
+            signals.upload_status_update.emit(f"Fehler: {e}")
             return False
 
-    def get_shareable_link(self, remote_path):
-        """
-        Erstellt einen öffentlichen Freigabelink für die letzte hochgeladene Order.
+    def _initialize_session(self, files_to_upload, kunde: Kunde = None):
+        """Upload-Session bei der API initialisieren."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
 
-        Für cloud.kowalenko.io:
-        - Der "Share-Link" ist die Customer-URL, die beim Upload zurückgegeben wird
-        - Format: https://cloud.kowalenko.io/content/{order_id}
-        - Alternativ kann get-share-link/{order_id} verwendet werden
+        # Metadata aus kunde-Parameter extrahieren
+        metadata = {}
+        if kunde:
+            from dataclasses import asdict, is_dataclass
 
-        Args:
-            remote_path: Wird ignoriert, da cloud.kowalenko.io mit Order-IDs arbeitet
-
-        Gibt den Link-String oder None bei einem Fehler zurück.
-        """
-        if not self._is_connected or not self.session:
-            self.log.error("Nicht mit Cloud API verbunden. Kann keinen Link erstellen.")
-            return None
-
-        if not self._last_order_id:
-            self.log.error("Keine Order-ID verfügbar. Bitte erst einen Upload durchführen.")
-            return None
-
-        api_url = self.config.get_secret("custom_api_url")
-
-        # Versuche, den offiziellen Share-Link-Endpoint zu verwenden
-        share_url = api_url.rstrip('/') + f'/get-share-link/{self._last_order_id}'
-
-        try:
-            self.log.info(f"Hole Share-Link für Order: {self._last_order_id}")
-
-            response = self.session.get(share_url, timeout=30)
-
-            if response.status_code in [200, 201]:
-                result = response.json()
-
-                # API gibt share_url zurück
-                share_link = result.get('share_url') or result.get('customer_url') or result.get('url')
-
-                if share_link:
-                    self.log.info(f"Share-Link erhalten: {share_link}")
-
-                    # Optional: Link kürzen, falls SkyLink konfiguriert ist
-                    try:
-                        shortened_link = self.link_shortener.shorten(share_link)
-                        if shortened_link and shortened_link != share_link:
-                            self.log.info(f"Link gekürzt: {shortened_link}")
-                            return shortened_link
-                    except Exception as e:
-                        self.log.warning(f"Link-Kürzung fehlgeschlagen, verwende Original: {e}")
-
-                    return share_link
-                else:
-                    self.log.error("API-Antwort enthält keinen Share-Link")
-                    return None
+            # Konvertiere Kunde-Objekt zu Dictionary
+            if is_dataclass(kunde):
+                kunde_dict = asdict(kunde)
+            elif isinstance(kunde, dict):
+                kunde_dict = kunde
             else:
-                self.log.error(f"Fehler beim Abrufen des Share-Links: HTTP {response.status_code}")
+                kunde_dict = vars(kunde)  # Fallback für normale Objekte
 
-                # Fallback: Erstelle die Customer-URL manuell
-                base_url = api_url.replace('/api', '')  # Entferne /api aus der URL
-                fallback_url = f"{base_url}/content/{self._last_order_id}"
-                self.log.info(f"Verwende Fallback Customer-URL: {fallback_url}")
-                return fallback_url
+            # WICHTIG: Direkt das Dictionary verwenden, NICHT json.dumps()!
+            metadata = kunde_dict  # <-- ÄNDERUNG HIER
+            self.log.info(f"Sende Metadata: {metadata}")
 
-        except Exception as e:
-            self.log.error(f"Fehler beim Abrufen des Share-Links: {e}")
+        payload = {
+            "files": [
+                {
+                    "name": f["name"],
+                    "size": f["size"],
+                    "type": f["type"]
+                }
+                for f in files_to_upload
+            ],
+            "metadata": metadata  # <-- Jetzt ein Dict, kein String!
+        }
 
-            # Fallback: Erstelle die Customer-URL manuell
-            try:
-                base_url = api_url.replace('/api', '')
-                fallback_url = f"{base_url}/content/{self._last_order_id}"
-                self.log.info(f"Verwende Fallback Customer-URL: {fallback_url}")
-                return fallback_url
-            except:
-                return None
+        response = requests.post(
+            f"{self.api_base_url}/upload/init",
+            json=payload,  # requests.post konvertiert automatisch zu JSON
+            headers=headers,
+            timeout=30
+        )
 
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code} - {response.text}")
 
+        return response.json()
+
+    def _upload_file_chunked(self, session_id, local_path, file_name, file_size,
+                             chunk_size, base_bytes_uploaded, total_job_size):
+        """Datei in Chunks hochladen."""
+        total_chunks = math.ceil(file_size / chunk_size)
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        with open(local_path, 'rb') as f:
+            for chunk_index in range(total_chunks):
+                chunk_data = f.read(chunk_size)
+
+                form_data = {
+                    'session_id': session_id,
+                    'file_name': file_name,
+                    'chunk_index': str(chunk_index),
+                    'total_chunks': str(total_chunks)
+                }
+
+                files = {
+                    'chunk': (f'chunk_{chunk_index}', chunk_data, 'application/octet-stream')
+                }
+
+                response = requests.post(
+                    f"{self.api_base_url}/upload/chunk",
+                    data=form_data,
+                    files=files,
+                    headers=headers,
+                    timeout=60
+                )
+
+                if response.status_code != 200:
+                    raise Exception(f"Chunk {chunk_index} upload failed: HTTP {response.status_code} - {response.text}")
+
+                # Fortschritt melden
+                bytes_sent = (chunk_index + 1) * chunk_size
+                if bytes_sent > file_size:
+                    bytes_sent = file_size
+
+                file_progress = int((bytes_sent / file_size) * 100)
+                signals.upload_progress_file.emit(file_progress, bytes_sent, file_size)
+
+                current_total_bytes = base_bytes_uploaded + bytes_sent
+                total_progress = int((current_total_bytes / total_job_size) * 100)
+                signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
+
+                self.log.debug(f"Chunk {chunk_index + 1}/{total_chunks} für {file_name} hochgeladen")
+
+        return True
+
+    def _complete_upload(self, session_id):
+        """Upload-Session abschließen."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(
+            f"{self.api_base_url}/upload/complete",
+            json={"session_id": session_id},
+            headers=headers,
+            timeout=120  # Längeres Timeout für Finalisierung
+        )
+
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code} - {response.text}")
+
+        return response.json()
+
+    def get_shareable_link(self, remote_path):
+        """Gibt den Customer-Link zurück (bereits von complete zurückgegeben)."""
+        # Bei diesem System wird der Link bereits beim complete zurückgegeben
+        # Diese Methode kann optional implementiert werden falls nötig
+        return None
+
+    def _get_mime_type(self, file_path):
+        """Ermittelt den MIME-Type einer Datei."""
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(file_path)
+        return mime_type or 'application/octet-stream'

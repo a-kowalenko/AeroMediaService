@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
 
+from models.kunde import Kunde
+
+
 class BaseClient(ABC):
     """
     Abstrakte Basisklasse für alle Cloud-Storage-Clients.
@@ -27,7 +30,7 @@ class BaseClient(ABC):
         pass
 
     @abstractmethod
-    def upload_directory(self, local_dir_path, remote_base_path, kunde=None):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde : Kunde =None):
         """
         Lädt ein komplettes Verzeichnis hoch.
         Muss Signale aus core.signals verwenden, um den Fortschritt zu melden.

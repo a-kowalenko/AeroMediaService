@@ -1,6 +1,8 @@
 import dropbox
 import os
 import logging
+
+from models.kunde import Kunde
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
@@ -129,7 +131,7 @@ class DropboxClient(BaseClient):
             self.log.error(f"Verbindungsprüfung fehlgeschlagen: {e}")
             return "Verbindungsfehler"
 
-    def upload_directory(self, local_dir_path, remote_base_path, kunde=None):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde=None):
         """Lädt ein Verzeichnis rekursiv hoch und meldet den Fortschritt."""
         if not self.dbx:
             self.log.error("Upload fehlgeschlagen: Nicht mit Dropbox verbunden.")
