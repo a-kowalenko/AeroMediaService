@@ -119,7 +119,7 @@ class CustomApiClient(BaseClient):
         else:
             return "Nicht verbunden"
 
-    def upload_directory(self, local_dir_path, remote_base_path):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde=None):
         """
         Lädt ein komplettes Verzeichnis zur cloud.kowalenko.io API hoch.
 
@@ -189,9 +189,27 @@ class CustomApiClient(BaseClient):
                 self.log.info(f"Sende {total_files} Dateien zum Server...")
                 signals.upload_progress.emit(f"Sende {total_files} Dateien...")
 
+                # Bereite FormData vor mit optionalen Metadaten
+                form_data = {}
+                if kunde:
+                    import json
+                    from dataclasses import asdict, is_dataclass
+
+                    # Konvertiere Kunde-Objekt zu Dictionary
+                    if is_dataclass(kunde):
+                        kunde_dict = asdict(kunde)
+                    elif isinstance(kunde, dict):
+                        kunde_dict = kunde
+                    else:
+                        kunde_dict = vars(kunde)  # Fallback für normale Objekte
+
+                    form_data['metadata'] = json.dumps(kunde_dict)
+                    self.log.info(f"Sende Metadata: {kunde_dict}")
+
                 response = self.session.post(
                     upload_url,
                     files=files_to_upload,
+                    data=form_data if form_data else None,
                     timeout=600  # 10 Minuten für große Uploads
                 )
 

@@ -27,7 +27,7 @@ class BaseClient(ABC):
         pass
 
     @abstractmethod
-    def upload_directory(self, local_dir_path, remote_base_path):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde=None):
         """
         Lädt ein komplettes Verzeichnis hoch.
         Muss Signale aus core.signals verwenden, um den Fortschritt zu melden.

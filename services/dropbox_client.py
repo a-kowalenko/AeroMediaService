@@ -129,7 +129,7 @@ class DropboxClient(BaseClient):
             self.log.error(f"Verbindungsprüfung fehlgeschlagen: {e}")
             return "Verbindungsfehler"
 
-    def upload_directory(self, local_dir_path, remote_base_path):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde=None):
         """Lädt ein Verzeichnis rekursiv hoch und meldet den Fortschritt."""
         if not self.dbx:
             self.log.error("Upload fehlgeschlagen: Nicht mit Dropbox verbunden.")

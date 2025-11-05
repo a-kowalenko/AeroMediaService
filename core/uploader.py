@@ -7,6 +7,7 @@ import time
 
 from PySide6.QtCore import QThread
 from core.config import ConfigManager
+from models.kunde import Kunde
 from services.base_client import BaseClient
 from services.email_client import EmailClient
 from services.sms_client import SmsClient
@@ -48,7 +49,6 @@ class UploaderThread(QThread):
             # damit sie im except-Block garantiert existieren.
             local_dir_path = None
             dir_name = "unbekannt"
-            kunde = None
 
             try:
                 # Warte blockierend auf ein Item in der Queue
@@ -62,7 +62,7 @@ class UploaderThread(QThread):
                 # Ab hier ist sicher, dass current_queue_item kein None ist.
                 self.log.debug(f"current_queue_item: {current_queue_item}")
                 local_dir_path = current_queue_item['dir_path']
-                kunde = current_queue_item['kunde']
+                kunde: Kunde = current_queue_item['kunde']
                 dir_name = os.path.basename(local_dir_path)  # dir_name hier setzen
 
                 self.log.info(f"Beginne Verarbeitung von: {dir_name}")
@@ -74,7 +74,7 @@ class UploaderThread(QThread):
                 remote_path = f"/{dir_name}"
 
                 # 1. Upload durchführen
-                upload_success = self.client.upload_directory(local_dir_path, remote_path)
+                upload_success = self.client.upload_directory(local_dir_path, remote_path, kunde)
 
                 if not upload_success:
                     raise Exception("Upload-Funktion des Clients meldete einen Fehler.")
@@ -93,7 +93,7 @@ class UploaderThread(QThread):
                     try:
                         asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
                     except Exception as sms_e:
-                        self.log.error(f"SMS-Versand für {kunde.vorname} {kunde.nachname} fehlgeschlagen: {sms_e}")
+                        self.log.error(f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}")
                 elif not kunde:
                     self.log.warning(f"Keine Kundendaten für {dir_name} gefunden. Benachrichtigungen übersprungen.")
 

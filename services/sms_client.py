@@ -2,6 +2,7 @@ import logging
 import aiohttp  # Erforderlich für asynchrone HTTP-Anfragen
 
 from core.config import ConfigManager
+from models.kunde import Kunde
 
 
 class SmsClient:
@@ -90,21 +91,21 @@ class SmsClient:
 
         return False
 
-    async def send_upload_success_sms(self, share_link, kunde):
+    async def send_upload_success_sms(self, share_link, kunde: Kunde):
         """
         Sendet eine Erfolgs-SMS mit dem Freigabelink.
         (Analog zu send_upload_success_email)
         """
 
-        phone_number = kunde.telefon
+        phone_number = kunde.phone
         if not phone_number:
             self.log.warning(
-                f"Keine Telefonnummer für Erfolgs-SMS (Gast: {kunde.vorname} {kunde.nachname}) angegeben. Versand wird übersprungen.")
+                f"Keine Telefonnummer für Erfolgs-SMS (Gast: {kunde.first_name} {kunde.last_name}) angegeben. Versand wird übersprungen.")
             return False  # Nicht senden, wenn keine Nummer da ist
 
         # Text für die SMS formatieren (kürzer als E-Mail)
         text = (
-            f"Hallo {kunde.vorname},\n"
+            f"Hallo {kunde.first_name},\n"
             f"dein Medien-Download ist fertig.\n"
             f"Link (14 Tage gültig): {share_link}\n\n"
             f"Dein AERO Fallschirmsport Team\n"

@@ -82,14 +82,20 @@ class MonitorThread(QThread):
                         kunde = None
                         if kundendaten:
                             data = json.loads(kundendaten)
-                            kunde = Kunde(
-                                kunde_id=int(data.get('kunde_id', 0)),
+                            kunde: Kunde = Kunde(
+                                customer_number=int(data.get('kunde_id', 0)),
                                 email=str(data.get('email', '')),
-                                vorname=str(data.get('vorname', '')),
-                                nachname=str(data.get('nachname', '')),
-                                telefon=str(data.get('telefon', '')),
-                                foto=bool(data.get('foto', False)),
-                                video=bool(data.get('video', False))
+                                first_name=str(data.get('vorname', '')),
+                                last_name=str(data.get('nachname', '')),
+                                phone=str(data.get('telefon', '')),
+                                handcam_foto=bool(data.get('handcam_foto', False)),
+                                handcam_video=bool(data.get('handcam_video', False)),
+                                outside_foto=bool(data.get('outside_foto', False)),
+                                outside_video=bool(data.get('outside_video', False)),
+                                ist_bezahlt_handcam_foto=bool(data.get('ist_bezahlt_handcam_foto', False)),
+                                ist_bezahlt_handcam_video=bool(data.get('ist_bezahlt_handcam_video', False)),
+                                ist_bezahlt_outside_foto=bool(data.get('ist_bezahlt_outside_foto', False)),
+                                ist_bezahlt_outside_video=bool(data.get('ist_bezahlt_outside_video', False))
                             )
                             self.log.info(f"Kundendaten geparst für '{dir_name}': {kunde}")
                         else:
