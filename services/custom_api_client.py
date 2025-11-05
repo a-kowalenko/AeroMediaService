@@ -1,6 +1,4 @@
-﻿import datetime
-import json
-import os
+﻿import os
 import requests
 import logging
 import math
@@ -25,6 +23,7 @@ class CustomApiClient(BaseClient):
         self.connected = False
         self.log = logging.getLogger(__name__)
         self.link_shortener = LinkShortener(config_manager)
+        self._last_customer_url = None  # Speichert die letzte customer_url
 
     def connect(self, auth_callback=None):
         """Verbindung zur API herstellen."""
@@ -150,6 +149,9 @@ class CustomApiClient(BaseClient):
             # 4. Upload abschließen
             result = self._complete_upload(session_id)
             customer_url = result.get("customer_url")
+
+            # Speichere customer_url für get_shareable_link
+            self._last_customer_url = customer_url
 
             signals.upload_status_update.emit(f"Upload abgeschlossen.")
             self.log.info(f"Upload erfolgreich: {customer_url}")
@@ -278,9 +280,22 @@ class CustomApiClient(BaseClient):
 
     def get_shareable_link(self, remote_path):
         """Gibt den Customer-Link zurück (bereits von complete zurückgegeben)."""
-        # Bei diesem System wird der Link bereits beim complete zurückgegeben
-        # Diese Methode kann optional implementiert werden falls nötig
-        return None
+        if not self._last_customer_url:
+            self.log.warning("Keine customer_url verfügbar. Upload noch nicht abgeschlossen?")
+            return None
+
+        self.log.info(f"Gebe customer_url zurück: {self._last_customer_url}")
+
+        # Optional: Link-Shortener verwenden
+        try:
+            shortened_link = self.link_shortener.shorten(self._last_customer_url)
+            if shortened_link:
+                self.log.info(f"Link gekürzt: {shortened_link}")
+                return shortened_link
+        except Exception as e:
+            self.log.warning(f"Link-Shortener fehlgeschlagen: {e}, verwende Original-Link")
+
+        return self._last_customer_url
 
     def _get_mime_type(self, file_path):
         """Ermittelt den MIME-Type einer Datei."""
