@@ -145,8 +145,8 @@ class DropboxClient(BaseClient):
         for root, _, files in os.walk(local_dir_path):
             for file in files:
                 local_path = os.path.join(root, file)
-                # Ignoriere die Marker-Datei
-                if file == "_fertig.txt" or file == "_in_verarbeitung.txt":
+                # Ignoriere die Marker-Datei und Systemdateien
+                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
                     continue
 
                 # Relativen Pfad für Dropbox berechnen

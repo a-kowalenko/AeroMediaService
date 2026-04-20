@@ -105,7 +105,7 @@ class CustomApiClient(BaseClient):
 
         for root, _, files in os.walk(local_dir_path):
             for file in files:
-                if file in ["_fertig.txt", "_in_verarbeitung.txt"]:
+                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
                     continue
 
                 local_path = os.path.join(root, file)
@@ -467,4 +467,3 @@ class CustomApiClient(BaseClient):
         import mimetypes
         mime_type, _ = mimetypes.guess_type(file_path)
         return mime_type or 'application/octet-stream'
-
