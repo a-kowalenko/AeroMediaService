@@ -37,10 +37,20 @@ class LinkShortener:
                 self.log.info(f"Link erfolgreich gekürzt: {short_url}")
                 return short_url
             else:
+                content_type = response.headers.get('content-type', '')
                 self.log.warning(
                     f"Kürzen des Links fehlgeschlagen (Status {response.status_code}), "
-                    f"Content-Type: {response.headers.get('content-type')}"
+                    f"Content-Type: {content_type}"
                 )
+
+                # Logge nur den Anfang der Response, um HTML-Flut zu vermeiden
+                if 'html' in content_type.lower():
+                    self.log.debug(f"Response (HTML, gekürzt): {response.text[:200]}...")
+                elif len(response.text) > 500:
+                    self.log.debug(f"Response (gekürzt): {response.text[:500]}...")
+                else:
+                    self.log.debug(f"Response: {response.text}")
+
                 if response.status_code == 401:
                     self.log.error("API-Key für SkyLink-Shortener ist ungültig oder fehlt!")
                 return long_url

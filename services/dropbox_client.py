@@ -1,6 +1,8 @@
 import dropbox
 import os
 import logging
+
+from models.kunde import Kunde
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
@@ -129,7 +131,7 @@ class DropboxClient(BaseClient):
             self.log.error(f"Verbindungsprüfung fehlgeschlagen: {e}")
             return "Verbindungsfehler"
 
-    def upload_directory(self, local_dir_path, remote_base_path):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde=None):
         """Lädt ein Verzeichnis rekursiv hoch und meldet den Fortschritt."""
         if not self.dbx:
             self.log.error("Upload fehlgeschlagen: Nicht mit Dropbox verbunden.")
@@ -143,8 +145,8 @@ class DropboxClient(BaseClient):
         for root, _, files in os.walk(local_dir_path):
             for file in files:
                 local_path = os.path.join(root, file)
-                # Ignoriere die Marker-Datei
-                if file == "_fertig.txt" or file == "_in_verarbeitung.txt":
+                # Ignoriere die Marker-Datei und Systemdateien
+                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
                     continue
 
                 # Relativen Pfad für Dropbox berechnen
