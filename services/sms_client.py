@@ -108,7 +108,7 @@ class SmsClient:
             f"Hallo {kunde.first_name},\n"
             f"dein Medien-Download ist fertig.\n"
             f"Link (14 Tage gültig): {share_link}\n\n"
-            f"Dein AERO Fallschirmsport Team\n"
+            f"Dein AERO Team\n"
             f"(Bei Fragen: 05674-99930)"
         )
 

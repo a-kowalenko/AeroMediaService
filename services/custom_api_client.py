@@ -131,12 +131,13 @@ class CustomApiClient(BaseClient):
 
         # 2. Direct Upload Session initialisieren
         try:
-            session_data = self._initialize_direct_session(files_to_upload, kunde)
+            # Extrahiere den exakten Verzeichnisnamen für den Server
+            folder_name = os.path.basename(local_dir_path)
+            session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
             session_id = session_data["session_id"]
             order_id = session_data["order_id"]
-            tenant_id = session_data["tenant_id"]
 
-            self.log.info(f"Direct Upload Session initialisiert: {session_id}, Order: {order_id}, Tenant: {tenant_id}")
+            self.log.info(f"Direct Upload Session initialisiert: {session_id}, Order: {order_id}")
 
         except Exception as e:
             self.log.error(f"Session-Initialisierung fehlgeschlagen: {e}")
@@ -156,7 +157,6 @@ class CustomApiClient(BaseClient):
                         self._upload_file_direct,
                         session_id,
                         order_id,
-                        tenant_id,
                         file_info,
                         total_size,
                         uploaded_counter
@@ -191,7 +191,7 @@ class CustomApiClient(BaseClient):
             signals.upload_status_update.emit(f"Fehler: {e}")
             return False
 
-    def _initialize_direct_session(self, files_to_upload, kunde: Kunde = None):
+    def _initialize_direct_session(self, files_to_upload, base_folder_name, kunde: Kunde = None):
         """Direct Upload Session bei der API initialisieren.
 
         Endpoint: POST /api/upload/direct-init
@@ -221,7 +221,8 @@ class CustomApiClient(BaseClient):
                 }
                 for f in files_to_upload
             ],
-            "metadata": metadata
+            "metadata": metadata,
+            "base_folder_name": base_folder_name
         }
 
         response = self.session.post(
@@ -241,23 +242,21 @@ class CustomApiClient(BaseClient):
 
         return result
 
-    def _get_presigned_url(self, session_id, order_id, tenant_id, file_name, file_type):
-        """Presigned URL für File-Upload abrufen (Vercel Blob Client Upload Protocol).
+    def _get_presigned_url(self, session_id, order_id, file_name, file_type):
+        """Upload-URL von der API abrufen.
 
         Endpoint: POST /api/upload/presigned-url
-
-        Returns: Dict mit 'clientToken' und 'pathname' für direkten Blob-Upload
+        Returns: Dict mit 'url' (Dropbox Direct Upload Link)
         """
-        pathname = f"{tenant_id}/{order_id}/{file_name}"
+        pathname = f"{order_id}/{file_name}"
 
         client_payload = json.dumps({
             "session_id": session_id,
             "order_id": order_id,
-            "tenant_id": tenant_id,
             "file_name": file_name
         })
 
-        # Vercel Blob Client Upload Protocol
+        # Die API erwartet aktuell noch dieses Format (Vercel Blob Protocol)
         token_request = {
             "type": "blob.generate-client-token",
             "payload": {
@@ -279,102 +278,100 @@ class CustomApiClient(BaseClient):
             raise Exception(f"HTTP {response.status_code} - {error_text}")
 
         token_data = response.json()
-
-        # Validiere Response
-        if token_data.get('type') != 'blob.generate-client-token':
-            raise Exception(f"Unexpected response type: {token_data.get('type')}")
-
+        # Die API sendet das Feld als 'url' (Fallback auf 'directUploadUrl' für Kompatibilität)
+        upload_url = token_data.get('url') or token_data.get('directUploadUrl')
         client_token = token_data.get('clientToken')
-        if not client_token:
-            raise Exception(f"No clientToken in response: {token_data}")
+
+        if not upload_url:
+            raise Exception(f"Keine Upload-URL in API-Antwort erhalten: {token_data}")
 
         return {
-            'clientToken': client_token,
-            'pathname': pathname
+            'url': upload_url,
+            'pathname': pathname,
+            'clientToken': client_token
         }
 
-    def _upload_file_direct(self, session_id, order_id, tenant_id, file_info, total_job_size, uploaded_counter):
-        """Datei direkt zu Blob Storage hochladen."""
+    def _upload_file_direct(self, session_id, order_id, file_info, total_job_size, uploaded_counter):
+        """Datei direkt zum Cloud Storage (Dropbox) hochladen."""
         file_name = file_info["name"]
         file_size = file_info["size"]
         file_type = file_info["type"]
         local_path = file_info["local_path"]
 
         try:
-            # 1. Upload-Token abrufen
+            # 1. Upload-URL abrufen
             presigned_data = self._get_presigned_url(
-                session_id, order_id, tenant_id, file_name, file_type
+                session_id, order_id, file_name, file_type
             )
 
-            client_token = presigned_data.get("clientToken")
+            upload_url = presigned_data.get("url")
             pathname = presigned_data.get("pathname")
+            client_token = presigned_data.get("clientToken")
 
-            if not client_token or not pathname:
-                raise Exception(f"Keine gültige Presigned URL: {presigned_data}")
+            self.log.info(f"✓ Upload-URL erhalten")
 
-            self.log.info(f"✓ Upload-Token erhalten")
-
-            # 2. Datei hochladen
-            blob_url = f"https://blob.vercel-storage.com/{pathname}"
-
+            # 2. Datei hochladen (Direct Upload zu Dropbox via POST)
             with open(local_path, 'rb') as f:
+                self.log.info(f"   Direct Upload zu Dropbox: {file_name}")
+                
                 upload_headers = {
-                    'Authorization': f'Bearer {client_token}',
-                    'Content-Type': file_type,
-                    'x-content-type': file_type
+                    'Content-Type': 'application/octet-stream'
                 }
-
-                upload_response = requests.put(
-                    blob_url,
+                
+                upload_response = requests.post(
+                    upload_url,
                     headers=upload_headers,
                     data=f,
-                    timeout=300
+                    timeout=600
                 )
 
             if upload_response.status_code not in [200, 201]:
+                self.log.error(f"Upload-Antwort: {upload_response.status_code} - {upload_response.text}")
                 raise Exception(f"Upload failed: HTTP {upload_response.status_code}")
 
-            # Parse Blob URL
+            # Dropbox liefert bei Erfolg Metadaten zurück, inkl. einer 'id'
+            dropbox_id = None
             try:
-                upload_result = upload_response.json()
-                actual_blob_url = upload_result.get('url', blob_url)
-            except:
-                actual_blob_url = blob_url
+                db_metadata = upload_response.json()
+                dropbox_id = db_metadata.get('id')
+                if not dropbox_id:
+                    self.log.warning(f"Dropbox-Antwort enthielt keine 'id': {db_metadata}")
+            except Exception as json_e:
+                self.log.warning(f"Konnte Dropbox-Antwort nicht als JSON parsen: {upload_response.text[:200]}")
+
+            # Fallback: Wenn keine ID vorhanden, erzeuge eine eindeutige ID im Dropbox-Format,
+            # um 'unique constraint' Fehler in der DB zu vermeiden.
+            if not dropbox_id:
+                import uuid
+                dropbox_id = f"id:temp_{uuid.uuid4().hex[:12]}"
+                self.log.info(f"Verwende temporäre ID: {dropbox_id}")
 
             # 3. File beim Server registrieren
-            # WICHTIG: Vercel Blob Callbacks funktionieren nicht bei direktem PUT!
+            # Wir senden alle Felder (inkl. blob_url Fallback), um Server-Fehler zu vermeiden
+            register_payload = {
+                'session_id': session_id,
+                'order_id': order_id,
+                'file_name': file_name,
+                'dropbox_id': dropbox_id,
+                'clientToken': client_token,
+                'blob_url': f"dropbox://{order_id}/{file_name}" # Hilfs-URL für den Server
+            }
+
             register_response = self.session.post(
                 f"{self.api_base_url}/upload/register",
-                json={
-                    'session_id': session_id,
-                    'file_name': file_name,
-                    'blob_url': actual_blob_url
-                },
+                json=register_payload,
                 timeout=30
             )
 
-            # CRITICAL: Werfe Exception wenn Registrierung fehlschlägt!
             if not register_response.ok:
                 error_text = register_response.text[:200] if len(register_response.text) > 200 else register_response.text
-                raise Exception(
-                    f"File registration failed: HTTP {register_response.status_code}\n"
-                    f"Response: {error_text}\n"
-                    f"File uploaded to Blob but NOT registered in database!"
-                )
-
-            # Log Success
-            register_data = register_response.json()
-            uploaded_count = register_data.get('uploaded_files', 0)
-            total_count = register_data.get('total_files', 0)
-            self.log.info(f"   ✓ Registered: {uploaded_count}/{total_count} files")
+                raise Exception(f"File registration failed: HTTP {register_response.status_code} - {error_text}")
 
             # 4. Progress aktualisieren
             with self.progress_lock:
                 uploaded_counter['bytes'] += file_size
                 current_total_bytes = uploaded_counter['bytes']
-
                 signals.upload_progress_file.emit(100, file_size, file_size)
-
                 total_progress = int((current_total_bytes / total_job_size) * 100)
                 signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
 
