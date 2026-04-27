@@ -2,11 +2,12 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon, QPainter, QColor
+from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
-    QMessageBox
+    QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter,
+    QDialog, QDialogButtonBox
 )
 
 from PySide6.QtCore import QCoreApplication, QProcess, Slot, Qt, Signal
@@ -25,6 +26,7 @@ from services.sms_client import SmsClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
 from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
+from utils.history_manager import HistoryManager
 
 
 class StatusLight(QWidget):
@@ -114,6 +116,10 @@ class MainWindow(QMainWindow):
         self.update_thread = None
         self.update_worker = None
 
+        self.history_manager = HistoryManager()
+        self.current_history_page = 0
+        self.history_items_per_page = 25
+
         # Member-Variable für den letzten Update-Status
         self.latest_version_info = "Noch nicht geprüft."
 
@@ -141,6 +147,14 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(main_widget)
         self.setCentralWidget(main_widget)
 
+        # Tab Widget
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # --- Tab 1: Monitor ---
+        self.monitor_tab = QWidget()
+        monitor_layout = QVBoxLayout(self.monitor_tab)
+
         # 1. Button-Leiste (oben)
         button_layout = QHBoxLayout()
 
@@ -163,13 +177,13 @@ class MainWindow(QMainWindow):
         button_layout.addStretch()
         button_layout.addWidget(self.settings_button)
         button_layout.addWidget(self.restart_button)
-        main_layout.addLayout(button_layout)
+        monitor_layout.addLayout(button_layout)
 
         # 2. Log-Anzeige
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        main_layout.addWidget(self.log_display)
+        monitor_layout.addWidget(self.log_display)
 
         # 3. Fortschrittsanzeigen
         progress_layout = QVBoxLayout()
@@ -200,7 +214,80 @@ class MainWindow(QMainWindow):
         self.file_progress_bar = QProgressBar(textVisible=False)
         progress_layout.addWidget(self.file_progress_bar)
 
-        main_layout.addLayout(progress_layout)
+        monitor_layout.addLayout(progress_layout)
+
+        self.tabs.addTab(self.monitor_tab, "Monitor")
+
+        # --- Tab 2: Upload-Historie ---
+        self.history_tab = QWidget()
+        history_layout = QVBoxLayout(self.history_tab)
+
+        # Suche & Buttons
+        hist_top_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Suchen...")
+        self.search_input.textChanged.connect(self.on_search_changed)
+        hist_top_layout.addWidget(self.search_input)
+
+        self.check_sms_status_btn = QPushButton("SMS-Status prüfen")
+        self.check_sms_status_btn.clicked.connect(self.check_sms_status)
+        hist_top_layout.addWidget(self.check_sms_status_btn)
+
+        self.delete_selected_btn = QPushButton("Ausgewählte löschen")
+        self.delete_selected_btn.clicked.connect(self.delete_selected_history)
+        hist_top_layout.addWidget(self.delete_selected_btn)
+
+        self.delete_all_btn = QPushButton("Alle löschen")
+        self.delete_all_btn.clicked.connect(self.delete_all_history)
+        hist_top_layout.addWidget(self.delete_all_btn)
+
+        history_layout.addLayout(hist_top_layout)
+
+        # Splitter für Main und Detail Grid
+        self.history_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Tabelle (Main Grid)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(4)
+        self.history_table.setHorizontalHeaderLabels(["Datum", "Name", "Status", "Fehler"])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.itemSelectionChanged.connect(self.on_history_selection_changed)
+        self.history_table.itemDoubleClicked.connect(self.on_history_cell_clicked)
+        self.history_splitter.addWidget(self.history_table)
+
+        # Detail Grid
+        self.detail_table = QTableWidget()
+        self.detail_table.setColumnCount(2)
+        self.detail_table.setHorizontalHeaderLabels(["Eigenschaft", "Wert"])
+        self.detail_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.detail_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.detail_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_splitter.addWidget(self.detail_table)
+
+        history_layout.addWidget(self.history_splitter)
+
+        # Pagination
+        pag_layout = QHBoxLayout()
+        self.prev_page_btn = QPushButton("< Vorherige")
+        self.prev_page_btn.clicked.connect(self.prev_history_page)
+        self.page_label = QLabel("Seite 1")
+        self.next_page_btn = QPushButton("Nächste >")
+        self.next_page_btn.clicked.connect(self.next_history_page)
+
+        pag_layout.addStretch()
+        pag_layout.addWidget(self.prev_page_btn)
+        pag_layout.addWidget(self.page_label)
+        pag_layout.addWidget(self.next_page_btn)
+        pag_layout.addStretch()
+
+        history_layout.addLayout(pag_layout)
+
+        self.tabs.addTab(self.history_tab, "Upload-Historie")
+        self.refresh_history_table()
 
         # 4. Statusleiste (unten)
         self.status_bar = QStatusBar()
@@ -218,17 +305,20 @@ class MainWindow(QMainWindow):
 
     def connect_signals(self):
         """Verbindet die globalen Signale mit den GUI-Slots."""
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        
         signals.log_message.connect(self.add_log_message)
+        signals.upload_history_update.connect(self.on_history_update)
         signals.upload_progress_file.connect(self.update_file_progress)
         signals.upload_progress_total.connect(self.update_total_progress)
         signals.upload_status_update.connect(self.status_label.setText)
         signals.monitoring_status_changed.connect(self.update_monitoring_status)
 
         # Upload-Fortschritt-Signale
-        signals.upload_started.connect(lambda count: self.add_log_message(f"Upload gestartet: {count} Datei(en)"))
-        signals.upload_progress.connect(self.add_log_message)
-        signals.upload_finished.connect(self.add_log_message)
-        signals.upload_failed.connect(lambda msg: self.add_log_message(f"❌ Upload fehlgeschlagen: {msg}"))
+        signals.upload_started.connect(lambda count: self.add_log_message(logging.INFO, f"Upload gestartet: {count} Datei(en)"))
+        signals.upload_progress.connect(lambda msg: self.add_log_message(logging.INFO, msg))
+        signals.upload_finished.connect(lambda msg: self.add_log_message(logging.INFO, msg))
+        signals.upload_failed.connect(lambda msg: self.add_log_message(logging.ERROR, f"❌ Upload fehlgeschlagen: {msg}"))
 
         signals.connection_status_changed.connect(self.connection_status_label.setText)
         signals.connection_status_changed.connect(self.update_status_light)
@@ -290,12 +380,457 @@ class MainWindow(QMainWindow):
 
     # --- Slot-Funktionen (Reaktionen auf Events) ---
 
-    @Slot(str)
-    def add_log_message(self, message):
-        """Fügt eine Nachricht zur Log-Anzeige hinzu."""
-        self.log_display.append(message)
+    @Slot(int, str)
+    def add_log_message(self, level, message):
+        """Fügt eine Nachricht zur Log-Anzeige hinzu und färbt sie ein."""
+        color = "white"
+        if level == logging.ERROR:
+            color = "red"
+        elif level == logging.WARNING:
+            color = "orange"
+        elif level == logging.DEBUG:
+            color = "gray"
+
+        # Verwende HTML für die Farbe, ersetze \n durch <br> um Formatierung beizubehalten
+        formatted_msg = message.replace('\n', '<br>')
+        html_message = f"<span style='color:{color};'>{formatted_msg}</span>"
+        self.log_display.append(html_message)
         # Auto-Scroll
         self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+
+    @Slot(dict)
+    def on_history_update(self, data):
+        """Wird aufgerufen, wenn ein Upload aktualisiert wird."""
+        selected_id = self.get_selected_history_id()
+
+        updated_id = data.get("id")
+        updated_dir = data.get("dir_name")
+
+        self.history_manager.add_or_update(data)
+        self.refresh_history_table(maintain_page=True)
+
+        # Detail Grid offen halten + live aktualisieren, wenn selektierter Eintrag betroffen ist.
+        if selected_id:
+            if (updated_id and updated_id == selected_id) or (
+                not updated_id and updated_dir and self._selected_entry_matches_dir(selected_id, updated_dir)
+            ):
+                item_data = self.get_history_entry_by_id(selected_id)
+                if item_data:
+                    self.populate_detail_table(item_data)
+
+    def _selected_entry_matches_dir(self, selected_id, dir_name):
+        """Hilfsfunktion: Prüft, ob die selektierte ID zu einem Verzeichnisnamen gehört."""
+        if not selected_id or not dir_name:
+            return False
+        for entry in self.history_manager.history:
+            if entry.get("id") == selected_id and entry.get("dir_name") == dir_name:
+                return True
+        return False
+
+    def refresh_history_table(self, maintain_page=False):
+        # Aktuell selektierte ID merken, um Auswahl beizubehalten
+        selected_id = None
+        selected_items = self.history_table.selectedItems()
+        if selected_items:
+            row = selected_items[0].row()
+            first_col_item = self.history_table.item(row, 0)
+            if first_col_item:
+                selected_id = first_col_item.data(Qt.ItemDataRole.UserRole)
+
+        search_text = self.search_input.text()
+        filtered_data = self.history_manager.get_filtered_history(search_text)
+
+        total_items = len(filtered_data)
+        max_page = max(0, (total_items - 1) // self.history_items_per_page)
+
+        if not maintain_page or self.current_history_page > max_page:
+            self.current_history_page = 0
+
+        start_idx = self.current_history_page * self.history_items_per_page
+        end_idx = start_idx + self.history_items_per_page
+        page_data = filtered_data[start_idx:end_idx]
+
+        self.history_table.blockSignals(True)
+        self.history_table.setRowCount(0)
+        for row_idx, item in enumerate(page_data):
+            self.history_table.insertRow(row_idx)
+
+            # Store ID in the first item's UserRole mapping for deletion
+            raw_date = item.get("last_updated", "")
+            formatted_date = ""
+            if "T" in raw_date:
+                try:
+                    d_part, t_part = raw_date.split("T")
+                    y, m, d = d_part.split("-")
+                    formatted_date = f"{d}.{m}.{y} {t_part[:8]}"
+                except Exception:
+                    formatted_date = raw_date[:19].replace("T", " ")
+            else:
+                formatted_date = raw_date[:19].replace("T", " ")
+
+            date_item = QTableWidgetItem(formatted_date)
+            date_item.setToolTip(formatted_date)
+            date_item.setData(Qt.ItemDataRole.UserRole, item.get("id"))
+            # Store full item data for detail view
+            date_item.setData(Qt.ItemDataRole.UserRole + 1, item)
+            date_item.setFlags(date_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            # Name generieren
+            first_name = item.get("first_name", "")
+            last_name = item.get("last_name", "")
+            if first_name or last_name:
+                name_text = f"{first_name} {last_name}".strip()
+            else:
+                name_text = item.get("dir_name", "Unbekannt")
+
+            name_item = QTableWidgetItem(name_text)
+            name_item.setToolTip(name_text)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            status_val = self.build_overall_status(item)
+            status_item = QTableWidgetItem(status_val)
+            status_item.setToolTip(status_val)
+            status_item.setIcon(self.get_status_icon(status_val))
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            error_text = self.build_combined_error_text(item)
+            err_item = QTableWidgetItem(error_text)
+            err_item.setToolTip(error_text)
+            err_item.setFlags(err_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            self.history_table.setItem(row_idx, 0, date_item)
+            self.history_table.setItem(row_idx, 1, name_item)
+            self.history_table.setItem(row_idx, 2, status_item)
+            self.history_table.setItem(row_idx, 3, err_item)
+
+        self.history_table.blockSignals(False)
+        
+        # Selektion wiederherstellen
+        if selected_id:
+            for row in range(self.history_table.rowCount()):
+                item = self.history_table.item(row, 0)
+                if item and item.data(Qt.ItemDataRole.UserRole) == selected_id:
+                    self.history_table.selectRow(row)
+                    break
+        else:
+            self.on_history_selection_changed()
+
+        self.page_label.setText(f"Seite {self.current_history_page + 1} von {max_page + 1}")
+        self.prev_page_btn.setEnabled(self.current_history_page > 0)
+        self.next_page_btn.setEnabled(self.current_history_page < max_page)
+
+    def build_combined_error_text(self, item_data):
+        """Sammelt alle Fehlermeldungen (Upload/E-Mail/SMS) in einem Text."""
+        errors = []
+
+        upload_error = (item_data.get("error_msg") or "").strip()
+        if upload_error:
+            errors.append(f"Upload: {upload_error}")
+
+        email_status = (item_data.get("email_status") or "").strip()
+        if email_status and (
+            "fehler" in email_status.lower()
+            or "fehlgeschlagen" in email_status.lower()
+            or "abgelehnt" in email_status.lower()
+        ):
+            errors.append(f"E-Mail: {email_status}")
+
+        sms_status = (item_data.get("sms_status") or "").strip()
+        if sms_status and (
+            "fehler" in sms_status.lower()
+            or "fehlgeschlagen" in sms_status.lower()
+            or "abgelehnt" in sms_status.lower()
+        ):
+            errors.append(f"SMS: {sms_status}")
+
+        return " | ".join(errors)
+
+    def build_overall_status(self, item_data):
+        """Erstellt den Gesamtstatus für das Main Grid."""
+        upload_status = (item_data.get("status") or "").strip()
+        email_status = (item_data.get("email_status") or "").strip()
+        sms_status = (item_data.get("sms_status") or "").strip()
+        email_value = (item_data.get("email") or "").strip()
+        phone_value = (item_data.get("phone") or "").strip()
+
+        def is_problem(status_value):
+            s = (status_value or "").strip().lower()
+            if not s:
+                return False
+            return ("fehler" in s) or ("fehlgeschlagen" in s) or ("abgelehnt" in s)
+
+        def is_in_progress(status_value):
+            s = (status_value or "").strip().lower()
+            if not s:
+                return False
+            return ("gestartet" in s) or ("übertragen" in s) or ("gepuffert" in s) or ("akzeptiert" in s)
+
+        def is_best_upload(status_value):
+            s = (status_value or "").strip().lower()
+            return "erfolgreich" in s
+
+        def is_best_email(status_value):
+            s = (status_value or "").strip().lower()
+            # E-Mail kennt i.d.R. keinen "zugestellt"-Rückkanal.
+            return ("gesendet" in s) or ("zugestellt" in s) or ("erfolgreich" in s)
+
+        def is_best_sms(status_value):
+            s = (status_value or "").strip().lower()
+            # Für SMS gilt erst "zugestellt" als bester Endzustand.
+            return ("zugestellt" in s) or ("erfolgreich" in s)
+
+        upload_problem = is_problem(upload_status)
+        email_problem = bool(email_value) and is_problem(email_status)
+        sms_problem = bool(phone_value) and is_problem(sms_status)
+        has_problem = upload_problem or email_problem or sms_problem
+        if has_problem:
+            return "Problem"
+
+        sms_sent_waiting_delivery = bool(phone_value) and ("gesendet" in sms_status.lower()) and not is_best_sms(sms_status)
+        if sms_sent_waiting_delivery:
+            return "In Bearbeitung"
+
+        if any(is_in_progress(s) for s in (upload_status, email_status, sms_status)):
+            return "In Bearbeitung"
+
+        upload_is_best = is_best_upload(upload_status)
+        email_is_best = (not email_value) or is_best_email(email_status)
+        sms_is_best = (not phone_value) or is_best_sms(sms_status)
+        if upload_is_best and email_is_best and sms_is_best:
+            return "Erfolgreich"
+
+        # Abgeschlossen, aber nicht auf Bestwert in allen Unter-Status.
+        if upload_status or email_status or sms_status:
+            return "Teilweise"
+
+        return "Unbekannt"
+
+    def get_status_icon(self, status_text, context_key=""):
+        """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text."""
+        color = "gray"
+        lower_status = status_text.lower()
+        lower_context = (context_key or "").lower()
+
+        # E-Mail "Gesendet" gilt als erfolgreicher Endzustand.
+        if "email" in lower_context and "gesendet" in lower_status:
+            color = "green"
+        elif "sms" in lower_context and "gesendet" in lower_status:
+            # SMS "Gesendet" ist noch nicht zwingend zugestellt.
+            color = "orange"
+        elif "problem" in lower_status:
+            color = "red"
+        elif "in bearbeitung" in lower_status:
+            color = "blue"
+        elif "erfolgreich" in lower_status:
+            color = "green"
+        elif "zugestellt" in lower_status:
+            color = "green"
+        elif "gesendet" in lower_status:
+            color = "orange"
+        elif "fehler" in lower_status or "fehlgeschlagen" in lower_status or "abgelehnt" in lower_status:
+            color = "red"
+        elif "gestartet" in lower_status or "übertragen" in lower_status or "gepuffert" in lower_status or "akzeptiert" in lower_status:
+            color = "blue"
+        elif "übersprungen" in lower_status:
+            color = "gray"
+
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.GlobalColor.transparent)
+        painter.drawEllipse(2, 2, 12, 12)
+        painter.end()
+        return QIcon(pixmap)
+
+    @Slot(int)
+    def on_tab_changed(self, index):
+        """Wird aufgerufen, wenn der Tab gewechselt wird."""
+        if hasattr(self, 'history_tab') and hasattr(self, 'tabs') and self.tabs.widget(index) == self.history_tab:
+            # Wenn auf den Historien-Tab gewechselt wird, SMS-Status automatisch abfragen
+            if hasattr(self, 'check_sms_status_btn') and self.check_sms_status_btn.isEnabled():
+                self.check_sms_status()
+
+    @Slot()
+    def on_history_selection_changed(self):
+        """Aktualisiert das Detail Grid basierend auf der Auswahl im Main Grid."""
+        selected_items = self.history_table.selectedItems()
+        if not selected_items:
+            self.detail_table.setRowCount(0)
+            return
+
+        row = selected_items[0].row()
+        date_item = self.history_table.item(row, 0)
+        if not date_item:
+            self.detail_table.setRowCount(0)
+            return
+
+        item_data = date_item.data(Qt.ItemDataRole.UserRole + 1)
+        if not item_data:
+            self.detail_table.setRowCount(0)
+            return
+
+        self.populate_detail_table(item_data)
+
+    def populate_detail_table(self, item_data):
+        """Befüllt das Detail Grid aus einem Historien-Eintrag."""
+        self.detail_table.setRowCount(0)
+
+        details = []
+        details.append(("Verzeichnis", item_data.get("dir_name", "")))
+        details.append(("Upload-Status", item_data.get("status", "")))
+
+        email_val = item_data.get("email", "")
+        email_status = item_data.get("email_status", "")
+        email_text = f"{email_val} ({email_status})" if email_val else email_status
+        details.append(("Email mit Status", email_text))
+
+        phone_val = item_data.get("phone", "")
+        sms_status = item_data.get("sms_status", "")
+        phone_text = f"{phone_val} ({sms_status})" if phone_val else sms_status
+        details.append(("Telefonnummer mit SMS-Status", phone_text))
+
+        sms_price = item_data.get("sms_price", "")
+        price_text = f"{sms_price}€" if sms_price else ""
+        details.append(("SMS Kosten", price_text))
+        details.append(("Fehlertext", self.build_combined_error_text(item_data)))
+
+        self.detail_table.setRowCount(len(details))
+        for i, (key, value) in enumerate(details):
+            key_item = QTableWidgetItem(key)
+            val_item = QTableWidgetItem(value)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            val_item.setFlags(val_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            val_item.setToolTip(value)
+
+            if "Status" in key:
+                val_item.setIcon(self.get_status_icon(value, key))
+
+            self.detail_table.setItem(i, 0, key_item)
+            self.detail_table.setItem(i, 1, val_item)
+
+    def get_selected_history_id(self):
+        """Liest die ID des aktuell selektierten Historien-Eintrags aus."""
+        selected_items = self.history_table.selectedItems()
+        if not selected_items:
+            return None
+        selected_row = selected_items[0].row()
+        selected_date_item = self.history_table.item(selected_row, 0)
+        if not selected_date_item:
+            return None
+        return selected_date_item.data(Qt.ItemDataRole.UserRole)
+
+    def get_history_entry_by_id(self, entry_id):
+        """Liefert den Historien-Eintrag zu einer ID."""
+        if not entry_id:
+            return None
+        for entry in self.history_manager.history:
+            if entry.get("id") == entry_id:
+                return entry
+        return None
+
+    @Slot(QTableWidgetItem)
+    def on_history_cell_clicked(self, item):
+        """Zeigt den kompletten Zelltext in einem kopierbaren, nicht editierbaren Dialog."""
+        if not item:
+            return
+
+        full_text = item.text() or ""
+        if not full_text:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Zellinhalt")
+        dialog.resize(700, 280)
+
+        layout = QVBoxLayout(dialog)
+        text_view = QTextEdit(dialog)
+        text_view.setReadOnly(True)
+        text_view.setPlainText(full_text)
+        text_view.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        layout.addWidget(text_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec()
+
+    @Slot()
+    def on_search_changed(self):
+        self.current_history_page = 0
+        self.refresh_history_table()
+
+    @Slot()
+    def prev_history_page(self):
+        if self.current_history_page > 0:
+            self.current_history_page -= 1
+            self.refresh_history_table(maintain_page=True)
+
+    @Slot()
+    def next_history_page(self):
+        self.current_history_page += 1
+        self.refresh_history_table(maintain_page=True)
+
+    @Slot()
+    def delete_selected_history(self):
+        selected_rows = set(item.row() for item in self.history_table.selectedItems())
+        if not selected_rows:
+            return
+
+        reply = QMessageBox.question(self, "Löschen bestätigen", f"Möchten Sie {len(selected_rows)} Eintrag/Einträge löschen?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            ids_to_delete = []
+            for row in selected_rows:
+                item = self.history_table.item(row, 0)
+                if item:
+                    item_id = item.data(Qt.ItemDataRole.UserRole)
+                    if item_id:
+                        ids_to_delete.append(item_id)
+            self.history_manager.delete_items(ids_to_delete)
+            self.refresh_history_table(maintain_page=True)
+
+    @Slot()
+    def delete_all_history(self):
+        reply = QMessageBox.question(self, "Löschen bestätigen", "Möchten Sie wirklich die gesamte Historie löschen?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.history_manager.clear_all()
+            self.refresh_history_table()
+
+    @Slot()
+    def check_sms_status(self):
+        """Startet die asynchrone Abfrage des SMS-Status via Seven.io API."""
+        self.check_sms_status_btn.setEnabled(False)
+        self.check_sms_status_btn.setText("Prüfe...")
+        
+        # Starte den Worker-Thread
+        from PySide6.QtCore import QThread
+        self._sms_worker_thread = QThread()
+        self._sms_worker = SmsStatusWorker(self.sms_client, self.history_manager)
+        self._sms_worker.moveToThread(self._sms_worker_thread)
+        
+        self._sms_worker_thread.started.connect(self._sms_worker.run)
+        self._sms_worker.finished.connect(self._sms_worker_thread.quit)
+        self._sms_worker.finished.connect(self._sms_worker.deleteLater)
+        self._sms_worker_thread.finished.connect(self._sms_worker_thread.deleteLater)
+        self._sms_worker.finished.connect(self.on_sms_status_checked)
+        self._sms_worker.item_updated.connect(self.on_history_update)
+        
+        self._sms_worker_thread.start()
+
+    @Slot()
+    def on_sms_status_checked(self):
+        """Wird aufgerufen, wenn die SMS-Status-Prüfung abgeschlossen ist."""
+        self.refresh_history_table(maintain_page=True)
+        self.check_sms_status_btn.setEnabled(True)
+        self.check_sms_status_btn.setText("SMS-Status prüfen")
 
     @Slot(bool)
     def toggle_monitoring(self, checked):
@@ -557,3 +1092,119 @@ class MainWindow(QMainWindow):
         # Zeige Feedback nur bei manueller Prüfung
         if self.sender() and self.sender().show_no_update_message:
             QMessageBox.critical(self, "Update-Fehler", message)
+
+
+from PySide6.QtCore import QObject
+import asyncio
+from datetime import datetime, timezone
+
+class SmsStatusWorker(QObject):
+    """Worker-Klasse für die asynchrone Abfrage des SMS-Status."""
+    finished = Signal()
+    item_updated = Signal(dict)
+
+    def __init__(self, sms_client: SmsClient, history_manager: HistoryManager):
+        super().__init__()
+        self.sms_client = sms_client
+        self.history_manager = history_manager
+
+    def run(self):
+        """Führt die API-Abfrage aus und aktualisiert die Historie."""
+        try:
+            journal_data = asyncio.run(self.sms_client.get_sms_journal(limit=100))
+            entries = []
+            if isinstance(journal_data, list):
+                entries = journal_data
+            elif isinstance(journal_data, dict):
+                # API kann je nach Endpoint/Version unterschiedliche Wrapper liefern.
+                for key in ("messages", "items", "data", "entries"):
+                    candidate = journal_data.get(key)
+                    if isinstance(candidate, list):
+                        entries = candidate
+                        break
+
+            if entries:
+                self._update_history_with_journal(entries)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Fehler bei der SMS-Status-Prüfung im Worker: {e}")
+        finally:
+            self.finished.emit()
+
+    def _translate_status(self, status):
+        lower_status = (status or "").lower()
+        if "delivered" in lower_status:
+            return "Zugestellt"
+        elif "notdelivered" in lower_status or "failed" in lower_status:
+            return "Fehlgeschlagen"
+        elif "buffered" in lower_status:
+            return "Gepuffert"
+        elif "transmitted" in lower_status:
+            return "Übertragen"
+        elif "accepted" in lower_status:
+            return "Akzeptiert"
+        elif "rejected" in lower_status:
+            return "Abgelehnt"
+        return status
+
+    def _update_history_with_journal(self, journal_data):
+        history = self.history_manager.history
+        updated = False
+
+        # Erstelle Lookups für effizienteres Matching
+        journal_by_id = {str(msg.get("id")): msg for msg in journal_data if msg.get("id")}
+        
+        from datetime import datetime
+        import time
+
+        def parse_iso(ts_str):
+            try:
+                # Einfacher Parser, ignoriert Zeitzonen für Differenzberechnung
+                clean_str = ts_str.replace('Z', '').split('+')[0].split('.')[0]
+                return time.mktime(time.strptime(clean_str, "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                # Versuch alternatives Format z.B. "2024-02-13 05:50:58"
+                try:
+                    clean_str = ts_str.split('.')[0]
+                    return time.mktime(time.strptime(clean_str, "%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    return 0
+
+        for item in history:
+            # Nur aktualisieren, wenn nicht schon zugestellt/fehlgeschlagen
+            if item.get("sms_status") in ["Zugestellt", "Fehlgeschlagen"]:
+                pass
+                # Update still allows price to change or ID to be filled if missing
+            matched_msg = None
+            sms_id = str(item.get("sms_id") or "").strip()
+            if sms_id.lower() in {"none", "null", "nan"}:
+                sms_id = ""
+            
+            if sms_id and str(sms_id) in journal_by_id:
+                matched_msg = journal_by_id[str(sms_id)]
+
+            if matched_msg:
+                status_raw = matched_msg.get("dlr") or matched_msg.get("state", "")
+                translated_status = self._translate_status(status_raw)
+                price = matched_msg.get("price")
+                
+                changed = False
+                if translated_status and translated_status != item.get("sms_status"):
+                    item["sms_status"] = translated_status
+                    changed = True
+                
+                if price and price != item.get("sms_price"):
+                    item["sms_price"] = price
+                    changed = True
+                    
+                if not item.get("sms_id") and matched_msg.get("id"):
+                    item["sms_id"] = str(matched_msg.get("id"))
+                    changed = True
+                    
+                if changed:
+                    item["last_updated"] = datetime.now().isoformat()
+                    updated = True
+                    # Live-Update in die UI senden (thread-sicher via Qt-Signal).
+                    self.item_updated.emit(dict(item))
+
+        if updated:
+            self.history_manager.save_history()

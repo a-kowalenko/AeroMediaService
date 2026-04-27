@@ -16,8 +16,8 @@ class LinkShortener:
         api_url = self.config.get_secret("skylink_api_url")
         api_key = self.config.get_secret("skylink_api_key")
 
-        if not api_url:
-            self.log.error("SkyLink API URL oder Key fehlt in der Konfiguration!")
+        if not api_url or not api_key:
+            self.log.debug("SkyLink API URL oder Key fehlt in der Konfiguration! Überspringe Kürzen.")
             return long_url
 
         headers = {

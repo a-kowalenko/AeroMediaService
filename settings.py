@@ -1,7 +1,7 @@
 import logging
 import requests
 from PySide6.QtWidgets import (
-    QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout,
+    QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
     QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog,
     QCheckBox
@@ -58,6 +58,10 @@ class SettingsDialog(QDialog):
 
         # 3. Initiale Sichtbarkeit der Cloud-Gruppen setzen
         self.on_cloud_service_changed()
+
+        # 4. Initialen SMS-Guthaben-Stand abrufen
+        import PySide6.QtCore as QtCore
+        QtCore.QTimer.singleShot(0, self.refresh_seven_balance)
 
     # --- Tab-Erstellung ---
 
@@ -331,12 +335,61 @@ class SettingsDialog(QDialog):
         api_link.setOpenExternalLinks(True)
         seven_layout.addRow("", api_link)
 
+        # --- Aktuelle Balance ---
+        balance_layout = QHBoxLayout()
+        self.sms_balance_label = QLabel("Aktuelle Balance: Unbekannt")
+        self.sms_balance_refresh_btn = QPushButton("Aktualisieren")
+        self.sms_balance_refresh_btn.clicked.connect(self.refresh_seven_balance)
+        balance_layout.addWidget(self.sms_balance_label)
+        balance_layout.addWidget(self.sms_balance_refresh_btn)
+        seven_layout.addRow("Guthaben:", balance_layout)
+
         self.seven_group.setLayout(seven_layout)
         layout.addWidget(self.seven_group)
 
         layout.addStretch(1)  # Füllt den restlichen Platz nach unten auf
 
         return widget
+
+    @Slot()
+    def refresh_seven_balance(self):
+        """Ruft die aktuelle Balance von Seven.io ab."""
+        import requests
+        
+        is_sandbox = self.sms_sandbox_check.isChecked()
+        if is_sandbox:
+            api_key = self.sms_sandbox_api_key_edit.text()
+        else:
+            api_key = self.sms_api_key_edit.text()
+            
+        if not api_key:
+            self.sms_balance_label.setText("Aktuelle Balance: Fehlender API-Key")
+            return
+            
+        self.sms_balance_label.setText("Aktuelle Balance: Lade...")
+        self.sms_balance_refresh_btn.setEnabled(False)
+        
+        def fetch_balance():
+            url = "https://gateway.seven.io/api/balance"
+            headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+            try:
+                response = requests.get(url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    amount = data.get("amount")
+                    # amount = f"{amount:.2f}"
+                    currency = data.get("currency", "€")
+                    if currency == "EUR":
+                         currency = "€"
+                    return f"{amount} {currency}"
+                else:
+                    return f"Fehler ({response.status_code})"
+            except requests.exceptions.RequestException as e:
+                return "Netzwerkfehler"
+
+        balance_str = fetch_balance()
+        self.sms_balance_label.setText(f"Aktuelle Balance: {balance_str}")
+        self.sms_balance_refresh_btn.setEnabled(True)
 
     # --------------------
 

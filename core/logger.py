@@ -19,7 +19,7 @@ class GuiLogHandler(logging.Handler):
         """Leitet die formatierte Log-Nachricht an die GUI weiter."""
         try:
             msg = self.format(record)
-            signals.log_message.emit(msg)
+            signals.log_message.emit(record.levelno, msg)
         except Exception:
             self.handleError(record)
 

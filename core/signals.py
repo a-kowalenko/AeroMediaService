@@ -7,8 +7,11 @@ class GlobalSignals(QObject):
     Kommunikation zwischen Worker-Threads und der GUI zu gewährleisten.
     """
 
-    # Signal zum Senden einer Log-Nachricht an die GUI
-    log_message = Signal(str)
+    # Signal zum Senden einer Log-Nachricht an die GUI (Loglevel, Nachricht)
+    log_message = Signal(int, str)
+
+    # Historien-Update Signal (dict)
+    upload_history_update = Signal(dict)
 
     # Signale zur Aktualisierung der Fortschrittsanzeigen
     upload_progress_file = Signal(int, int, int)  # Fortschritt der aktuellen Datei (Prozent, aktuelle Bytes, Gesamtbytes)
