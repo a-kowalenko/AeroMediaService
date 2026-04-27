@@ -14,10 +14,24 @@ class SmsClient:
         # Der API-Endpunkt ist normalerweise statisch
         self.endpoint = "https://gateway.seven.io/api/sms"
 
+    async def get_balance(self, api_key):
+        """Ruft die aktuelle Balance von Seven.io ab."""
+        url = "https://gateway.seven.io/api/balance"
+        headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("amount")
+        except Exception as e:
+            self.log.error(f"Fehler beim Abrufen der Seven.io Balance: {e}")
+        return None
+
     async def send_sms(self, to_recipient, text_body):
         """
         Stellt die Verbindung zur Seven.io API her und versendet die SMS.
-        (Analog zu send_email)
+        Gibt ein Tupel (Erfolg_boolean, sms_id_string_oder_None) zurück.
         """
 
         # Lade API-Einstellungen
@@ -40,17 +54,17 @@ class SmsClient:
 
         except Exception as e:
             self.log.error(f"Fehler beim Laden der SMS-Konfiguration: {e}")
-            return False
+            return False, None
 
         if not all([api_key, sender]):
             # Logik angepasst, um den spezifischen Key-Namen anzuzeigen
             key_name = "seven_sandbox_api_key" if sandbox == 1 else "seven_api_key"
             self.log.error(f"SMS-Versand fehlgeschlagen: '{key_name}' oder 'seven_sender' unvollständig.")
-            return False
+            return False, None
 
         if not to_recipient:
             self.log.error("SMS-Versand fehlgeschlagen: Kein Empfänger (to_recipient) angegeben.")
-            return False
+            return False, None
 
         try:
             self.log.info(f"({mode}) Versende SMS an {to_recipient}...")
@@ -60,7 +74,8 @@ class SmsClient:
                 "to": to_recipient,
                 "text": text_body,
                 "from": sender,
-                "sandbox": sandbox
+                "sandbox": sandbox,
+                "json": 1
             }
             headers = {"X-Api-Key": api_key}
 
@@ -75,12 +90,29 @@ class SmsClient:
                     if resp.status == 200:
                         self.log.info(
                             f"({mode}) SMS an {to_recipient} erfolgreich verarbeitet. Response: {response_text[:80]}{'...' if len(response_text) > 80 else ''}")
-                        return True
+
+                        sms_id = None
+                        try:
+                            import json
+                            data = json.loads(response_text)
+                            messages = data.get("messages", [])
+                            if messages:
+                                sms_id = str(messages[0].get("id"))
+                        except Exception as parse_e:
+                            self.log.error(f"Konnte SMS-ID nicht auslesen: {parse_e}")
+
+                        # Balance prüfen
+                        if mode == "LIVE":
+                            balance = await self.get_balance(api_key)
+                            if balance is not None and balance < 1.0:
+                                self.log.error(f"ACHTUNG: Seven.io Balance ist unter 1€ (Aktueller Stand: {balance}€)")
+
+                        return True, sms_id
                     else:
                         # Logge den API-Fehler
                         self.log.error(
                             f"({mode}) SMS-API-Fehler bei Versand an {to_recipient}. Status: {resp.status}, Response: {response_text}")
-                        return False
+                        return False, None
 
         except aiohttp.ClientError as e:
             # Spezifischer Fehler für Netzwerk/HTTP-Probleme
@@ -89,19 +121,19 @@ class SmsClient:
             # Allgemeiner Fehler (z.B. Timeout, DNS-Fehler)
             self.log.error(f"Allgemeiner Fehler beim SMS-Versand an {to_recipient}: {e}")
 
-        return False
+        return False, None
 
     async def send_upload_success_sms(self, share_link, kunde: Kunde):
         """
         Sendet eine Erfolgs-SMS mit dem Freigabelink.
-        (Analog zu send_upload_success_email)
+        Gibt ein Tupel (Erfolg_boolean, sms_id_string_oder_None) zurück.
         """
 
         phone_number = kunde.phone
         if not phone_number:
             self.log.warning(
                 f"Keine Telefonnummer für Erfolgs-SMS (Gast: {kunde.first_name} {kunde.last_name}) angegeben. Versand wird übersprungen.")
-            return False  # Nicht senden, wenn keine Nummer da ist
+            return False, None  # Nicht senden, wenn keine Nummer da ist
 
         # Text für die SMS formatieren (kürzer als E-Mail)
         text = (
@@ -114,3 +146,33 @@ class SmsClient:
 
         # Rufe die zentrale Versandmethode auf
         return await self.send_sms(phone_number, text)
+
+    async def get_sms_journal(self, limit=100):
+        """
+        Ruft das Logbuch (Outbound Journal) von Seven.io ab.
+        """
+        sandbox_str = self.config.get_setting("seven_sandbox_mode", "false")
+        sandbox = 1 if sandbox_str.lower() == 'true' else 0
+        if sandbox == 1:
+            api_key = self.config.get_secret("seven_sandbox_api_key")
+        else:
+            api_key = self.config.get_secret("seven_api_key")
+
+        if not api_key:
+            return None
+
+        url = f"https://gateway.seven.io/api/journal/outbound?limit={limit}"
+        headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=15) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data
+                    else:
+                        self.log.error(f"Fehler beim Abrufen des SMS-Journals: HTTP {resp.status}")
+                        return None
+        except Exception as e:
+            self.log.error(f"Ausnahme beim Abrufen des SMS-Journals: {e}")
+            return None

@@ -6,7 +6,7 @@ from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
-    QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView
+    QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter
 )
 
 from PySide6.QtCore import QCoreApplication, QProcess, Slot, Qt, Signal
@@ -228,6 +228,10 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self.on_search_changed)
         hist_top_layout.addWidget(self.search_input)
 
+        self.check_sms_status_btn = QPushButton("SMS-Status prüfen")
+        self.check_sms_status_btn.clicked.connect(self.check_sms_status)
+        hist_top_layout.addWidget(self.check_sms_status_btn)
+
         self.delete_selected_btn = QPushButton("Ausgewählte löschen")
         self.delete_selected_btn.clicked.connect(self.delete_selected_history)
         hist_top_layout.addWidget(self.delete_selected_btn)
@@ -238,13 +242,30 @@ class MainWindow(QMainWindow):
 
         history_layout.addLayout(hist_top_layout)
 
-        # Tabelle
+        # Splitter für Main und Detail Grid
+        self.history_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Tabelle (Main Grid)
         self.history_table = QTableWidget()
-        self.history_table.setColumnCount(6)
-        self.history_table.setHorizontalHeaderLabels(["Datum", "Verzeichnis", "Status", "E-Mail", "SMS", "Fehler"])
+        self.history_table.setColumnCount(4)
+        self.history_table.setHorizontalHeaderLabels(["Datum", "Name", "Status", "Fehler"])
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        history_layout.addWidget(self.history_table)
+        self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_table.itemSelectionChanged.connect(self.on_history_selection_changed)
+        self.history_splitter.addWidget(self.history_table)
+
+        # Detail Grid
+        self.detail_table = QTableWidget()
+        self.detail_table.setColumnCount(2)
+        self.detail_table.setHorizontalHeaderLabels(["Eigenschaft", "Wert"])
+        self.detail_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.detail_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.detail_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_splitter.addWidget(self.detail_table)
+
+        history_layout.addWidget(self.history_splitter)
 
         # Pagination
         pag_layout = QHBoxLayout()
@@ -281,6 +302,8 @@ class MainWindow(QMainWindow):
 
     def connect_signals(self):
         """Verbindet die globalen Signale mit den GUI-Slots."""
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        
         signals.log_message.connect(self.add_log_message)
         signals.upload_history_update.connect(self.on_history_update)
         signals.upload_progress_file.connect(self.update_file_progress)
@@ -379,6 +402,15 @@ class MainWindow(QMainWindow):
         self.refresh_history_table(maintain_page=True)
 
     def refresh_history_table(self, maintain_page=False):
+        # Aktuell selektierte ID merken, um Auswahl beizubehalten
+        selected_id = None
+        selected_items = self.history_table.selectedItems()
+        if selected_items:
+            row = selected_items[0].row()
+            first_col_item = self.history_table.item(row, 0)
+            if first_col_item:
+                selected_id = first_col_item.data(Qt.ItemDataRole.UserRole)
+
         search_text = self.search_input.text()
         filtered_data = self.history_manager.get_filtered_history(search_text)
 
@@ -392,6 +424,7 @@ class MainWindow(QMainWindow):
         end_idx = start_idx + self.history_items_per_page
         page_data = filtered_data[start_idx:end_idx]
 
+        self.history_table.blockSignals(True)
         self.history_table.setRowCount(0)
         for row_idx, item in enumerate(page_data):
             self.history_table.insertRow(row_idx)
@@ -411,35 +444,45 @@ class MainWindow(QMainWindow):
 
             date_item = QTableWidgetItem(formatted_date)
             date_item.setData(Qt.ItemDataRole.UserRole, item.get("id"))
+            # Store full item data for detail view
+            date_item.setData(Qt.ItemDataRole.UserRole + 1, item)
             date_item.setFlags(date_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            dir_item = QTableWidgetItem(item.get("dir_name", ""))
-            dir_item.setFlags(dir_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            # Name generieren
+            first_name = item.get("first_name", "")
+            last_name = item.get("last_name", "")
+            if first_name or last_name:
+                name_text = f"{first_name} {last_name}".strip()
+            else:
+                name_text = item.get("dir_name", "Unbekannt")
+
+            name_item = QTableWidgetItem(name_text)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             status_val = item.get("status", "")
             status_item = QTableWidgetItem(status_val)
             status_item.setIcon(self.get_status_icon(status_val))
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            email_val = item.get("email_status", "")
-            email_item = QTableWidgetItem(email_val)
-            email_item.setIcon(self.get_status_icon(email_val))
-            email_item.setFlags(email_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-
-            sms_val = item.get("sms_status", "")
-            sms_item = QTableWidgetItem(sms_val)
-            sms_item.setIcon(self.get_status_icon(sms_val))
-            sms_item.setFlags(sms_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-
             err_item = QTableWidgetItem(item.get("error_msg", ""))
             err_item.setFlags(err_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             self.history_table.setItem(row_idx, 0, date_item)
-            self.history_table.setItem(row_idx, 1, dir_item)
+            self.history_table.setItem(row_idx, 1, name_item)
             self.history_table.setItem(row_idx, 2, status_item)
-            self.history_table.setItem(row_idx, 3, email_item)
-            self.history_table.setItem(row_idx, 4, sms_item)
-            self.history_table.setItem(row_idx, 5, err_item)
+            self.history_table.setItem(row_idx, 3, err_item)
+
+        self.history_table.blockSignals(False)
+        
+        # Selektion wiederherstellen
+        if selected_id:
+            for row in range(self.history_table.rowCount()):
+                item = self.history_table.item(row, 0)
+                if item and item.data(Qt.ItemDataRole.UserRole) == selected_id:
+                    self.history_table.selectRow(row)
+                    break
+        else:
+            self.on_history_selection_changed()
 
         self.page_label.setText(f"Seite {self.current_history_page + 1} von {max_page + 1}")
         self.prev_page_btn.setEnabled(self.current_history_page > 0)
@@ -449,11 +492,15 @@ class MainWindow(QMainWindow):
         """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text."""
         color = "gray"
         lower_status = status_text.lower()
-        if "erfolgreich" in lower_status:
+        if "zugestellt" in lower_status:
             color = "green"
-        elif "fehler" in lower_status:
+        elif "gesendet" in lower_status:
+            color = "orange"
+        elif "erfolgreich" in lower_status:
+            color = "green"
+        elif "fehler" in lower_status or "fehlgeschlagen" in lower_status or "abgelehnt" in lower_status:
             color = "red"
-        elif "gestartet" in lower_status:
+        elif "gestartet" in lower_status or "übertragen" in lower_status or "gepuffert" in lower_status or "akzeptiert" in lower_status:
             color = "blue"
         elif "übersprungen" in lower_status:
             color = "gray"
@@ -461,12 +508,65 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(16, 16)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setBrush(QColor(color))
         painter.setPen(Qt.GlobalColor.transparent)
         painter.drawEllipse(2, 2, 12, 12)
         painter.end()
         return QIcon(pixmap)
+
+    @Slot(int)
+    def on_tab_changed(self, index):
+        """Wird aufgerufen, wenn der Tab gewechselt wird."""
+        if hasattr(self, 'history_tab') and hasattr(self, 'tabs') and self.tabs.widget(index) == self.history_tab:
+            # Wenn auf den Historien-Tab gewechselt wird, SMS-Status automatisch abfragen
+            if hasattr(self, 'check_sms_status_btn') and self.check_sms_status_btn.isEnabled():
+                self.check_sms_status()
+
+    @Slot()
+    def on_history_selection_changed(self):
+        """Aktualisiert das Detail Grid basierend auf der Auswahl im Main Grid."""
+        self.detail_table.setRowCount(0)
+        selected_items = self.history_table.selectedItems()
+        if not selected_items:
+            return
+
+        row = selected_items[0].row()
+        date_item = self.history_table.item(row, 0)
+        if not date_item:
+            return
+
+        item_data = date_item.data(Qt.ItemDataRole.UserRole + 1)
+        if not item_data:
+            return
+
+        details = []
+        details.append(("Verzeichnis", item_data.get("dir_name", "")))
+
+        email_val = item_data.get("email", "")
+        email_status = item_data.get("email_status", "")
+        email_text = f"{email_val} ({email_status})" if email_val else email_status
+        details.append(("Email mit Status", email_text))
+
+        phone_val = item_data.get("phone", "")
+        sms_status = item_data.get("sms_status", "")
+        phone_text = f"{phone_val} ({sms_status})" if phone_val else sms_status
+        details.append(("Telefonnummer mit SMS-Status", phone_text))
+
+        sms_price = item_data.get("sms_price", "")
+        price_text = f"{sms_price}€" if sms_price else ""
+        details.append(("SMS Kosten", price_text))
+
+        self.detail_table.setRowCount(len(details))
+        for i, (key, value) in enumerate(details):
+            key_item = QTableWidgetItem(key)
+            val_item = QTableWidgetItem(value)
+
+            if "Status" in key:
+                val_item.setIcon(self.get_status_icon(value))
+
+            self.detail_table.setItem(i, 0, key_item)
+            self.detail_table.setItem(i, 1, val_item)
 
     @Slot()
     def on_search_changed(self):
@@ -510,6 +610,33 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.history_manager.clear_all()
             self.refresh_history_table()
+
+    @Slot()
+    def check_sms_status(self):
+        """Startet die asynchrone Abfrage des SMS-Status via Seven.io API."""
+        self.check_sms_status_btn.setEnabled(False)
+        self.check_sms_status_btn.setText("Prüfe...")
+        
+        # Starte den Worker-Thread
+        from PySide6.QtCore import QThread
+        self._sms_worker_thread = QThread()
+        self._sms_worker = SmsStatusWorker(self.sms_client, self.history_manager)
+        self._sms_worker.moveToThread(self._sms_worker_thread)
+        
+        self._sms_worker_thread.started.connect(self._sms_worker.run)
+        self._sms_worker.finished.connect(self._sms_worker_thread.quit)
+        self._sms_worker.finished.connect(self._sms_worker.deleteLater)
+        self._sms_worker_thread.finished.connect(self._sms_worker_thread.deleteLater)
+        self._sms_worker.finished.connect(self.on_sms_status_checked)
+        
+        self._sms_worker_thread.start()
+
+    @Slot()
+    def on_sms_status_checked(self):
+        """Wird aufgerufen, wenn die SMS-Status-Prüfung abgeschlossen ist."""
+        self.refresh_history_table(maintain_page=True)
+        self.check_sms_status_btn.setEnabled(True)
+        self.check_sms_status_btn.setText("SMS-Status prüfen")
 
     @Slot(bool)
     def toggle_monitoring(self, checked):
@@ -771,3 +898,112 @@ class MainWindow(QMainWindow):
         # Zeige Feedback nur bei manueller Prüfung
         if self.sender() and self.sender().show_no_update_message:
             QMessageBox.critical(self, "Update-Fehler", message)
+
+
+from PySide6.QtCore import QObject
+import asyncio
+from datetime import datetime, timezone
+
+class SmsStatusWorker(QObject):
+    """Worker-Klasse für die asynchrone Abfrage des SMS-Status."""
+    finished = Signal()
+
+    def __init__(self, sms_client: SmsClient, history_manager: HistoryManager):
+        super().__init__()
+        self.sms_client = sms_client
+        self.history_manager = history_manager
+
+    def run(self):
+        """Führt die API-Abfrage aus und aktualisiert die Historie."""
+        try:
+            journal_data = asyncio.run(self.sms_client.get_sms_journal(limit=100))
+            if journal_data and isinstance(journal_data, list):
+                self._update_history_with_journal(journal_data)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Fehler bei der SMS-Status-Prüfung im Worker: {e}")
+        finally:
+            self.finished.emit()
+
+    def _translate_status(self, status):
+        lower_status = (status or "").lower()
+        if "delivered" in lower_status:
+            return "Zugestellt"
+        elif "notdelivered" in lower_status or "failed" in lower_status:
+            return "Fehlgeschlagen"
+        elif "buffered" in lower_status:
+            return "Gepuffert"
+        elif "transmitted" in lower_status:
+            return "Übertragen"
+        elif "accepted" in lower_status:
+            return "Akzeptiert"
+        elif "rejected" in lower_status:
+            return "Abgelehnt"
+        return status
+
+    def _update_history_with_journal(self, journal_data):
+        history = self.history_manager.history
+        updated = False
+        
+        # Erstelle Lookups für effizienteres Matching
+        journal_by_id = {str(msg.get("id")): msg for msg in journal_data if msg.get("id")}
+        
+        from datetime import datetime
+        import time
+
+        def parse_iso(ts_str):
+            try:
+                # Einfacher Parser, ignoriert Zeitzonen für Differenzberechnung
+                clean_str = ts_str.replace('Z', '').split('+')[0].split('.')[0]
+                return time.mktime(time.strptime(clean_str, "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                # Versuch alternatives Format z.B. "2024-02-13 05:50:58"
+                try:
+                    clean_str = ts_str.split('.')[0]
+                    return time.mktime(time.strptime(clean_str, "%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    return 0
+
+        for item in history:
+            # Nur aktualisieren, wenn nicht schon zugestellt/fehlgeschlagen
+            if item.get("sms_status") in ["Zugestellt", "Fehlgeschlagen"]:
+                pass
+                # Update still allows price to change or ID to be filled if missing
+            matched_msg = None
+            sms_id = item.get("sms_id")
+            
+            if sms_id and str(sms_id) in journal_by_id:
+                matched_msg = journal_by_id[str(sms_id)]
+            else:
+                # Heuristik: Abgleich nach Zeit ±120 Sekunden, wenn keine sms_id vorhanden
+                hist_ts = parse_iso(item.get("created_at", ""))
+                if hist_ts > 0:
+                    for msg in journal_data:
+                        msg_ts = parse_iso(msg.get("timestamp", ""))
+                        if msg_ts > 0 and abs(hist_ts - msg_ts) <= 120:
+                            matched_msg = msg
+                            break
+
+            if matched_msg:
+                status_raw = matched_msg.get("dlr") or matched_msg.get("state", "")
+                translated_status = self._translate_status(status_raw)
+                price = matched_msg.get("price")
+                
+                changed = False
+                if translated_status and translated_status != item.get("sms_status"):
+                    item["sms_status"] = translated_status
+                    changed = True
+                
+                if price and price != item.get("sms_price"):
+                    item["sms_price"] = price
+                    changed = True
+                    
+                if not item.get("sms_id") and matched_msg.get("id"):
+                    item["sms_id"] = str(matched_msg.get("id"))
+                    changed = True
+                    
+                if changed:
+                    item["last_updated"] = datetime.now().isoformat()
+                    updated = True
+
+        if updated:
+            self.history_manager.save_history()
