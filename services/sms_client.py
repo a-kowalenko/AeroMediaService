@@ -13,6 +13,7 @@ class SmsClient:
         self.log = logging.getLogger('sms')  # Spezieller Logger
         # Der API-Endpunkt ist normalerweise statisch
         self.endpoint = "https://gateway.seven.io/api/sms"
+        self.last_error = ""
 
     async def get_balance(self, api_key):
         """Ruft die aktuelle Balance von Seven.io ab."""
@@ -34,6 +35,8 @@ class SmsClient:
         Gibt ein Tupel (Erfolg_boolean, sms_id_string_oder_None) zurück.
         """
 
+        self.last_error = ""
+
         # Lade API-Einstellungen
         try:
             # Sandbox-Modus aus Config lesen (standardmäßig 'false')
@@ -54,16 +57,19 @@ class SmsClient:
 
         except Exception as e:
             self.log.error(f"Fehler beim Laden der SMS-Konfiguration: {e}")
+            self.last_error = f"Konfigurationsfehler: {e}"
             return False, None
 
         if not all([api_key, sender]):
             # Logik angepasst, um den spezifischen Key-Namen anzuzeigen
             key_name = "seven_sandbox_api_key" if sandbox == 1 else "seven_api_key"
             self.log.error(f"SMS-Versand fehlgeschlagen: '{key_name}' oder 'seven_sender' unvollständig.")
+            self.last_error = f"Konfigurationsfehler: {key_name}/seven_sender unvollständig"
             return False, None
 
         if not to_recipient:
             self.log.error("SMS-Versand fehlgeschlagen: Kein Empfänger (to_recipient) angegeben.")
+            self.last_error = "Kein Empfänger angegeben"
             return False, None
 
         try:
@@ -97,9 +103,29 @@ class SmsClient:
                             data = json.loads(response_text)
                             messages = data.get("messages", [])
                             if messages:
-                                sms_id = str(messages[0].get("id"))
+                                message = messages[0] or {}
+                                message_success = message.get("success")
+                                message_error_text = message.get("error_text")
+                                message_error_code = message.get("error")
+                                message_id = message.get("id")
+
+                                if message_id is not None:
+                                    sms_id = str(message_id)
+
+                                # Seven kann HTTP 200 liefern, obwohl die Nachricht fehlschlug.
+                                if message_success in (False, "false", 0, "0"):
+                                    self.last_error = (
+                                        f"{message_error_text or 'SMS abgelehnt'}"
+                                        + (f" (Code {message_error_code})" if message_error_code is not None else "")
+                                    )
+                                    self.log.error(
+                                        f"({mode}) SMS abgelehnt für {to_recipient}: {self.last_error}. "
+                                        f"Response: {response_text}"
+                                    )
+                                    return False, sms_id
                         except Exception as parse_e:
                             self.log.error(f"Konnte SMS-ID nicht auslesen: {parse_e}")
+                            self.last_error = f"Antwort konnte nicht verarbeitet werden: {parse_e}"
 
                         # Balance prüfen
                         if mode == "LIVE":
@@ -112,14 +138,17 @@ class SmsClient:
                         # Logge den API-Fehler
                         self.log.error(
                             f"({mode}) SMS-API-Fehler bei Versand an {to_recipient}. Status: {resp.status}, Response: {response_text}")
+                        self.last_error = f"HTTP {resp.status}: {response_text}"
                         return False, None
 
         except aiohttp.ClientError as e:
             # Spezifischer Fehler für Netzwerk/HTTP-Probleme
             self.log.error(f"AIOHTTP-Fehler beim Senden der SMS an {to_recipient}: {e}")
+            self.last_error = f"Netzwerkfehler: {e}"
         except Exception as e:
             # Allgemeiner Fehler (z.B. Timeout, DNS-Fehler)
             self.log.error(f"Allgemeiner Fehler beim SMS-Versand an {to_recipient}: {e}")
+            self.last_error = f"Allgemeiner Fehler: {e}"
 
         return False, None
 

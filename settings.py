@@ -377,6 +377,7 @@ class SettingsDialog(QDialog):
                 if response.status_code == 200:
                     data = response.json()
                     amount = data.get("amount")
+                    # amount = f"{amount:.2f}"
                     currency = data.get("currency", "€")
                     if currency == "EUR":
                          currency = "€"

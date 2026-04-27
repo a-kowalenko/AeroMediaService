@@ -6,7 +6,8 @@ from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
-    QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter
+    QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter,
+    QDialog, QDialogButtonBox
 )
 
 from PySide6.QtCore import QCoreApplication, QProcess, Slot, Qt, Signal
@@ -250,9 +251,11 @@ class MainWindow(QMainWindow):
         self.history_table.setColumnCount(4)
         self.history_table.setHorizontalHeaderLabels(["Datum", "Name", "Status", "Fehler"])
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.itemSelectionChanged.connect(self.on_history_selection_changed)
+        self.history_table.itemDoubleClicked.connect(self.on_history_cell_clicked)
         self.history_splitter.addWidget(self.history_table)
 
         # Detail Grid
@@ -398,8 +401,31 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def on_history_update(self, data):
         """Wird aufgerufen, wenn ein Upload aktualisiert wird."""
+        selected_id = self.get_selected_history_id()
+
+        updated_id = data.get("id")
+        updated_dir = data.get("dir_name")
+
         self.history_manager.add_or_update(data)
         self.refresh_history_table(maintain_page=True)
+
+        # Detail Grid offen halten + live aktualisieren, wenn selektierter Eintrag betroffen ist.
+        if selected_id:
+            if (updated_id and updated_id == selected_id) or (
+                not updated_id and updated_dir and self._selected_entry_matches_dir(selected_id, updated_dir)
+            ):
+                item_data = self.get_history_entry_by_id(selected_id)
+                if item_data:
+                    self.populate_detail_table(item_data)
+
+    def _selected_entry_matches_dir(self, selected_id, dir_name):
+        """Hilfsfunktion: Prüft, ob die selektierte ID zu einem Verzeichnisnamen gehört."""
+        if not selected_id or not dir_name:
+            return False
+        for entry in self.history_manager.history:
+            if entry.get("id") == selected_id and entry.get("dir_name") == dir_name:
+                return True
+        return False
 
     def refresh_history_table(self, maintain_page=False):
         # Aktuell selektierte ID merken, um Auswahl beizubehalten
@@ -443,6 +469,7 @@ class MainWindow(QMainWindow):
                 formatted_date = raw_date[:19].replace("T", " ")
 
             date_item = QTableWidgetItem(formatted_date)
+            date_item.setToolTip(formatted_date)
             date_item.setData(Qt.ItemDataRole.UserRole, item.get("id"))
             # Store full item data for detail view
             date_item.setData(Qt.ItemDataRole.UserRole + 1, item)
@@ -457,14 +484,18 @@ class MainWindow(QMainWindow):
                 name_text = item.get("dir_name", "Unbekannt")
 
             name_item = QTableWidgetItem(name_text)
+            name_item.setToolTip(name_text)
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             status_val = self.build_overall_status(item)
             status_item = QTableWidgetItem(status_val)
+            status_item.setToolTip(status_val)
             status_item.setIcon(self.get_status_icon(status_val))
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            err_item = QTableWidgetItem(item.get("error_msg", ""))
+            error_text = self.build_combined_error_text(item)
+            err_item = QTableWidgetItem(error_text)
+            err_item.setToolTip(error_text)
             err_item.setFlags(err_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             self.history_table.setItem(row_idx, 0, date_item)
@@ -487,6 +518,32 @@ class MainWindow(QMainWindow):
         self.page_label.setText(f"Seite {self.current_history_page + 1} von {max_page + 1}")
         self.prev_page_btn.setEnabled(self.current_history_page > 0)
         self.next_page_btn.setEnabled(self.current_history_page < max_page)
+
+    def build_combined_error_text(self, item_data):
+        """Sammelt alle Fehlermeldungen (Upload/E-Mail/SMS) in einem Text."""
+        errors = []
+
+        upload_error = (item_data.get("error_msg") or "").strip()
+        if upload_error:
+            errors.append(f"Upload: {upload_error}")
+
+        email_status = (item_data.get("email_status") or "").strip()
+        if email_status and (
+            "fehler" in email_status.lower()
+            or "fehlgeschlagen" in email_status.lower()
+            or "abgelehnt" in email_status.lower()
+        ):
+            errors.append(f"E-Mail: {email_status}")
+
+        sms_status = (item_data.get("sms_status") or "").strip()
+        if sms_status and (
+            "fehler" in sms_status.lower()
+            or "fehlgeschlagen" in sms_status.lower()
+            or "abgelehnt" in sms_status.lower()
+        ):
+            errors.append(f"SMS: {sms_status}")
+
+        return " | ".join(errors)
 
     def build_overall_status(self, item_data):
         """Erstellt den Gesamtstatus für das Main Grid."""
@@ -512,9 +569,15 @@ class MainWindow(QMainWindow):
             s = (status_value or "").strip().lower()
             return "erfolgreich" in s
 
-        def is_best_notification(status_value):
+        def is_best_email(status_value):
             s = (status_value or "").strip().lower()
+            # E-Mail kennt i.d.R. keinen "zugestellt"-Rückkanal.
             return ("gesendet" in s) or ("zugestellt" in s) or ("erfolgreich" in s)
+
+        def is_best_sms(status_value):
+            s = (status_value or "").strip().lower()
+            # Für SMS gilt erst "zugestellt" als bester Endzustand.
+            return ("zugestellt" in s) or ("erfolgreich" in s)
 
         upload_problem = is_problem(upload_status)
         email_problem = bool(email_value) and is_problem(email_status)
@@ -523,12 +586,16 @@ class MainWindow(QMainWindow):
         if has_problem:
             return "Problem"
 
+        sms_sent_waiting_delivery = bool(phone_value) and ("gesendet" in sms_status.lower()) and not is_best_sms(sms_status)
+        if sms_sent_waiting_delivery:
+            return "In Bearbeitung"
+
         if any(is_in_progress(s) for s in (upload_status, email_status, sms_status)):
             return "In Bearbeitung"
 
         upload_is_best = is_best_upload(upload_status)
-        email_is_best = (not email_value) or is_best_notification(email_status)
-        sms_is_best = (not phone_value) or is_best_notification(sms_status)
+        email_is_best = (not email_value) or is_best_email(email_status)
+        sms_is_best = (not phone_value) or is_best_sms(sms_status)
         if upload_is_best and email_is_best and sms_is_best:
             return "Erfolgreich"
 
@@ -538,12 +605,19 @@ class MainWindow(QMainWindow):
 
         return "Unbekannt"
 
-    def get_status_icon(self, status_text):
+    def get_status_icon(self, status_text, context_key=""):
         """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text."""
         color = "gray"
         lower_status = status_text.lower()
+        lower_context = (context_key or "").lower()
 
-        if "problem" in lower_status:
+        # E-Mail "Gesendet" gilt als erfolgreicher Endzustand.
+        if "email" in lower_context and "gesendet" in lower_status:
+            color = "green"
+        elif "sms" in lower_context and "gesendet" in lower_status:
+            # SMS "Gesendet" ist noch nicht zwingend zugestellt.
+            color = "orange"
+        elif "problem" in lower_status:
             color = "red"
         elif "in bearbeitung" in lower_status:
             color = "blue"
@@ -581,19 +655,27 @@ class MainWindow(QMainWindow):
     @Slot()
     def on_history_selection_changed(self):
         """Aktualisiert das Detail Grid basierend auf der Auswahl im Main Grid."""
-        self.detail_table.setRowCount(0)
         selected_items = self.history_table.selectedItems()
         if not selected_items:
+            self.detail_table.setRowCount(0)
             return
 
         row = selected_items[0].row()
         date_item = self.history_table.item(row, 0)
         if not date_item:
+            self.detail_table.setRowCount(0)
             return
 
         item_data = date_item.data(Qt.ItemDataRole.UserRole + 1)
         if not item_data:
+            self.detail_table.setRowCount(0)
             return
+
+        self.populate_detail_table(item_data)
+
+    def populate_detail_table(self, item_data):
+        """Befüllt das Detail Grid aus einem Historien-Eintrag."""
+        self.detail_table.setRowCount(0)
 
         details = []
         details.append(("Verzeichnis", item_data.get("dir_name", "")))
@@ -612,17 +694,72 @@ class MainWindow(QMainWindow):
         sms_price = item_data.get("sms_price", "")
         price_text = f"{sms_price}€" if sms_price else ""
         details.append(("SMS Kosten", price_text))
+        details.append(("Fehlertext", self.build_combined_error_text(item_data)))
 
         self.detail_table.setRowCount(len(details))
         for i, (key, value) in enumerate(details):
             key_item = QTableWidgetItem(key)
             val_item = QTableWidgetItem(value)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            val_item.setFlags(val_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            val_item.setToolTip(value)
 
             if "Status" in key:
-                val_item.setIcon(self.get_status_icon(value))
+                val_item.setIcon(self.get_status_icon(value, key))
 
             self.detail_table.setItem(i, 0, key_item)
             self.detail_table.setItem(i, 1, val_item)
+
+    def get_selected_history_id(self):
+        """Liest die ID des aktuell selektierten Historien-Eintrags aus."""
+        selected_items = self.history_table.selectedItems()
+        if not selected_items:
+            return None
+        selected_row = selected_items[0].row()
+        selected_date_item = self.history_table.item(selected_row, 0)
+        if not selected_date_item:
+            return None
+        return selected_date_item.data(Qt.ItemDataRole.UserRole)
+
+    def get_history_entry_by_id(self, entry_id):
+        """Liefert den Historien-Eintrag zu einer ID."""
+        if not entry_id:
+            return None
+        for entry in self.history_manager.history:
+            if entry.get("id") == entry_id:
+                return entry
+        return None
+
+    @Slot(QTableWidgetItem)
+    def on_history_cell_clicked(self, item):
+        """Zeigt den kompletten Zelltext in einem kopierbaren, nicht editierbaren Dialog."""
+        if not item:
+            return
+
+        full_text = item.text() or ""
+        if not full_text:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Zellinhalt")
+        dialog.resize(700, 280)
+
+        layout = QVBoxLayout(dialog)
+        text_view = QTextEdit(dialog)
+        text_view.setReadOnly(True)
+        text_view.setPlainText(full_text)
+        text_view.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        layout.addWidget(text_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.exec()
 
     @Slot()
     def on_search_changed(self):
@@ -684,6 +821,7 @@ class MainWindow(QMainWindow):
         self._sms_worker.finished.connect(self._sms_worker.deleteLater)
         self._sms_worker_thread.finished.connect(self._sms_worker_thread.deleteLater)
         self._sms_worker.finished.connect(self.on_sms_status_checked)
+        self._sms_worker.item_updated.connect(self.on_history_update)
         
         self._sms_worker_thread.start()
 
@@ -963,6 +1101,7 @@ from datetime import datetime, timezone
 class SmsStatusWorker(QObject):
     """Worker-Klasse für die asynchrone Abfrage des SMS-Status."""
     finished = Signal()
+    item_updated = Signal(dict)
 
     def __init__(self, sms_client: SmsClient, history_manager: HistoryManager):
         super().__init__()
@@ -973,8 +1112,19 @@ class SmsStatusWorker(QObject):
         """Führt die API-Abfrage aus und aktualisiert die Historie."""
         try:
             journal_data = asyncio.run(self.sms_client.get_sms_journal(limit=100))
-            if journal_data and isinstance(journal_data, list):
-                self._update_history_with_journal(journal_data)
+            entries = []
+            if isinstance(journal_data, list):
+                entries = journal_data
+            elif isinstance(journal_data, dict):
+                # API kann je nach Endpoint/Version unterschiedliche Wrapper liefern.
+                for key in ("messages", "items", "data", "entries"):
+                    candidate = journal_data.get(key)
+                    if isinstance(candidate, list):
+                        entries = candidate
+                        break
+
+            if entries:
+                self._update_history_with_journal(entries)
         except Exception as e:
             logging.getLogger(__name__).error(f"Fehler bei der SMS-Status-Prüfung im Worker: {e}")
         finally:
@@ -999,7 +1149,7 @@ class SmsStatusWorker(QObject):
     def _update_history_with_journal(self, journal_data):
         history = self.history_manager.history
         updated = False
-        
+
         # Erstelle Lookups für effizienteres Matching
         journal_by_id = {str(msg.get("id")): msg for msg in journal_data if msg.get("id")}
         
@@ -1025,19 +1175,12 @@ class SmsStatusWorker(QObject):
                 pass
                 # Update still allows price to change or ID to be filled if missing
             matched_msg = None
-            sms_id = item.get("sms_id")
+            sms_id = str(item.get("sms_id") or "").strip()
+            if sms_id.lower() in {"none", "null", "nan"}:
+                sms_id = ""
             
             if sms_id and str(sms_id) in journal_by_id:
                 matched_msg = journal_by_id[str(sms_id)]
-            else:
-                # Heuristik: Abgleich nach Zeit ±120 Sekunden, wenn keine sms_id vorhanden
-                hist_ts = parse_iso(item.get("created_at", ""))
-                if hist_ts > 0:
-                    for msg in journal_data:
-                        msg_ts = parse_iso(msg.get("timestamp", ""))
-                        if msg_ts > 0 and abs(hist_ts - msg_ts) <= 120:
-                            matched_msg = msg
-                            break
 
             if matched_msg:
                 status_raw = matched_msg.get("dlr") or matched_msg.get("state", "")
@@ -1060,6 +1203,8 @@ class SmsStatusWorker(QObject):
                 if changed:
                     item["last_updated"] = datetime.now().isoformat()
                     updated = True
+                    # Live-Update in die UI senden (thread-sicher via Qt-Signal).
+                    self.item_updated.emit(dict(item))
 
         if updated:
             self.history_manager.save_history()

@@ -116,7 +116,8 @@ class UploaderThread(QThread):
                             sms_id_val = sms_id
                         else:
                             if kunde.phone:
-                                sms_status = "Fehler beim Senden"
+                                err_text = getattr(self.sms_client, "last_error", "") or "Fehler beim Senden"
+                                sms_status = f"Fehler: {err_text}"
                     except Exception as sms_e:
                         sms_status = f"Fehler: {sms_e}"
                         self.log.error(f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}")
