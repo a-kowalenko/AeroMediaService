@@ -459,7 +459,7 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem(name_text)
             name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            status_val = item.get("status", "")
+            status_val = self.build_overall_status(item)
             status_item = QTableWidgetItem(status_val)
             status_item.setIcon(self.get_status_icon(status_val))
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -488,16 +488,71 @@ class MainWindow(QMainWindow):
         self.prev_page_btn.setEnabled(self.current_history_page > 0)
         self.next_page_btn.setEnabled(self.current_history_page < max_page)
 
+    def build_overall_status(self, item_data):
+        """Erstellt den Gesamtstatus für das Main Grid."""
+        upload_status = (item_data.get("status") or "").strip()
+        email_status = (item_data.get("email_status") or "").strip()
+        sms_status = (item_data.get("sms_status") or "").strip()
+        email_value = (item_data.get("email") or "").strip()
+        phone_value = (item_data.get("phone") or "").strip()
+
+        def is_problem(status_value):
+            s = (status_value or "").strip().lower()
+            if not s:
+                return False
+            return ("fehler" in s) or ("fehlgeschlagen" in s) or ("abgelehnt" in s)
+
+        def is_in_progress(status_value):
+            s = (status_value or "").strip().lower()
+            if not s:
+                return False
+            return ("gestartet" in s) or ("übertragen" in s) or ("gepuffert" in s) or ("akzeptiert" in s)
+
+        def is_best_upload(status_value):
+            s = (status_value or "").strip().lower()
+            return "erfolgreich" in s
+
+        def is_best_notification(status_value):
+            s = (status_value or "").strip().lower()
+            return ("gesendet" in s) or ("zugestellt" in s) or ("erfolgreich" in s)
+
+        upload_problem = is_problem(upload_status)
+        email_problem = bool(email_value) and is_problem(email_status)
+        sms_problem = bool(phone_value) and is_problem(sms_status)
+        has_problem = upload_problem or email_problem or sms_problem
+        if has_problem:
+            return "Problem"
+
+        if any(is_in_progress(s) for s in (upload_status, email_status, sms_status)):
+            return "In Bearbeitung"
+
+        upload_is_best = is_best_upload(upload_status)
+        email_is_best = (not email_value) or is_best_notification(email_status)
+        sms_is_best = (not phone_value) or is_best_notification(sms_status)
+        if upload_is_best and email_is_best and sms_is_best:
+            return "Erfolgreich"
+
+        # Abgeschlossen, aber nicht auf Bestwert in allen Unter-Status.
+        if upload_status or email_status or sms_status:
+            return "Teilweise"
+
+        return "Unbekannt"
+
     def get_status_icon(self, status_text):
         """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text."""
         color = "gray"
         lower_status = status_text.lower()
-        if "zugestellt" in lower_status:
+
+        if "problem" in lower_status:
+            color = "red"
+        elif "in bearbeitung" in lower_status:
+            color = "blue"
+        elif "erfolgreich" in lower_status:
+            color = "green"
+        elif "zugestellt" in lower_status:
             color = "green"
         elif "gesendet" in lower_status:
             color = "orange"
-        elif "erfolgreich" in lower_status:
-            color = "green"
         elif "fehler" in lower_status or "fehlgeschlagen" in lower_status or "abgelehnt" in lower_status:
             color = "red"
         elif "gestartet" in lower_status or "übertragen" in lower_status or "gepuffert" in lower_status or "akzeptiert" in lower_status:
@@ -542,6 +597,7 @@ class MainWindow(QMainWindow):
 
         details = []
         details.append(("Verzeichnis", item_data.get("dir_name", "")))
+        details.append(("Upload-Status", item_data.get("status", "")))
 
         email_val = item_data.get("email", "")
         email_status = item_data.get("email_status", "")
