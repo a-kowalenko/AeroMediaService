@@ -70,6 +70,12 @@ class UploaderThread(QThread):
                 signals.upload_progress_file.emit(0, 0, 0)
                 signals.upload_progress_total.emit(0, 0, 0)
 
+                # History: Start
+                signals.upload_history_update.emit({
+                    "dir_name": dir_name,
+                    "status": "Gestartet"
+                })
+
                 # Remote-Pfad festlegen (z.B. /App-Ordner/Verzeichnisname)
                 remote_path = f"/{dir_name}"
 
@@ -88,14 +94,32 @@ class UploaderThread(QThread):
                     self.log.error(f"Konnte Freigabelink für {dir_name} nicht erstellen.")
 
                 # 3. Erfolgs-E-Mail senden
+                email_status = "Übersprungen"
+                sms_status = "Übersprungen"
                 if share_link and kunde and kunde.email:
-                    self.email_client.send_upload_success_email(dir_name, share_link, kunde.email)
+                    try:
+                        self.email_client.send_upload_success_email(dir_name, share_link, kunde.email)
+                        email_status = "Erfolgreich"
+                    except Exception as email_e:
+                        email_status = f"Fehler: {email_e}"
+                        self.log.error(f"E-Mail-Versand fehlgeschlagen: {email_e}")
+
                     try:
                         asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
+                        sms_status = "Erfolgreich"
                     except Exception as sms_e:
+                        sms_status = f"Fehler: {sms_e}"
                         self.log.error(f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}")
                 elif not kunde:
                     self.log.warning(f"Keine Kundendaten für {dir_name} gefunden. Benachrichtigungen übersprungen.")
+
+                # History: Success
+                signals.upload_history_update.emit({
+                    "dir_name": dir_name,
+                    "status": "Erfolgreich",
+                    "email_status": email_status,
+                    "sms_status": sms_status
+                })
 
                 # 4. In Archiv-Ordner verschieben
                 self.archive_directory(local_dir_path, "erfolg")
@@ -105,6 +129,13 @@ class UploaderThread(QThread):
             except Exception as e:
                 self.log.error(f"Fehler bei der Verarbeitung von '{dir_name}' (Pfad: {local_dir_path}): {e}")
                 signals.upload_status_update.emit(f"Fehler: {dir_name}")
+
+                # History: Error
+                signals.upload_history_update.emit({
+                    "dir_name": dir_name,
+                    "status": "Fehler",
+                    "error_msg": str(e)
+                })
 
                 # 5. Bei Fehler in Fehler-Ordner verschieben
                 # Nur archivieren, wenn local_dir_path auch einen Wert hat.

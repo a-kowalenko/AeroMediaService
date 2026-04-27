@@ -2,11 +2,11 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon, QPainter, QColor
+from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
-    QMessageBox
+    QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView
 )
 
 from PySide6.QtCore import QCoreApplication, QProcess, Slot, Qt, Signal
@@ -25,6 +25,7 @@ from services.sms_client import SmsClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
 from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
+from utils.history_manager import HistoryManager
 
 
 class StatusLight(QWidget):
@@ -114,6 +115,10 @@ class MainWindow(QMainWindow):
         self.update_thread = None
         self.update_worker = None
 
+        self.history_manager = HistoryManager()
+        self.current_history_page = 0
+        self.history_items_per_page = 25
+
         # Member-Variable für den letzten Update-Status
         self.latest_version_info = "Noch nicht geprüft."
 
@@ -141,6 +146,14 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(main_widget)
         self.setCentralWidget(main_widget)
 
+        # Tab Widget
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # --- Tab 1: Monitor ---
+        self.monitor_tab = QWidget()
+        monitor_layout = QVBoxLayout(self.monitor_tab)
+
         # 1. Button-Leiste (oben)
         button_layout = QHBoxLayout()
 
@@ -163,13 +176,13 @@ class MainWindow(QMainWindow):
         button_layout.addStretch()
         button_layout.addWidget(self.settings_button)
         button_layout.addWidget(self.restart_button)
-        main_layout.addLayout(button_layout)
+        monitor_layout.addLayout(button_layout)
 
         # 2. Log-Anzeige
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        main_layout.addWidget(self.log_display)
+        monitor_layout.addWidget(self.log_display)
 
         # 3. Fortschrittsanzeigen
         progress_layout = QVBoxLayout()
@@ -200,7 +213,57 @@ class MainWindow(QMainWindow):
         self.file_progress_bar = QProgressBar(textVisible=False)
         progress_layout.addWidget(self.file_progress_bar)
 
-        main_layout.addLayout(progress_layout)
+        monitor_layout.addLayout(progress_layout)
+
+        self.tabs.addTab(self.monitor_tab, "Monitor")
+
+        # --- Tab 2: Upload-Historie ---
+        self.history_tab = QWidget()
+        history_layout = QVBoxLayout(self.history_tab)
+
+        # Suche & Buttons
+        hist_top_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Suchen...")
+        self.search_input.textChanged.connect(self.on_search_changed)
+        hist_top_layout.addWidget(self.search_input)
+
+        self.delete_selected_btn = QPushButton("Ausgewählte löschen")
+        self.delete_selected_btn.clicked.connect(self.delete_selected_history)
+        hist_top_layout.addWidget(self.delete_selected_btn)
+
+        self.delete_all_btn = QPushButton("Alle löschen")
+        self.delete_all_btn.clicked.connect(self.delete_all_history)
+        hist_top_layout.addWidget(self.delete_all_btn)
+
+        history_layout.addLayout(hist_top_layout)
+
+        # Tabelle
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(6)
+        self.history_table.setHorizontalHeaderLabels(["Datum", "Verzeichnis", "Status", "E-Mail", "SMS", "Fehler"])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        history_layout.addWidget(self.history_table)
+
+        # Pagination
+        pag_layout = QHBoxLayout()
+        self.prev_page_btn = QPushButton("< Vorherige")
+        self.prev_page_btn.clicked.connect(self.prev_history_page)
+        self.page_label = QLabel("Seite 1")
+        self.next_page_btn = QPushButton("Nächste >")
+        self.next_page_btn.clicked.connect(self.next_history_page)
+
+        pag_layout.addStretch()
+        pag_layout.addWidget(self.prev_page_btn)
+        pag_layout.addWidget(self.page_label)
+        pag_layout.addWidget(self.next_page_btn)
+        pag_layout.addStretch()
+
+        history_layout.addLayout(pag_layout)
+
+        self.tabs.addTab(self.history_tab, "Upload-Historie")
+        self.refresh_history_table()
 
         # 4. Statusleiste (unten)
         self.status_bar = QStatusBar()
@@ -219,16 +282,17 @@ class MainWindow(QMainWindow):
     def connect_signals(self):
         """Verbindet die globalen Signale mit den GUI-Slots."""
         signals.log_message.connect(self.add_log_message)
+        signals.upload_history_update.connect(self.on_history_update)
         signals.upload_progress_file.connect(self.update_file_progress)
         signals.upload_progress_total.connect(self.update_total_progress)
         signals.upload_status_update.connect(self.status_label.setText)
         signals.monitoring_status_changed.connect(self.update_monitoring_status)
 
         # Upload-Fortschritt-Signale
-        signals.upload_started.connect(lambda count: self.add_log_message(f"Upload gestartet: {count} Datei(en)"))
-        signals.upload_progress.connect(self.add_log_message)
-        signals.upload_finished.connect(self.add_log_message)
-        signals.upload_failed.connect(lambda msg: self.add_log_message(f"❌ Upload fehlgeschlagen: {msg}"))
+        signals.upload_started.connect(lambda count: self.add_log_message(logging.INFO, f"Upload gestartet: {count} Datei(en)"))
+        signals.upload_progress.connect(lambda msg: self.add_log_message(logging.INFO, msg))
+        signals.upload_finished.connect(lambda msg: self.add_log_message(logging.INFO, msg))
+        signals.upload_failed.connect(lambda msg: self.add_log_message(logging.ERROR, f"❌ Upload fehlgeschlagen: {msg}"))
 
         signals.connection_status_changed.connect(self.connection_status_label.setText)
         signals.connection_status_changed.connect(self.update_status_light)
@@ -290,12 +354,162 @@ class MainWindow(QMainWindow):
 
     # --- Slot-Funktionen (Reaktionen auf Events) ---
 
-    @Slot(str)
-    def add_log_message(self, message):
-        """Fügt eine Nachricht zur Log-Anzeige hinzu."""
-        self.log_display.append(message)
+    @Slot(int, str)
+    def add_log_message(self, level, message):
+        """Fügt eine Nachricht zur Log-Anzeige hinzu und färbt sie ein."""
+        color = "white"
+        if level == logging.ERROR:
+            color = "red"
+        elif level == logging.WARNING:
+            color = "orange"
+        elif level == logging.DEBUG:
+            color = "gray"
+
+        # Verwende HTML für die Farbe, ersetze \n durch <br> um Formatierung beizubehalten
+        formatted_msg = message.replace('\n', '<br>')
+        html_message = f"<span style='color:{color};'>{formatted_msg}</span>"
+        self.log_display.append(html_message)
         # Auto-Scroll
         self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+
+    @Slot(dict)
+    def on_history_update(self, data):
+        """Wird aufgerufen, wenn ein Upload aktualisiert wird."""
+        self.history_manager.add_or_update(data)
+        self.refresh_history_table(maintain_page=True)
+
+    def refresh_history_table(self, maintain_page=False):
+        search_text = self.search_input.text()
+        filtered_data = self.history_manager.get_filtered_history(search_text)
+
+        total_items = len(filtered_data)
+        max_page = max(0, (total_items - 1) // self.history_items_per_page)
+
+        if not maintain_page or self.current_history_page > max_page:
+            self.current_history_page = 0
+
+        start_idx = self.current_history_page * self.history_items_per_page
+        end_idx = start_idx + self.history_items_per_page
+        page_data = filtered_data[start_idx:end_idx]
+
+        self.history_table.setRowCount(0)
+        for row_idx, item in enumerate(page_data):
+            self.history_table.insertRow(row_idx)
+
+            # Store ID in the first item's UserRole mapping for deletion
+            raw_date = item.get("last_updated", "")
+            formatted_date = ""
+            if "T" in raw_date:
+                try:
+                    d_part, t_part = raw_date.split("T")
+                    y, m, d = d_part.split("-")
+                    formatted_date = f"{d}.{m}.{y} {t_part[:8]}"
+                except Exception:
+                    formatted_date = raw_date[:19].replace("T", " ")
+            else:
+                formatted_date = raw_date[:19].replace("T", " ")
+
+            date_item = QTableWidgetItem(formatted_date)
+            date_item.setData(Qt.ItemDataRole.UserRole, item.get("id"))
+            date_item.setFlags(date_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            dir_item = QTableWidgetItem(item.get("dir_name", ""))
+            dir_item.setFlags(dir_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            status_val = item.get("status", "")
+            status_item = QTableWidgetItem(status_val)
+            status_item.setIcon(self.get_status_icon(status_val))
+            status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            email_val = item.get("email_status", "")
+            email_item = QTableWidgetItem(email_val)
+            email_item.setIcon(self.get_status_icon(email_val))
+            email_item.setFlags(email_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            sms_val = item.get("sms_status", "")
+            sms_item = QTableWidgetItem(sms_val)
+            sms_item.setIcon(self.get_status_icon(sms_val))
+            sms_item.setFlags(sms_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            err_item = QTableWidgetItem(item.get("error_msg", ""))
+            err_item.setFlags(err_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+
+            self.history_table.setItem(row_idx, 0, date_item)
+            self.history_table.setItem(row_idx, 1, dir_item)
+            self.history_table.setItem(row_idx, 2, status_item)
+            self.history_table.setItem(row_idx, 3, email_item)
+            self.history_table.setItem(row_idx, 4, sms_item)
+            self.history_table.setItem(row_idx, 5, err_item)
+
+        self.page_label.setText(f"Seite {self.current_history_page + 1} von {max_page + 1}")
+        self.prev_page_btn.setEnabled(self.current_history_page > 0)
+        self.next_page_btn.setEnabled(self.current_history_page < max_page)
+
+    def get_status_icon(self, status_text):
+        """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text."""
+        color = "gray"
+        lower_status = status_text.lower()
+        if "erfolgreich" in lower_status:
+            color = "green"
+        elif "fehler" in lower_status:
+            color = "red"
+        elif "gestartet" in lower_status:
+            color = "blue"
+        elif "übersprungen" in lower_status:
+            color = "gray"
+
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.GlobalColor.transparent)
+        painter.drawEllipse(2, 2, 12, 12)
+        painter.end()
+        return QIcon(pixmap)
+
+    @Slot()
+    def on_search_changed(self):
+        self.current_history_page = 0
+        self.refresh_history_table()
+
+    @Slot()
+    def prev_history_page(self):
+        if self.current_history_page > 0:
+            self.current_history_page -= 1
+            self.refresh_history_table(maintain_page=True)
+
+    @Slot()
+    def next_history_page(self):
+        self.current_history_page += 1
+        self.refresh_history_table(maintain_page=True)
+
+    @Slot()
+    def delete_selected_history(self):
+        selected_rows = set(item.row() for item in self.history_table.selectedItems())
+        if not selected_rows:
+            return
+
+        reply = QMessageBox.question(self, "Löschen bestätigen", f"Möchten Sie {len(selected_rows)} Eintrag/Einträge löschen?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            ids_to_delete = []
+            for row in selected_rows:
+                item = self.history_table.item(row, 0)
+                if item:
+                    item_id = item.data(Qt.ItemDataRole.UserRole)
+                    if item_id:
+                        ids_to_delete.append(item_id)
+            self.history_manager.delete_items(ids_to_delete)
+            self.refresh_history_table(maintain_page=True)
+
+    @Slot()
+    def delete_all_history(self):
+        reply = QMessageBox.question(self, "Löschen bestätigen", "Möchten Sie wirklich die gesamte Historie löschen?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.history_manager.clear_all()
+            self.refresh_history_table()
 
     @Slot(bool)
     def toggle_monitoring(self, checked):
