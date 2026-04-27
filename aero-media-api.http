@@ -1,0 +1,42 @@
+### Aero Media API Testdatei
+### Stand: 2026-04-27
+### Basis: https://uhdwagclmozdzryyyjjw.supabase.co/functions/v1
+
+@baseUrl = https://uhdwagclmozdzryyyjjw.supabase.co/functions/v1
+@idHash = <HASH>
+@customerToken = <AERO_MEDIA_CUSTOMER_TOKEN>
+@nachverkaufToken = <AERO_MEDIA_NACHVERKAUF_TOKEN>
+@art = Video
+@bezahlung = bar
+
+###
+### Optional: Falls kein eigenes Nachverkauf-Token genutzt wird,
+### kann @nachverkaufToken auch auf @customerToken gesetzt werden.
+###
+
+### 1) GET /aero-media-customer
+### Zweck: Teilnehmer ueber id_hash lesen
+GET {{baseUrl}}/aero-media-customer?id_hash={{idHash}}
+Authorization: Bearer {{customerToken}}
+Content-Type: application/json
+
+###
+### 2) POST /aero-media-nachverkauf
+### Zweck: Zahlung fuer Media setzen oder neue Option anlegen
+POST {{baseUrl}}/aero-media-nachverkauf
+Authorization: Bearer {{nachverkaufToken}}
+Content-Type: application/json
+
+{
+  "hashid": "{{idHash}}",
+  "art": "{{art}}",
+  "bezahlung": "{{bezahlung}}"
+}
+
+###
+### 3) GET erneut fuer Integrations-Check
+### Erwartung: media.bezahlt hat sich entsprechend geaendert
+GET {{baseUrl}}/aero-media-customer?id_hash={{idHash}}
+Authorization: Bearer {{customerToken}}
+Content-Type: application/json
+
