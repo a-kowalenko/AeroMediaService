@@ -189,7 +189,7 @@ class SettingsDialog(QDialog):
         self.dropbox_group.setLayout(db_layout)
         layout.addWidget(self.dropbox_group)
 
-        # --- SkyLink Shortener Einstellungen ---
+        # --- SkyLink Shortener Einstellungen (derzeit ausgeblendet) ---
         self.skylink_group = QGroupBox("SkyLink API (Link Shortener)")
         skylink_layout = QFormLayout()
 
@@ -208,6 +208,15 @@ class SettingsDialog(QDialog):
         self.custom_api_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.custom_api_token_edit.setPlaceholderText("Bearer Token für Authentifizierung")
         custom_api_layout.addRow("Bearer Token:", self.custom_api_token_edit)
+
+        self.aero_customer_base_url_edit = QLineEdit()
+        self.aero_customer_base_url_edit.setPlaceholderText("z.B. https://api.example.com/functions/v1")
+        custom_api_layout.addRow("Aero Customer Base URL:", self.aero_customer_base_url_edit)
+
+        self.aero_customer_api_token_edit = QLineEdit()
+        self.aero_customer_api_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.aero_customer_api_token_edit.setPlaceholderText("Token für /aero-media-customer Lookup")
+        custom_api_layout.addRow("Aero Customer API Token:", self.aero_customer_api_token_edit)
 
         # Erweiterte Einstellungen
         self.custom_api_upload_endpoint_edit = QLineEdit()
@@ -237,7 +246,7 @@ class SettingsDialog(QDialog):
         skylink_layout.addRow("SkyLink API Key:", self.skylink_key_edit)
 
         self.skylink_group.setLayout(skylink_layout)
-        layout.addWidget(self.skylink_group)
+        self.skylink_group.setVisible(False)
 
         layout.addStretch(1)  # Schiebt alles nach oben
 
@@ -439,13 +448,15 @@ class SettingsDialog(QDialog):
         self.db_app_key_edit.setText(self.config.get_secret("db_app_key"))
         self.db_app_secret_edit.setText(self.config.get_secret("db_app_secret"))
 
-        # SkyLink
+        # SkyLink (ausgeblendet)
         self.skylink_url_edit.setText(self.config.get_secret("skylink_api_url"))
         self.skylink_key_edit.setText(self.config.get_secret("skylink_api_key"))
 
         # Custom API
         self.custom_api_url_edit.setText(self.config.get_secret("custom_api_url"))
         self.custom_api_token_edit.setText(self.config.get_secret("custom_api_bearer_token"))
+        self.aero_customer_base_url_edit.setText(self.config.get_secret("aero_customer_base_url"))
+        self.aero_customer_api_token_edit.setText(self.config.get_secret("aero_customer_api_token"))
         self.custom_api_upload_endpoint_edit.setText(self.config.get_setting("custom_api_upload_endpoint", "/upload"))
         self.custom_api_share_endpoint_edit.setText(self.config.get_setting("custom_api_share_endpoint", "/share"))
         self.custom_api_health_endpoint_edit.setText(self.config.get_setting("custom_api_health_endpoint", "/health"))
@@ -509,14 +520,13 @@ class SettingsDialog(QDialog):
             self.config.save_secret("db_app_key", self.db_app_key_edit.text())
             self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
 
-            # SkyLink
-            # Wir verwenden save_secret, da der LinkShortener get_secret erwartet.
-            self.config.save_secret("skylink_api_url", self.skylink_url_edit.text())
-            self.config.save_secret("skylink_api_key", self.skylink_key_edit.text())
+            # SkyLink (ausgeblendet, keine Änderungen speichern)
 
             # Custom API
             self.config.save_secret("custom_api_url", self.custom_api_url_edit.text())
             self.config.save_secret("custom_api_bearer_token", self.custom_api_token_edit.text())
+            self.config.save_secret("aero_customer_base_url", self.aero_customer_base_url_edit.text())
+            self.config.save_secret("aero_customer_api_token", self.aero_customer_api_token_edit.text())
             self.config.save_setting("custom_api_upload_endpoint", self.custom_api_upload_endpoint_edit.text())
             self.config.save_setting("custom_api_share_endpoint", self.custom_api_share_endpoint_edit.text())
             self.config.save_setting("custom_api_health_endpoint", self.custom_api_health_endpoint_edit.text())
@@ -569,12 +579,12 @@ class SettingsDialog(QDialog):
         if self.radio_dropbox.isChecked():
             self.dropbox_group.setVisible(True)
             self.custom_api_group.setVisible(False)
-            self.skylink_group.setVisible(True)  # SkyLink wird für beide angezeigt
+            self.skylink_group.setVisible(False)
             self.log.info("Cloud-Dienst gewechselt zu: Dropbox")
         elif self.radio_custom_api.isChecked():
             self.dropbox_group.setVisible(False)
             self.custom_api_group.setVisible(True)
-            self.skylink_group.setVisible(True)  # SkyLink wird für beide angezeigt
+            self.skylink_group.setVisible(False)
             self.log.info("Cloud-Dienst gewechselt zu: Custom API")
 
     def update_dropbox_status(self):
@@ -622,6 +632,8 @@ class SettingsDialog(QDialog):
         # Speichere die Einstellungen
         self.config.save_secret("custom_api_url", api_url)
         self.config.save_secret("custom_api_bearer_token", bearer_token)
+        self.config.save_secret("aero_customer_base_url", self.aero_customer_base_url_edit.text())
+        self.config.save_secret("aero_customer_api_token", self.aero_customer_api_token_edit.text())
         self.config.save_setting("custom_api_upload_endpoint",
                                 self.custom_api_upload_endpoint_edit.text() or "/upload")
         self.config.save_setting("custom_api_share_endpoint",

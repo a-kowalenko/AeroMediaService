@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import shutil
+import requests
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
 from models.kunde import Kunde
@@ -34,6 +35,84 @@ class MonitorThread(QThread):
     def wake_up(self):
         """Weckt den Thread auf (z.B. nach Einstellungsänderungen)."""
         self._wait_condition.wakeAll()
+
+    def _normalize_type(self, raw_type):
+        """Normalisiert den Typ für den API-Call."""
+        value = str(raw_type or "").strip()
+        if value == "Handcam":
+            return "Handycam"
+        return value
+
+    def _parse_marker_payload(self, marker_content):
+        """Validiert Marker-Inhalt und liefert API-Query-Parameter."""
+        if not marker_content:
+            raise ValueError("Marker-Datei ist leer.")
+
+        try:
+            data = json.loads(marker_content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Marker-Datei ist kein gültiges JSON: {exc}") from exc
+
+        marker_type = self._normalize_type(data.get("type"))
+        if not marker_type:
+            raise ValueError("Pflichtfeld 'type' fehlt.")
+
+        if "kunden_id_hash" in data and "booking_id_hash" in data:
+            return {
+                "customer_id": str(data["kunden_id_hash"]).strip(),
+                "booking_id": str(data["booking_id_hash"]).strip(),
+                "type": marker_type
+            }, "hash"
+
+        if "kunden_id" in data and "booking_id" in data:
+            return {
+                "id": str(data["kunden_id"]).strip(),
+                "bookingid": str(data["booking_id"]).strip(),
+                "type": marker_type
+            }, "id"
+
+        raise ValueError(
+            "Ungültiges Marker-Format. Erwartet entweder "
+            "'kunden_id_hash' + 'booking_id_hash' oder 'kunden_id' + 'booking_id'."
+        )
+
+    def _fetch_customer_data(self, query_params):
+        """Lädt Kundendaten über /aero-media-customer."""
+        api_base_url = self.config.get_secret("aero_customer_base_url")
+        api_token = self.config.get_secret("aero_customer_api_token")
+
+        if not api_base_url or not api_token:
+            raise RuntimeError("API-Credentials fehlen (aero_customer_base_url/aero_customer_api_token).")
+
+        response = requests.get(
+            f"{api_base_url}/aero-media-customer",
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json"
+            },
+            params=query_params,
+            timeout=15
+        )
+
+        if not response.ok:
+            raise RuntimeError(f"Customer-Lookup fehlgeschlagen: HTTP {response.status_code} - {response.text[:300]}")
+
+        payload = response.json()
+        customer = payload.get("customer")
+        if not customer:
+            raise RuntimeError("Customer-Lookup lieferte kein 'customer'-Objekt.")
+
+        return customer
+
+    def _build_kunde_from_customer(self, customer):
+        """Mappt API-Response auf Kunde-Modell."""
+        return Kunde(
+            customer_number=int(customer.get("id", 0)) if customer.get("id") is not None else None,
+            email=str(customer.get("email", "")),
+            first_name=str(customer.get("vorname", "")),
+            last_name=str(customer.get("nachname", "")),
+            phone=str(customer.get("telefon", ""))
+        )
 
     def run(self):
         """Die Hauptschleife des Monitor-Threads."""
@@ -68,43 +147,23 @@ class MonitorThread(QThread):
 
                     # Prüfen, ob es ein Verzeichnis ist UND die Marker-Datei existiert
                     if os.path.isdir(full_dir_path) and os.path.exists(marker_file_path):
-                        self.log.info(f"Neues Verzeichnis gefunden: {dir_name}")
-
-                        # Ziehe Kundendaten aus Marker-Datei (optional)
                         try:
+                            self.log.info(f"Neues Verzeichnis gefunden: {dir_name}")
+
                             with open(marker_file_path, 'r', encoding='utf-8') as marker_file:
-                                kundendaten = marker_file.read().strip()
-                                self.log.debug(f"Kundendaten für '{dir_name}': {kundendaten}")
-                        except Exception as e:
-                            self.log.error(f"Fehler beim Lesen der Marker-Datei für '{dir_name}': {e}")
+                                marker_raw = marker_file.read().strip()
+                            self.log.debug(f"Marker-Daten für '{dir_name}': {marker_raw}")
 
-                        # Parse Kundendaten in Kunde Object (optional)
-                        kunde = None
-                        if kundendaten:
-                            data = json.loads(kundendaten)
-                            kunde: Kunde = Kunde(
-                                customer_number=int(data.get('kunde_id', 0)),
-                                email=str(data.get('email', '')),
-                                first_name=str(data.get('vorname', '')),
-                                last_name=str(data.get('nachname', '')),
-                                phone=str(data.get('telefon', '')),
-                                handcam_foto=bool(data.get('handcam_foto', False)),
-                                handcam_video=bool(data.get('handcam_video', False)),
-                                outside_foto=bool(data.get('outside_foto', False)),
-                                outside_video=bool(data.get('outside_video', False)),
-                                ist_bezahlt_handcam_foto=bool(data.get('ist_bezahlt_handcam_foto', False)),
-                                ist_bezahlt_handcam_video=bool(data.get('ist_bezahlt_handcam_video', False)),
-                                ist_bezahlt_outside_foto=bool(data.get('ist_bezahlt_outside_foto', False)),
-                                ist_bezahlt_outside_video=bool(data.get('ist_bezahlt_outside_video', False))
-                            )
-                            self.log.info(f"Kundendaten geparst für '{dir_name}': {kunde}")
-                        else:
-                            self.log.warning(f"Keine Kundendaten in Marker-Datei für '{dir_name}' gefunden.")
+                            lookup_params, lookup_mode = self._parse_marker_payload(marker_raw)
+                            self.log.info(f"Starte Customer-Lookup für '{dir_name}' mit Variante '{lookup_mode}'.")
 
-                        # Wir fügen den Pfad direkt zur Queue hinzu.
-                        # Der Uploader ist dafür verantwortlich, ihn nach dem Upload zu verschieben.
-                        # Um ein doppeltes Hinzufügen zu verhindern, benennen wir die Marker-Datei um.
-                        try:
+                            customer = self._fetch_customer_data(lookup_params)
+                            kunde = self._build_kunde_from_customer(customer)
+                            self.log.info(f"Kundendaten erfolgreich geladen für '{dir_name}': {kunde}")
+
+                            # Wir fügen den Pfad direkt zur Queue hinzu.
+                            # Der Uploader ist dafür verantwortlich, ihn nach dem Upload zu verschieben.
+                            # Um ein doppeltes Hinzufügen zu verhindern, benennen wir die Marker-Datei um.
                             processing_marker_path = os.path.join(full_dir_path, "_in_verarbeitung.txt")
                             os.rename(marker_file_path, processing_marker_path)
 
@@ -115,8 +174,8 @@ class MonitorThread(QThread):
                             })
                             self.log.info(f"'{dir_name}' zur Upload-Warteschlange hinzugefügt.")
                             found_items += 1
-                        except OSError as e:
-                            self.log.error(f"Fehler beim Umbenennen der Marker-Datei für '{dir_name}': {e}")
+                        except Exception as e:
+                            self.log.error(f"Fehler bei Verarbeitung von '{dir_name}': {e}")
 
             except FileNotFoundError:
                 self.log.error(f"Überwachungsordner '{scan_path}' wurde gelöscht.")
