@@ -102,7 +102,7 @@ class UploaderThread(QThread):
                 sms_status = "Übersprungen"
                 if share_link and kunde and kunde.email:
                     try:
-                        self.email_client.send_upload_success_email(dir_name, share_link, kunde.email)
+                        self.email_client.send_upload_success_email(dir_name, share_link, kunde.email, kunde.vorname)
                         email_status = "Gesendet"
                     except Exception as email_e:
                         email_status = f"Fehler: {email_e}"

@@ -107,11 +107,13 @@ class MonitorThread(QThread):
     def _build_kunde_from_customer(self, customer):
         """Mappt API-Response auf Kunde-Modell."""
         return Kunde(
-            customer_number=int(customer.get("id", 0)) if customer.get("id") is not None else None,
+            customer_number=str(customer.get("customer_id", "")),
+            booking_number=str(customer.get("booking_id", "")),
             email=str(customer.get("email", "")),
             first_name=str(customer.get("vorname", "")),
             last_name=str(customer.get("nachname", "")),
-            phone=str(customer.get("telefon", ""))
+            phone=str(customer.get("telefon", "")),
+            type=str(customer.get("typ", ""))
         )
 
     def run(self):

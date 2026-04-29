@@ -19,6 +19,7 @@ class SmsClient:
         """Ruft die aktuelle Balance von Seven.io ab."""
         url = "https://gateway.seven.io/api/balance"
         headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+        print('get_balance')
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as resp:

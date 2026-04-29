@@ -65,7 +65,7 @@ class EmailClient:
 
         return False
 
-    def send_upload_success_email(self, directory_name, share_link, email):
+    def send_upload_success_email(self, directory_name, share_link, email, vorname):
         """Sendet eine Erfolgs-E-Mail mit dem Freigabelink."""
         recipient = email
         if not recipient:
@@ -91,7 +91,7 @@ class EmailClient:
                 </head>
                 <body>
                     <div class="container">
-                        <h2>Hallo,</h2>
+                        <h2>Hallo {vorname},</h2>
                         <p>vielen Dank für deinen Besuch.</p>
 
                         <p>Die Medien zu deinem Sprung wurden erfolgreich hochgeladen und sind jetzt verfügbar.</p>
