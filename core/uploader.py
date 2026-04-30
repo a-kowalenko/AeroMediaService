@@ -91,8 +91,18 @@ class UploaderThread(QThread):
 
                 self.log.info(f"Upload für {dir_name} erfolgreich abgeschlossen.")
 
-                # 2. Freigabelink erstellen
-                share_link = self.client.get_shareable_link(remote_path)
+                # 2. Freigabelink erstellen (mit kurzen Retries bei spaeter Finalisierung)
+                share_link = None
+                for attempt in range(1, 4):
+                    share_link = self.client.get_shareable_link(remote_path)
+                    if share_link:
+                        break
+                    if attempt < 3:
+                        self.log.warning(
+                            f"Freigabelink noch nicht verfuegbar (Versuch {attempt}/3), warte 2s..."
+                        )
+                        time.sleep(2)
+
                 if not share_link:
                     # Logge den Fehler, aber fahre fort (Upload war erfolgreich)
                     self.log.error(f"Konnte Freigabelink für {dir_name} nicht erstellen.")

@@ -25,6 +25,8 @@ class CustomApiClient(BaseClient):
         self.log = logging.getLogger(__name__)
         self.link_shortener = LinkShortener(config_manager)
         self._last_customer_url = None  # Speichert die letzte customer_url
+        self._last_session_id = None  # Letzte Upload-Session fuer spaeteren Link-Check
+        self._last_kunde = None  # Letzter Kunde fuer Customer-API-Fallback
         self.session = None  # requests.Session für Connection-Pooling
         self.progress_lock = Lock()  # Lock für Thread-sichere Progress-Updates
         self.max_parallel_uploads = 3  # Max. parallele File-Uploads
@@ -98,6 +100,7 @@ class CustomApiClient(BaseClient):
             return False
 
         self.log.info(f"Beginne Direct Upload von '{local_dir_path}'")
+        self._last_kunde = kunde
 
         # 1. Dateien sammeln
         files_to_upload = []
@@ -136,6 +139,7 @@ class CustomApiClient(BaseClient):
             session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
             session_id = session_data["session_id"]
             order_id = session_data["order_id"]
+            self._last_session_id = session_id
 
             self.log.info(f"Direct Upload Session initialisiert: {session_id}, Order: {order_id}")
 
@@ -179,11 +183,16 @@ class CustomApiClient(BaseClient):
             self.log.info("Alle Dateien hochgeladen, warte auf Server-Finalisierung...")
             customer_url = self._wait_for_completion(session_id)
 
-            # Speichere customer_url für get_shareable_link
-            self._last_customer_url = customer_url
+            # Speichere customer_url für get_shareable_link (nur wenn vorhanden)
+            self._last_customer_url = customer_url if customer_url else None
 
             signals.upload_status_update.emit(f"Upload abgeschlossen.")
-            self.log.info(f"Upload erfolgreich: {customer_url}")
+            if customer_url:
+                self.log.info(f"Upload erfolgreich: {customer_url}")
+            else:
+                self.log.warning(
+                    "Upload der Dateien erfolgreich, aber customer_url noch nicht verfuegbar."
+                )
             return True
 
         except Exception as e:
@@ -388,14 +397,14 @@ class CustomApiClient(BaseClient):
         Der Server finalisiert die Session automatisch nachdem alle Files
         über den onUploadCompleted Callback registriert wurden.
         """
-        max_wait_time = 10  # 60 Sekunden max
+        max_wait_time = 15  # 15 Sekunden max
         poll_interval = 2  # Alle 2 Sekunden prüfen
-        elapsed = 0
+        started_at = time.monotonic()
 
         self.log.info("Warte auf Server-Finalisierung...")
         signals.upload_status_update.emit("Finalisiere Upload...")
 
-        while elapsed < max_wait_time:
+        while (time.monotonic() - started_at) < max_wait_time:
             try:
                 # Session-Status abrufen
                 response = self.session.get(
@@ -406,45 +415,200 @@ class CustomApiClient(BaseClient):
 
                 if response.ok:
                     result = response.json()
+                    self.log.debug(f"Session-Status Antwort: {result}")
 
-                    if result.get("status") == "completed":
-                        customer_url = result.get("customer_url")
+                    customer_url = self._extract_customer_url(result)
+                    if result.get("status") == "completed" and customer_url:
                         self.log.info(f"Session finalisiert! Customer URL: {customer_url}")
+                        return customer_url
+
+                    # Manche Server liefern URL bereits vor finalem Status.
+                    if customer_url:
+                        self.log.info(f"Customer URL bereits verfuegbar: {customer_url}")
                         return customer_url
 
                     # Status-Update loggen
                     uploaded = result.get("uploaded_files", 0)
                     total = result.get("total_files", 0)
                     self.log.debug(f"Session Status: {uploaded}/{total} Files verarbeitet")
+                else:
+                    self.log.warning(f"Status-Check HTTP {response.status_code}: {response.text[:200]}")
 
             except Exception as e:
                 self.log.warning(f"Fehler beim Status-Check: {e}")
 
             time.sleep(poll_interval)
-            elapsed += poll_interval
 
-        # Timeout - versuche trotzdem customer_url zu holen
+        # Timeout - versuche trotzdem customer_url mit kurzen Retries zu holen
         self.log.warning("Timeout beim Warten auf Finalisierung, versuche URL zu holen...")
 
-        try:
-            response = self.session.get(
-                f"{self.api_base_url}/upload/status/{session_id}",
-                headers={'Authorization': f'Bearer {self.api_key}'},
-                timeout=10
-            )
-            if response.ok:
-                result = response.json()
-                return result.get("customer_url")
-        except:
-            pass
+        for _ in range(3):
+            try:
+                response = self.session.get(
+                    f"{self.api_base_url}/upload/status/{session_id}",
+                    headers={'Authorization': f'Bearer {self.api_key}'},
+                    timeout=10
+                )
+                if response.ok:
+                    result = response.json()
+                    customer_url = self._extract_customer_url(result)
+                    if customer_url:
+                        self.log.info(f"Customer URL nach Timeout erhalten: {customer_url}")
+                        return customer_url
+            except Exception as e:
+                self.log.warning(f"Fehler beim nachtraeglichen URL-Check: {e}")
+
+            time.sleep(2)
+
+        return None
+
+    def _extract_customer_url(self, result):
+        """Extrahiert den Kunden-Link robust aus unterschiedlichen API-Formaten."""
+        if not isinstance(result, dict):
+            return None
+
+        # Hauefige Feldnamen im Wilden.
+        direct_keys = [
+            "customer_url",
+            "customerUrl",
+            "share_url",
+            "shareUrl",
+            "public_url",
+            "publicUrl",
+            "url"
+        ]
+        for key in direct_keys:
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        # Verschachtelte Varianten
+        nested_candidates = [
+            result.get("data"),
+            result.get("result"),
+            result.get("upload"),
+            result.get("session")
+        ]
+        for candidate in nested_candidates:
+            if isinstance(candidate, dict):
+                for key in direct_keys:
+                    value = candidate.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+
+        return None
+
+    def _extract_link_from_customer_payload(self, payload):
+        """Extrahiert Link robust aus aero-media-customer Antwort."""
+        if not isinstance(payload, dict):
+            return None
+
+        # Direkte Felder
+        for key in ["link", "customer_url", "customerUrl", "url", "short_order_id", "shortOrderId"]:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        customer = payload.get("customer")
+        if isinstance(customer, dict):
+            for key in ["link", "customer_url", "customerUrl", "url", "short_order_id", "shortOrderId"]:
+                value = customer.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+            # Typische verschachtelte Media-Strukturen
+            for media_key in ["media", "handycam", "handcam", "files"]:
+                media_obj = customer.get(media_key)
+                if isinstance(media_obj, dict):
+                    for key in ["link", "customer_url", "customerUrl", "url", "short_order_id", "shortOrderId"]:
+                        value = media_obj.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+
+        return None
+
+    def _fetch_customer_url_from_aero_customer(self):
+        """Fallback auf aero-media-customer, falls Upload-Status keinen Link liefert."""
+        if not self._last_kunde:
+            return None
+
+        base_url = self.config.get_secret("aero_customer_base_url")
+        token = self.config.get_secret("aero_customer_api_token")
+        if not base_url or not token:
+            return None
+
+        kunde = self._last_kunde
+        query_params = {
+            "customer_id": str(getattr(kunde, "customer_number", "") or "").strip(),
+            "booking_id": str(getattr(kunde, "booking_number", "") or "").strip(),
+            "type": str(getattr(kunde, "type", "") or "").strip()
+        }
+        if not query_params["customer_id"] or not query_params["booking_id"] or not query_params["type"]:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        endpoint = f"{base_url.rstrip('/')}/aero-media-customer"
+        for fallback_mode in [False, True]:
+            params = dict(query_params)
+            if fallback_mode:
+                params["Fallback"] = "true"
+
+            try:
+                response = requests.get(endpoint, headers=headers, params=params, timeout=15)
+                if not response.ok:
+                    self.log.warning(
+                        f"aero-media-customer Lookup fehlgeschlagen (HTTP {response.status_code}) "
+                        f"mit params={params}"
+                    )
+                    continue
+
+                payload = response.json()
+                self.log.debug(f"aero-media-customer Antwort: {payload}")
+                link = self._extract_link_from_customer_payload(payload)
+                if link:
+                    self.log.info(f"Link ueber aero-media-customer gefunden: {link}")
+                    return link
+            except Exception as e:
+                self.log.warning(f"aero-media-customer Lookup Fehler: {e}")
 
         return None
 
     def get_shareable_link(self, remote_path):
         """Gibt den Customer-Link zurück (bereits von Session zurückgegeben)."""
         if not self._last_customer_url:
-            self.log.warning("Keine customer_url verfügbar. Upload noch nicht abgeschlossen?")
-            return None
+            # Fallback: versuche URL noch einmal anhand der letzten Session zu laden.
+            if self._last_session_id:
+                try:
+                    response = self.session.get(
+                        f"{self.api_base_url}/upload/status/{self._last_session_id}",
+                        headers={'Authorization': f'Bearer {self.api_key}'},
+                        timeout=10
+                    )
+                    if response.ok:
+                        result = response.json()
+                        fallback_url = self._extract_customer_url(result)
+                        if fallback_url:
+                            self._last_customer_url = fallback_url
+                            self.log.info(f"customer_url per Fallback-Check erhalten: {fallback_url}")
+                    else:
+                        self.log.warning(
+                            f"Fallback Status-Check fehlgeschlagen (HTTP {response.status_code})"
+                        )
+                except Exception as e:
+                    self.log.warning(f"Fallback Status-Check fuer customer_url fehlgeschlagen: {e}")
+
+            if not self._last_customer_url:
+                customer_lookup_url = self._fetch_customer_url_from_aero_customer()
+                if customer_lookup_url:
+                    self._last_customer_url = customer_lookup_url
+
+            if not self._last_customer_url:
+                self.log.warning("Keine customer_url verfügbar. Upload noch nicht abgeschlossen?")
+                return None
 
         self.log.info(f"Gebe customer_url zurück: {self._last_customer_url}")
 
