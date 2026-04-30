@@ -44,7 +44,7 @@ class MonitorThread(QThread):
         return value
 
     def _parse_marker_payload(self, marker_content):
-        """Validiert Marker-Inhalt und liefert API-Query-Parameter."""
+        """Validiert Marker-Inhalt und liefert API-Query-Parameter plus Lookup-Modus."""
         if not marker_content:
             raise ValueError("Marker-Datei ist leer.")
 
@@ -66,8 +66,8 @@ class MonitorThread(QThread):
 
         if "kunden_id" in data and "booking_id" in data:
             return {
-                "id": str(data["kunden_id"]).strip(),
-                "bookingid": str(data["booking_id"]).strip(),
+                "customer_id": str(data["kunden_id"]).strip(),
+                "booking_id": str(data["booking_id"]).strip(),
                 "type": marker_type
             }, "id"
 
@@ -76,21 +76,27 @@ class MonitorThread(QThread):
             "'kunden_id_hash' + 'booking_id_hash' oder 'kunden_id' + 'booking_id'."
         )
 
-    def _fetch_customer_data(self, query_params):
-        """Lädt Kundendaten über /aero-media-customer."""
+    def _fetch_customer_data(self, query_params, lookup_mode):
+        """Lädt Kundendaten über den passenden Customer-Endpoint."""
         api_base_url = self.config.get_secret("aero_customer_base_url")
         api_token = self.config.get_secret("aero_customer_api_token")
 
         if not api_base_url or not api_token:
             raise RuntimeError("API-Credentials fehlen (aero_customer_base_url/aero_customer_api_token).")
 
+        endpoint = "/aero-media-customer"
+        params = dict(query_params)
+        if lookup_mode == "id":
+            endpoint = "/aero-media-customer-fallback"
+            params["Fallback"] = "true"
+
         response = requests.get(
-            f"{api_base_url}/aero-media-customer",
+            f"{api_base_url}{endpoint}",
             headers={
                 "Authorization": f"Bearer {api_token}",
                 "Content-Type": "application/json"
             },
-            params=query_params,
+            params=params,
             timeout=15
         )
 
@@ -159,7 +165,7 @@ class MonitorThread(QThread):
                             lookup_params, lookup_mode = self._parse_marker_payload(marker_raw)
                             self.log.info(f"Starte Customer-Lookup für '{dir_name}' mit Variante '{lookup_mode}'.")
 
-                            customer = self._fetch_customer_data(lookup_params)
+                            customer = self._fetch_customer_data(lookup_params, lookup_mode)
                             kunde = self._build_kunde_from_customer(customer)
                             self.log.info(f"Kundendaten erfolgreich geladen für '{dir_name}': {kunde}")
 
