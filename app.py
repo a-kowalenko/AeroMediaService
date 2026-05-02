@@ -2,7 +2,7 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap, QPalette
+from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap, QPalette, QPen
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox
 )
 
-from PySide6.QtCore import QCoreApplication, QProcess, Slot, Qt, Signal
+from PySide6.QtCore import QCoreApplication, QProcess, QThread, QTimer, QRectF, Slot, Qt, Signal
 
 # Importiere alle Komponenten des Projekts
 from core import APP_VERSION
@@ -62,6 +62,82 @@ class StatusLight(QWidget):
             self._color = QColor(Qt.GlobalColor.gray)  # Fallback
 
         self.update()  # Löst ein paintEvent aus
+
+
+class HistoryRefreshOverlay(QWidget):
+    """Dezente halbtransparente Schicht mit zentriertem Lade-Indikator über der Historien-Tabelle."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance_angle)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def _advance_angle(self):
+        self._angle = (self._angle + 11) % 360
+        self.update()
+
+    def show_loading(self):
+        self._angle = 0
+        self._timer.start(40)
+        self.show()
+        self.raise_()
+
+    def hide_loading(self):
+        self._timer.stop()
+        self.hide()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        scrim = QColor(self.palette().color(QPalette.ColorRole.Window))
+        scrim.setAlpha(120)
+        painter.fillRect(self.rect(), scrim)
+
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0
+        card = QRectF(cx - 40, cy - 40, 80, 80)
+        base = QColor(self.palette().color(QPalette.ColorRole.Base))
+        base.setAlpha(242)
+        painter.setBrush(base)
+        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 1))
+        painter.drawRoundedRect(card, 14, 14)
+
+        ring = QRectF(cx - 22, cy - 22, 44, 44)
+        track = QPen(self.palette().color(QPalette.ColorRole.Mid))
+        track.setWidth(5)
+        track.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(track)
+        painter.drawArc(ring, 0, 360 * 16)
+
+        accent = QPen(self.palette().color(QPalette.ColorRole.Highlight))
+        accent.setWidth(5)
+        accent.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(accent)
+        painter.drawArc(ring, self._angle * 16, 280 * 16)
+
+
+class _HistoryTableHost(QWidget):
+    """Stackt die Tabelle und das Lade-Overlay gleich groß übereinander."""
+
+    def __init__(self, table: QTableWidget):
+        super().__init__()
+        self._table = table
+        self._overlay = HistoryRefreshOverlay(self)
+        self._table.setParent(self)
+        self._overlay.hide()
+
+    @property
+    def overlay(self) -> HistoryRefreshOverlay:
+        return self._overlay
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        r = self.rect()
+        self._table.setGeometry(r)
+        self._overlay.setGeometry(r)
 
 
 class MainWindow(QMainWindow):
@@ -119,6 +195,7 @@ class MainWindow(QMainWindow):
         self.history_manager = HistoryManager()
         self.current_history_page = 0
         self.history_items_per_page = 25
+        self._history_refresh_overlay_refs = 0
 
         # Member-Variable für den letzten Update-Status
         self.latest_version_info = "Noch nicht geprüft."
@@ -229,9 +306,22 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self.on_search_changed)
         hist_top_layout.addWidget(self.search_input)
 
-        self.check_sms_status_btn = QPushButton("SMS-Status prüfen")
-        self.check_sms_status_btn.clicked.connect(self.check_sms_status)
-        hist_top_layout.addWidget(self.check_sms_status_btn)
+        self.history_manual_refresh_btn = QPushButton("\u21bb")
+        self.history_manual_refresh_btn.setToolTip("Historie von Festplatte laden und SMS-Status prüfen")
+        self.history_manual_refresh_btn.setFixedWidth(36)
+        self.history_manual_refresh_btn.clicked.connect(self.on_history_manual_refresh_clicked)
+        hist_top_layout.addWidget(self.history_manual_refresh_btn)
+
+        self.history_refresh_countdown_label = QLabel()
+        self.history_refresh_countdown_label.setMinimumWidth(180)
+        hist_top_layout.addWidget(self.history_refresh_countdown_label)
+
+        self._history_refresh_interval_sec = 60
+        self._history_refresh_seconds_left = self._history_refresh_interval_sec
+        self._history_refresh_timer = QTimer(self)
+        self._history_refresh_timer.timeout.connect(self._on_history_refresh_timer_tick)
+        self._history_refresh_timer.start(1000)
+        self._update_history_refresh_countdown_label()
 
         self.delete_selected_btn = QPushButton("Ausgewählte löschen")
         self.delete_selected_btn.clicked.connect(self.delete_selected_history)
@@ -256,7 +346,9 @@ class MainWindow(QMainWindow):
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.itemSelectionChanged.connect(self.on_history_selection_changed)
         self.history_table.itemDoubleClicked.connect(self.on_history_cell_clicked)
-        self.history_splitter.addWidget(self.history_table)
+        self._history_table_host = _HistoryTableHost(self.history_table)
+        self._history_refresh_overlay = self._history_table_host.overlay
+        self.history_splitter.addWidget(self._history_table_host)
 
         # Detail Grid
         self.detail_table = QTableWidget()
@@ -427,6 +519,74 @@ class MainWindow(QMainWindow):
             if entry.get("id") == selected_id and entry.get("dir_name") == dir_name:
                 return True
         return False
+
+    def _sms_status_worker_busy(self):
+        """True, wenn der SMS-Worker-Thread noch (oder scheinbar noch) existiert und läuft."""
+        t = getattr(self, "_sms_worker_thread", None)
+        if t is None:
+            return False
+        try:
+            return t.isRunning()
+        except RuntimeError:
+            # C++-Objekt bereits von deleteLater entfernt, Python-Referenz war noch gesetzt
+            self._sms_worker_thread = None
+            return False
+
+    @Slot()
+    def _on_sms_worker_thread_destroyed(self):
+        try:
+            dead = self.sender()
+        except RuntimeError:
+            dead = None
+        if dead is not None and dead is getattr(self, "_sms_worker_thread", None):
+            self._sms_worker_thread = None
+
+    def _begin_history_refresh_overlay(self):
+        self._history_refresh_overlay_refs += 1
+        if self._history_refresh_overlay_refs == 1:
+            self._history_refresh_overlay.show_loading()
+
+    def _end_history_refresh_overlay(self):
+        if self._history_refresh_overlay_refs <= 0:
+            return
+        self._history_refresh_overlay_refs -= 1
+        if self._history_refresh_overlay_refs == 0:
+            self._history_refresh_overlay.hide_loading()
+
+    def reload_history_from_disk_and_refresh(self):
+        """Liest upload_history.json neu ein, zeichnet die Tabelle neu, startet SMS-Status-Prüfung."""
+        self._begin_history_refresh_overlay()
+        sms_started = False
+        try:
+            self.history_manager.reload_from_file()
+            self.refresh_history_table(maintain_page=True)
+            sms_started = self.check_sms_status()
+        except Exception:
+            self.log.exception("Historie-Refresh fehlgeschlagen")
+            self._end_history_refresh_overlay()
+            return
+        if not sms_started:
+            QTimer.singleShot(320, self._end_history_refresh_overlay)
+
+    def _update_history_refresh_countdown_label(self):
+        if hasattr(self, "history_refresh_countdown_label"):
+            self.history_refresh_countdown_label.setText(
+                f"Nächstes Laden in {self._history_refresh_seconds_left} s"
+            )
+
+    @Slot()
+    def _on_history_refresh_timer_tick(self):
+        self._history_refresh_seconds_left -= 1
+        if self._history_refresh_seconds_left <= 0:
+            self.reload_history_from_disk_and_refresh()
+            self._history_refresh_seconds_left = self._history_refresh_interval_sec
+        self._update_history_refresh_countdown_label()
+
+    @Slot()
+    def on_history_manual_refresh_clicked(self):
+        self._history_refresh_seconds_left = self._history_refresh_interval_sec
+        self.reload_history_from_disk_and_refresh()
+        self._update_history_refresh_countdown_label()
 
     def refresh_history_table(self, maintain_page=False):
         # Aktuell selektierte ID merken, um Auswahl beizubehalten
@@ -649,9 +809,8 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         """Wird aufgerufen, wenn der Tab gewechselt wird."""
         if hasattr(self, 'history_tab') and hasattr(self, 'tabs') and self.tabs.widget(index) == self.history_tab:
-            # Wenn auf den Historien-Tab gewechselt wird, SMS-Status automatisch abfragen
-            if hasattr(self, 'check_sms_status_btn') and self.check_sms_status_btn.isEnabled():
-                self.check_sms_status()
+            # Historie von Platte + Tabelle + SMS-Status wie beim periodischen Refresh
+            self.reload_history_from_disk_and_refresh()
 
     @Slot()
     def on_history_selection_changed(self):
@@ -805,33 +964,36 @@ class MainWindow(QMainWindow):
             self.history_manager.clear_all()
             self.refresh_history_table()
 
-    @Slot()
     def check_sms_status(self):
-        """Startet die asynchrone Abfrage des SMS-Status via Seven.io API."""
-        self.check_sms_status_btn.setEnabled(False)
-        self.check_sms_status_btn.setText("Prüfe...")
-        
+        """Startet die asynchrone Abfrage des SMS-Status via Seven.io API (kein paralleler Lauf).
+
+        Returns:
+            True, wenn ein Worker gestartet wurde; False, wenn bereits einer läuft.
+        """
+        if self._sms_status_worker_busy():
+            return False
+
         # Starte den Worker-Thread
-        from PySide6.QtCore import QThread
         self._sms_worker_thread = QThread()
+        self._sms_worker_thread.destroyed.connect(self._on_sms_worker_thread_destroyed)
         self._sms_worker = SmsStatusWorker(self.sms_client, self.history_manager)
         self._sms_worker.moveToThread(self._sms_worker_thread)
-        
+
         self._sms_worker_thread.started.connect(self._sms_worker.run)
         self._sms_worker.finished.connect(self._sms_worker_thread.quit)
         self._sms_worker.finished.connect(self._sms_worker.deleteLater)
         self._sms_worker_thread.finished.connect(self._sms_worker_thread.deleteLater)
         self._sms_worker.finished.connect(self.on_sms_status_checked)
         self._sms_worker.item_updated.connect(self.on_history_update)
-        
+
         self._sms_worker_thread.start()
+        return True
 
     @Slot()
     def on_sms_status_checked(self):
         """Wird aufgerufen, wenn die SMS-Status-Prüfung abgeschlossen ist."""
         self.refresh_history_table(maintain_page=True)
-        self.check_sms_status_btn.setEnabled(True)
-        self.check_sms_status_btn.setText("SMS-Status prüfen")
+        self._end_history_refresh_overlay()
 
     @Slot(bool)
     def toggle_monitoring(self, checked):
