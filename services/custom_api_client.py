@@ -4,7 +4,6 @@ import requests
 from requests.adapters import HTTPAdapter
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 from models.kunde import Kunde
@@ -13,8 +12,8 @@ from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
 
-# Mindestabstand zwischen Fortschritts-Signalen beim Streaming-Upload (Bytes)
-_PROGRESS_EMIT_INTERVAL = 256 * 1024
+# Chunk-Groesse fuer Custom-API-Session-Upload (Server-Limit, z. B. Vercel)
+SESSION_CHUNK_SIZE = 4 * 1024 * 1024
 
 
 def _summarize_api_error_body(text: str, max_len: int = 800) -> str:
@@ -44,39 +43,8 @@ def _full_body_for_log(text: str, limit: int = 4000) -> str:
     return text[:limit] + f"... [truncated, {len(text)} chars total]"
 
 
-class _ProgressReportingReader:
-    """Wrappt eine geoeffnete Binaerdatei; meldet Fortschritt periodisch beim Lesen."""
-
-    __slots__ = ("_raw", "_file_size", "_on_progress", "_sent", "_last_threshold")
-
-    def __init__(self, raw, file_size: int, on_progress):
-        self._raw = raw
-        self._file_size = max(file_size, 0)
-        self._on_progress = on_progress
-        self._sent = 0
-        self._last_threshold = -1
-
-    @property
-    def bytes_sent(self) -> int:
-        return self._sent
-
-    def read(self, n=-1):
-        chunk = self._raw.read(n)
-        if chunk:
-            self._sent += len(chunk)
-            if self._file_size > 0:
-                threshold = self._sent // _PROGRESS_EMIT_INTERVAL
-                if threshold > self._last_threshold:
-                    self._last_threshold = threshold
-                    self._on_progress(self._sent)
-        return chunk
-
-    def __getattr__(self, name):
-        return getattr(self._raw, name)
-
-
 class CustomApiClient(BaseClient):
-    """Implementierung des BaseClient für Custom Cloud Storage API mit Direct Upload (Presigned URLs)."""
+    """Custom Cloud API: direct-init, chunked Session-Upload (4 MB), finalize."""
 
     def __init__(self, config_manager: ConfigManager):
         self.config = config_manager
@@ -90,7 +58,6 @@ class CustomApiClient(BaseClient):
         self._last_kunde = None  # Letzter Kunde fuer Customer-API-Fallback
         self.session = None  # requests.Session für Connection-Pooling
         self.progress_lock = Lock()  # Lock für Thread-sichere Progress-Updates
-        self.max_parallel_uploads = 3  # Max. parallele File-Uploads
 
     def connect(self, auth_callback=None):
         """Verbindung zur API herstellen."""
@@ -127,7 +94,7 @@ class CustomApiClient(BaseClient):
 
             if response.status_code == 200:
                 self.connected = True
-                self.log.info("Erfolgreich mit Custom API verbunden (Direct Upload Mode).")
+                self.log.info("Erfolgreich mit Custom API verbunden (Session-Chunk-Upload).")
                 signals.connection_status_changed.emit("Verbunden")
                 return True
             else:
@@ -154,13 +121,24 @@ class CustomApiClient(BaseClient):
         """Verbindungsstatus zurückgeben."""
         return "Verbunden" if self.connected else "Nicht verbunden"
 
+    def _api_origin(self) -> str:
+        """Host-Basis ohne doppeltes /api (custom_api_url z. B. https://host oder https://host/api)."""
+        b = str(self.api_base_url or "").rstrip("/")
+        if b.endswith("/api"):
+            return b[:-4]
+        return b
+
+    def _upload_api_root(self) -> str:
+        """Basis-URL fuer Upload-Routen (z. B. https://host/api/upload)."""
+        return f"{self._api_origin()}/api/upload"
+
     def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde = None):
-        """Lädt ein Verzeichnis mit Direct Upload (Presigned URLs) hoch."""
+        """Lädt ein Verzeichnis per direct-init, 4-MB-Session-Chunks und finalize hoch."""
         if not self.connected:
             self.log.error("Upload fehlgeschlagen: Nicht verbunden.")
             return False
 
-        self.log.info(f"Beginne Direct Upload von '{local_dir_path}'")
+        self.log.info(f"Beginne Session-Upload von '{local_dir_path}'")
         self._last_kunde = kunde
 
         # 1. Dateien sammeln
@@ -199,50 +177,35 @@ class CustomApiClient(BaseClient):
             folder_name = os.path.basename(local_dir_path)
             session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
             session_id = session_data["session_id"]
-            order_id = session_data["order_id"]
+            order_id = session_data.get("order_id")
             self._last_session_id = session_id
 
-            self.log.info(f"Direct Upload Session initialisiert: {session_id}, Order: {order_id}")
+            self.log.info(
+                "Upload-Session initialisiert: session_id=%s%s",
+                session_id,
+                f", order_id={order_id}" if order_id else "",
+            )
 
         except Exception as e:
             self.log.error(f"Session-Initialisierung fehlgeschlagen: {e}")
             signals.upload_status_update.emit(f"Fehler: {e}")
             return False
 
-        # 3. Dateien parallel direkt hochladen
-        uploaded_counter = {'bytes': 0}  # Thread-safe counter
+        # 3. Dateien nacheinander (Session-Offsets pro Datei seriell)
+        uploaded_counter = {"bytes": 0}
 
         try:
-            # Parallele Uploads mit ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=self.max_parallel_uploads) as executor:
-                futures = {}
+            for file_info in files_to_upload:
+                self._upload_file_via_session(
+                    session_id, file_info, total_size, uploaded_counter
+                )
 
-                for file_info in files_to_upload:
-                    future = executor.submit(
-                        self._upload_file_direct,
-                        session_id,
-                        order_id,
-                        file_info,
-                        total_size,
-                        uploaded_counter
-                    )
-                    futures[future] = file_info
-
-                # Warte auf Completion und aktualisiere Progress
-                for future in as_completed(futures):
-                    file_info = futures[future]
-                    try:
-                        success = future.result()
-                        if not success:
-                            raise Exception(f"Upload von {file_info['name']} fehlgeschlagen")
-
-                    except Exception as e:
-                        self.log.error(f"Fehler beim Upload von {file_info['name']}: {e}")
-                        raise
-
-            # 4. Warten bis Session finalisiert ist
-            self.log.info("Alle Dateien hochgeladen, warte auf Server-Finalisierung...")
-            customer_url = self._wait_for_completion(session_id)
+            # 4. Session abschliessen (Kunden-URL)
+            self.log.info("Alle Dateien hochgeladen, finalisiere Session...")
+            signals.upload_status_update.emit("Finalisiere Upload...")
+            customer_url = self._finalize_session(session_id)
+            if not customer_url:
+                customer_url = self._wait_for_completion_legacy(session_id)
 
             # Speichere customer_url für get_shareable_link (nur wenn vorhanden)
             self._last_customer_url = customer_url if customer_url else None
@@ -295,271 +258,217 @@ class CustomApiClient(BaseClient):
             "base_folder_name": base_folder_name
         }
 
+        root = self._upload_api_root()
         response = self.session.post(
-            f"{self.api_base_url}/upload/direct-init",
+            f"{root}/direct-init",
             json=payload,
-            timeout=30
+            timeout=60,
         )
 
         if response.status_code != 200:
-            error_text = response.text[:500] if len(response.text) > 500 else response.text
-            raise Exception(f"HTTP {response.status_code} - {error_text}")
+            body = response.text or ""
+            summary = _summarize_api_error_body(body)
+            self.log.error(
+                "direct-init fehlgeschlagen: HTTP %s — %s | Body: %s",
+                response.status_code,
+                summary,
+                _full_body_for_log(body),
+            )
+            raise Exception(f"HTTP {response.status_code} — {summary}")
 
         result = response.json()
-
-        if not result.get("ok"):
+        if not result.get("session_id"):
+            raise Exception(f"Session-Initialisierung fehlgeschlagen (keine session_id): {result}")
+        if result.get("ok") is False:
             raise Exception(f"Session-Initialisierung fehlgeschlagen: {result}")
 
         return result
 
-    def _get_presigned_url(self, session_id, order_id, file_name, file_type):
-        """Upload-URL von der API abrufen.
+    def _post_session_multipart(self, subpath: str, fields: dict, per_request_timeout: int = 600):
+        """POST multipart/form-data an /api/upload/session/..."""
+        url = f"{self._upload_api_root()}{subpath}"
+        r = self.session.post(url, files=fields, timeout=per_request_timeout)
+        if not r.ok:
+            body = r.text or ""
+            summary = _summarize_api_error_body(body)
+            self.log.error(
+                "Session-Request %s: HTTP %s — %s | Body: %s",
+                subpath,
+                r.status_code,
+                summary,
+                _full_body_for_log(body),
+            )
+            raise Exception(f"Session upload {subpath}: HTTP {r.status_code} — {summary}")
+        return r
 
-        Endpoint: POST /api/upload/presigned-url
-        Returns: Dict mit 'url' (Dropbox Direct Upload Link)
-        """
-        pathname = f"{order_id}/{file_name}"
-
-        client_payload = json.dumps({
-            "session_id": session_id,
-            "order_id": order_id,
-            "file_name": file_name
-        })
-
-        # Die API erwartet aktuell noch dieses Format (Vercel Blob Protocol)
-        token_request = {
-            "type": "blob.generate-client-token",
-            "payload": {
-                "pathname": pathname,
-                "callbackUrl": None,
-                "multipart": False,
-                "clientPayload": client_payload
-            }
-        }
-
-        response = self.session.post(
-            f"{self.api_base_url}/upload/presigned-url",
-            json=token_request,
-            timeout=30
-        )
-
-        if response.status_code != 200:
-            error_text = response.text[:500] if len(response.text) > 500 else response.text
-            raise Exception(f"HTTP {response.status_code} - {error_text}")
-
-        token_data = response.json()
-        # Die API sendet das Feld als 'url' (Fallback auf 'directUploadUrl' für Kompatibilität)
-        upload_url = token_data.get('url') or token_data.get('directUploadUrl')
-        client_token = token_data.get('clientToken')
-
-        if not upload_url:
-            raise Exception(f"Keine Upload-URL in API-Antwort erhalten: {token_data}")
-
-        return {
-            'url': upload_url,
-            'pathname': pathname,
-            'clientToken': client_token
-        }
-
-    def _upload_file_direct(self, session_id, order_id, file_info, total_job_size, uploaded_counter):
-        """Datei direkt zum Cloud Storage (Dropbox) hochladen."""
+    def _upload_file_via_session(
+        self, session_id: str, file_info: dict, total_job_size: int, uploaded_counter: dict
+    ):
+        """Eine Datei in 4-MB-Teilen ueber session/start, append, finish."""
         file_name = file_info["name"]
         file_size = file_info["size"]
-        file_type = file_info["type"]
         local_path = file_info["local_path"]
+        mime_type = file_info["type"]
+        chunk_max = SESSION_CHUNK_SIZE
 
-        try:
-            # 1. Upload-URL abrufen
-            presigned_data = self._get_presigned_url(
-                session_id, order_id, file_name, file_type
-            )
-
-            upload_url = presigned_data.get("url")
-            pathname = presigned_data.get("pathname")
-            client_token = presigned_data.get("clientToken")
-
-            self.log.info(f"✓ Upload-URL erhalten")
-
-            # 2. Datei hochladen (Direct Upload zu Dropbox via POST)
-            def emit_progress(bytes_sent_partial: int):
-                if file_size <= 0:
-                    return
-                pct = min(100, int((bytes_sent_partial / file_size) * 100))
-                with self.progress_lock:
-                    base = uploaded_counter["bytes"]
-                combined = base + bytes_sent_partial
-                total_pct = (
-                    min(100, int((combined / total_job_size) * 100))
-                    if total_job_size > 0
-                    else 0
-                )
-                signals.upload_progress_file.emit(pct, bytes_sent_partial, file_size)
-                signals.upload_progress_total.emit(total_pct, combined, total_job_size)
-
-            with open(local_path, "rb") as raw_f:
-                self.log.info(f"   Direct Upload zu Dropbox: {file_name} ({file_size} bytes)")
-                upload_headers = {
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(file_size),
-                }
-                wrapped = _ProgressReportingReader(raw_f, file_size, emit_progress)
-                signals.upload_progress_file.emit(0, 0, file_size)
-                emit_progress(0)
-                upload_response = requests.post(
-                    upload_url,
-                    headers=upload_headers,
-                    data=wrapped,
-                    timeout=600,
-                )
-                if file_size > 0 and wrapped.bytes_sent < file_size:
-                    emit_progress(wrapped.bytes_sent)
-                elif file_size > 0:
-                    emit_progress(file_size)
-
-            if upload_response.status_code not in [200, 201]:
-                body = upload_response.text or ""
-                summary = _summarize_api_error_body(body)
-                self.log.error(
-                    "Upload-Antwort: HTTP %s — %s | Body: %s",
-                    upload_response.status_code,
-                    summary,
-                    _full_body_for_log(body),
-                )
-                raise Exception(
-                    f"Upload failed: HTTP {upload_response.status_code} — {summary}"
-                )
-
-            # Dropbox liefert bei Erfolg Metadaten zurück, inkl. einer 'id'
-            dropbox_id = None
-            try:
-                db_metadata = upload_response.json()
-                dropbox_id = db_metadata.get('id')
-                if not dropbox_id:
-                    self.log.warning(f"Dropbox-Antwort enthielt keine 'id': {db_metadata}")
-            except Exception as json_e:
-                self.log.warning(f"Konnte Dropbox-Antwort nicht als JSON parsen: {upload_response.text[:200]}")
-
-            # Fallback: Wenn keine ID vorhanden, erzeuge eine eindeutige ID im Dropbox-Format,
-            # um 'unique constraint' Fehler in der DB zu vermeiden.
-            if not dropbox_id:
-                import uuid
-                dropbox_id = f"id:temp_{uuid.uuid4().hex[:12]}"
-                self.log.info(f"Verwende temporäre ID: {dropbox_id}")
-
-            # 3. File beim Server registrieren
-            # Wir senden alle Felder (inkl. blob_url Fallback), um Server-Fehler zu vermeiden
-            register_payload = {
-                'session_id': session_id,
-                'order_id': order_id,
-                'file_name': file_name,
-                'dropbox_id': dropbox_id,
-                'clientToken': client_token,
-                'blob_url': f"dropbox://{order_id}/{file_name}" # Hilfs-URL für den Server
-            }
-
-            register_response = self.session.post(
-                f"{self.api_base_url}/upload/register",
-                json=register_payload,
-                timeout=30
-            )
-
-            if not register_response.ok:
-                reg_body = register_response.text or ""
-                reg_summary = _summarize_api_error_body(reg_body)
-                self.log.error(
-                    "upload/register fehlgeschlagen: HTTP %s — %s | Body: %s",
-                    register_response.status_code,
-                    reg_summary,
-                    _full_body_for_log(reg_body),
-                )
-                raise Exception(
-                    f"File registration failed: HTTP {register_response.status_code} — {reg_summary}"
-                )
-
-            # 4. Progress aktualisieren
+        def emit_progress(bytes_sent_partial: int):
+            if file_size <= 0:
+                pct = 100
+                sent = 0
+            else:
+                sent = bytes_sent_partial
+                pct = min(100, int((sent / file_size) * 100))
             with self.progress_lock:
-                uploaded_counter['bytes'] += file_size
-                current_total_bytes = uploaded_counter['bytes']
-                signals.upload_progress_file.emit(100, file_size, file_size)
-                total_progress = int((current_total_bytes / total_job_size) * 100)
-                signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
+                base = uploaded_counter["bytes"]
+            combined = base + sent
+            total_pct = (
+                min(100, int((combined / total_job_size) * 100))
+                if total_job_size > 0
+                else 0
+            )
+            total_denom = file_size if file_size > 0 else 1
+            signals.upload_progress_file.emit(pct, sent, total_denom)
+            signals.upload_progress_total.emit(total_pct, combined, total_job_size)
 
-            self.log.info(f"✅ {file_name} erfolgreich hochgeladen")
-            return True
+        self.log.info("Session-Upload: %s (%s bytes)", file_name, file_size)
+        signals.upload_status_update.emit(f"Lade hoch: {file_name}")
+        emit_progress(0)
+        denom = file_size if file_size > 0 else 1
+        signals.upload_progress_file.emit(0, 0, denom)
 
-        except Exception as e:
-            self.log.error(f"Fehler beim Upload von {file_name}: {e}")
-            raise
+        with open(local_path, "rb") as f:
+            first_len = min(chunk_max, file_size) if file_size > 0 else 0
+            first = f.read(first_len)
+            self._post_session_multipart(
+                "/session/start",
+                {
+                    "session_id": (None, session_id),
+                    "file_name": (None, file_name),
+                    "expected_size": (None, str(file_size)),
+                    "chunk": ("chunk", first, "application/octet-stream"),
+                },
+            )
+            emit_progress(len(first))
+            off = len(first)
 
-    def _wait_for_completion(self, session_id):
-        """Warten bis Session vom Server finalisiert wurde.
+            while file_size - off > chunk_max:
+                buf = f.read(chunk_max)
+                r = self._post_session_multipart(
+                    "/session/append",
+                    {
+                        "session_id": (None, session_id),
+                        "file_name": (None, file_name),
+                        "offset": (None, str(off)),
+                        "chunk": ("chunk", buf, "application/octet-stream"),
+                    },
+                )
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and "next_offset" in j:
+                        off = int(j["next_offset"])
+                    else:
+                        off += len(buf)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    off += len(buf)
+                emit_progress(off)
 
-        Der Server finalisiert die Session automatisch nachdem alle Files
-        über den onUploadCompleted Callback registriert wurden.
-        """
-        max_wait_time = 15  # 15 Sekunden max
-        poll_interval = 2  # Alle 2 Sekunden prüfen
+            last = f.read()
+            self._post_session_multipart(
+                "/session/finish",
+                {
+                    "session_id": (None, session_id),
+                    "file_name": (None, file_name),
+                    "offset": (None, str(off)),
+                    "chunk": ("chunk", last, "application/octet-stream"),
+                    "mime_type": (None, mime_type),
+                },
+            )
+
+        emit_progress(file_size)
+
+        with self.progress_lock:
+            uploaded_counter["bytes"] += file_size
+            current_total_bytes = uploaded_counter["bytes"]
+        fd = file_size if file_size > 0 else 1
+        signals.upload_progress_file.emit(100, file_size, fd)
+        total_progress = (
+            int((current_total_bytes / total_job_size) * 100) if total_job_size > 0 else 100
+        )
+        signals.upload_progress_total.emit(
+            total_progress, current_total_bytes, total_job_size
+        )
+        self.log.info("Fertig: %s", file_name)
+
+    def _finalize_session(self, session_id: str):
+        """POST /api/upload/finalize — liefert u. a. customer_url."""
+        r = self.session.post(
+            f"{self._upload_api_root()}/finalize",
+            json={"session_id": session_id},
+            timeout=120,
+        )
+        if r.status_code in (404, 405, 501):
+            self.log.warning(
+                "finalize nicht unterstuetzt (HTTP %s), nutze Status-Poll-Fallback",
+                r.status_code,
+            )
+            return None
+        if not r.ok:
+            body = r.text or ""
+            summary = _summarize_api_error_body(body)
+            self.log.error(
+                "finalize fehlgeschlagen: HTTP %s — %s | Body: %s",
+                r.status_code,
+                summary,
+                _full_body_for_log(body),
+            )
+            raise Exception(f"finalize: HTTP {r.status_code} — {summary}")
+        try:
+            data = r.json()
+        except json.JSONDecodeError:
+            self.log.warning("finalize: keine JSON-Antwort")
+            return None
+        return self._extract_customer_url(data)
+
+    def _wait_for_completion_legacy(self, session_id):
+        """Fallback: Status per GET pollen (alte APIs ohne finalize-URL in Antwort)."""
+        max_wait_time = 30
+        poll_interval = 2
         started_at = time.monotonic()
+        status_urls = [
+            f"{self._upload_api_root()}/status/{session_id}",
+            f"{self._api_origin()}/upload/status/{session_id}",
+        ]
 
-        self.log.info("Warte auf Server-Finalisierung...")
-        signals.upload_status_update.emit("Finalisiere Upload...")
+        self.log.info("Warte auf Server-Finalisierung (Status-Poll)...")
 
         while (time.monotonic() - started_at) < max_wait_time:
-            try:
-                # Session-Status abrufen
-                response = self.session.get(
-                    f"{self.api_base_url}/upload/status/{session_id}",
-                    headers={'Authorization': f'Bearer {self.api_key}'},
-                    timeout=10
-                )
-
-                if response.ok:
+            for status_url in status_urls:
+                try:
+                    response = self.session.get(status_url, timeout=15)
+                    if not response.ok:
+                        continue
                     result = response.json()
-                    self.log.debug(f"Session-Status Antwort: {result}")
-
                     customer_url = self._extract_customer_url(result)
                     if result.get("status") == "completed" and customer_url:
-                        self.log.info(f"Session finalisiert! Customer URL: {customer_url}")
+                        self.log.info("Session finalisiert (Poll): %s", customer_url)
                         return customer_url
-
-                    # Manche Server liefern URL bereits vor finalem Status.
                     if customer_url:
-                        self.log.info(f"Customer URL bereits verfuegbar: {customer_url}")
+                        self.log.info("Customer URL (Poll): %s", customer_url)
                         return customer_url
-
-                    # Status-Update loggen
-                    uploaded = result.get("uploaded_files", 0)
-                    total = result.get("total_files", 0)
-                    self.log.debug(f"Session Status: {uploaded}/{total} Files verarbeitet")
-                else:
-                    self.log.warning(f"Status-Check HTTP {response.status_code}: {response.text[:200]}")
-
-            except Exception as e:
-                self.log.warning(f"Fehler beim Status-Check: {e}")
-
+                except Exception as e:
+                    self.log.debug("Status-Poll %s: %s", status_url, e)
             time.sleep(poll_interval)
 
-        # Timeout - versuche trotzdem customer_url mit kurzen Retries zu holen
-        self.log.warning("Timeout beim Warten auf Finalisierung, versuche URL zu holen...")
-
-        for _ in range(3):
+        self.log.warning("Timeout beim Status-Poll, letzte Versuche...")
+        for status_url in status_urls:
             try:
-                response = self.session.get(
-                    f"{self.api_base_url}/upload/status/{session_id}",
-                    headers={'Authorization': f'Bearer {self.api_key}'},
-                    timeout=10
-                )
+                response = self.session.get(status_url, timeout=15)
                 if response.ok:
-                    result = response.json()
-                    customer_url = self._extract_customer_url(result)
+                    customer_url = self._extract_customer_url(response.json())
                     if customer_url:
-                        self.log.info(f"Customer URL nach Timeout erhalten: {customer_url}")
                         return customer_url
             except Exception as e:
-                self.log.warning(f"Fehler beim nachtraeglichen URL-Check: {e}")
-
-            time.sleep(2)
-
+                self.log.warning("Status-Poll Fehler: %s", e)
         return None
 
     def _extract_customer_url(self, result):
@@ -681,25 +590,25 @@ class CustomApiClient(BaseClient):
         """Gibt den Customer-Link zurück (bereits von Session zurückgegeben)."""
         if not self._last_customer_url:
             # Fallback: versuche URL noch einmal anhand der letzten Session zu laden.
-            if self._last_session_id:
-                try:
-                    response = self.session.get(
-                        f"{self.api_base_url}/upload/status/{self._last_session_id}",
-                        headers={'Authorization': f'Bearer {self.api_key}'},
-                        timeout=10
-                    )
-                    if response.ok:
-                        result = response.json()
-                        fallback_url = self._extract_customer_url(result)
-                        if fallback_url:
-                            self._last_customer_url = fallback_url
-                            self.log.info(f"customer_url per Fallback-Check erhalten: {fallback_url}")
-                    else:
-                        self.log.warning(
-                            f"Fallback Status-Check fehlgeschlagen (HTTP {response.status_code})"
-                        )
-                except Exception as e:
-                    self.log.warning(f"Fallback Status-Check fuer customer_url fehlgeschlagen: {e}")
+            if self._last_session_id and self.session and self.api_base_url:
+                for status_url in (
+                    f"{self._upload_api_root()}/status/{self._last_session_id}",
+                    f"{self._api_origin()}/upload/status/{self._last_session_id}",
+                ):
+                    try:
+                        response = self.session.get(status_url, timeout=15)
+                        if response.ok:
+                            fallback_url = self._extract_customer_url(response.json())
+                            if fallback_url:
+                                self._last_customer_url = fallback_url
+                                self.log.info(
+                                    "customer_url per Fallback-Check erhalten: %s", fallback_url
+                                )
+                                break
+                    except Exception as e:
+                        self.log.warning("Fallback Status-Check (%s): %s", status_url, e)
+                else:
+                    self.log.warning("Fallback Status-Check: keine customer_url")
 
             if not self._last_customer_url:
                 customer_lookup_url = self._fetch_customer_url_from_aero_customer()
