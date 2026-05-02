@@ -13,6 +13,67 @@ from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
 
+# Mindestabstand zwischen Fortschritts-Signalen beim Streaming-Upload (Bytes)
+_PROGRESS_EMIT_INTERVAL = 256 * 1024
+
+
+def _summarize_api_error_body(text: str, max_len: int = 800) -> str:
+    """Kurzfassung fuer Logs/Exception: Dropbox liefert JSON mit error_summary."""
+    if not text or not text.strip():
+        return "(leer)"
+    snippet = text.strip()
+    try:
+        data = json.loads(snippet)
+        if isinstance(data, dict):
+            summary = data.get("error_summary")
+            if summary:
+                return str(summary)[:max_len]
+            err = data.get("error")
+            if isinstance(err, dict) and ".tag" in err:
+                return str(err)[:max_len]
+    except json.JSONDecodeError:
+        pass
+    return snippet[:max_len] + ("..." if len(snippet) > max_len else "")
+
+
+def _full_body_for_log(text: str, limit: int = 4000) -> str:
+    if not text:
+        return "(leer)"
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated, {len(text)} chars total]"
+
+
+class _ProgressReportingReader:
+    """Wrappt eine geoeffnete Binaerdatei; meldet Fortschritt periodisch beim Lesen."""
+
+    __slots__ = ("_raw", "_file_size", "_on_progress", "_sent", "_last_threshold")
+
+    def __init__(self, raw, file_size: int, on_progress):
+        self._raw = raw
+        self._file_size = max(file_size, 0)
+        self._on_progress = on_progress
+        self._sent = 0
+        self._last_threshold = -1
+
+    @property
+    def bytes_sent(self) -> int:
+        return self._sent
+
+    def read(self, n=-1):
+        chunk = self._raw.read(n)
+        if chunk:
+            self._sent += len(chunk)
+            if self._file_size > 0:
+                threshold = self._sent // _PROGRESS_EMIT_INTERVAL
+                if threshold > self._last_threshold:
+                    self._last_threshold = threshold
+                    self._on_progress(self._sent)
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
 
 class CustomApiClient(BaseClient):
     """Implementierung des BaseClient für Custom Cloud Storage API mit Direct Upload (Presigned URLs)."""
@@ -320,23 +381,53 @@ class CustomApiClient(BaseClient):
             self.log.info(f"✓ Upload-URL erhalten")
 
             # 2. Datei hochladen (Direct Upload zu Dropbox via POST)
-            with open(local_path, 'rb') as f:
-                self.log.info(f"   Direct Upload zu Dropbox: {file_name}")
-                
+            def emit_progress(bytes_sent_partial: int):
+                if file_size <= 0:
+                    return
+                pct = min(100, int((bytes_sent_partial / file_size) * 100))
+                with self.progress_lock:
+                    base = uploaded_counter["bytes"]
+                combined = base + bytes_sent_partial
+                total_pct = (
+                    min(100, int((combined / total_job_size) * 100))
+                    if total_job_size > 0
+                    else 0
+                )
+                signals.upload_progress_file.emit(pct, bytes_sent_partial, file_size)
+                signals.upload_progress_total.emit(total_pct, combined, total_job_size)
+
+            with open(local_path, "rb") as raw_f:
+                self.log.info(f"   Direct Upload zu Dropbox: {file_name} ({file_size} bytes)")
                 upload_headers = {
-                    'Content-Type': 'application/octet-stream'
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(file_size),
                 }
-                
+                wrapped = _ProgressReportingReader(raw_f, file_size, emit_progress)
+                signals.upload_progress_file.emit(0, 0, file_size)
+                emit_progress(0)
                 upload_response = requests.post(
                     upload_url,
                     headers=upload_headers,
-                    data=f,
-                    timeout=600
+                    data=wrapped,
+                    timeout=600,
                 )
+                if file_size > 0 and wrapped.bytes_sent < file_size:
+                    emit_progress(wrapped.bytes_sent)
+                elif file_size > 0:
+                    emit_progress(file_size)
 
             if upload_response.status_code not in [200, 201]:
-                self.log.error(f"Upload-Antwort: {upload_response.status_code} - {upload_response.text}")
-                raise Exception(f"Upload failed: HTTP {upload_response.status_code}")
+                body = upload_response.text or ""
+                summary = _summarize_api_error_body(body)
+                self.log.error(
+                    "Upload-Antwort: HTTP %s — %s | Body: %s",
+                    upload_response.status_code,
+                    summary,
+                    _full_body_for_log(body),
+                )
+                raise Exception(
+                    f"Upload failed: HTTP {upload_response.status_code} — {summary}"
+                )
 
             # Dropbox liefert bei Erfolg Metadaten zurück, inkl. einer 'id'
             dropbox_id = None
@@ -373,8 +464,17 @@ class CustomApiClient(BaseClient):
             )
 
             if not register_response.ok:
-                error_text = register_response.text[:200] if len(register_response.text) > 200 else register_response.text
-                raise Exception(f"File registration failed: HTTP {register_response.status_code} - {error_text}")
+                reg_body = register_response.text or ""
+                reg_summary = _summarize_api_error_body(reg_body)
+                self.log.error(
+                    "upload/register fehlgeschlagen: HTTP %s — %s | Body: %s",
+                    register_response.status_code,
+                    reg_summary,
+                    _full_body_for_log(reg_body),
+                )
+                raise Exception(
+                    f"File registration failed: HTTP {register_response.status_code} — {reg_summary}"
+                )
 
             # 4. Progress aktualisieren
             with self.progress_lock:
