@@ -17,6 +17,10 @@ class HistoryManager:
                 return []
         return []
 
+    def reload_from_file(self):
+        """Ersetzt die in-memory-Historie durch den aktuellen Dateiinhalt (ohne zu speichern)."""
+        self.history = self.load_history()
+
     def save_history(self):
         try:
             with open(self.file_path, "w", encoding="utf-8") as f:
