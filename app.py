@@ -2,7 +2,7 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
@@ -383,7 +383,8 @@ class MainWindow(QMainWindow):
     @Slot(int, str)
     def add_log_message(self, level, message):
         """Fügt eine Nachricht zur Log-Anzeige hinzu und färbt sie ein."""
-        color = "white"
+        # Standardtext: Systempalette (Light/Dark), nicht fest „white“ (sonst unsichtbar auf hellem Hintergrund).
+        color = self.log_display.palette().color(QPalette.ColorRole.Text).name()
         if level == logging.ERROR:
             color = "red"
         elif level == logging.WARNING:
