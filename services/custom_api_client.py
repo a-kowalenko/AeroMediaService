@@ -1,5 +1,6 @@
 ﻿import os
 import json
+import random
 import requests
 from requests.adapters import HTTPAdapter
 import logging
@@ -12,8 +13,18 @@ from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
 
-# Chunk-Groesse fuer Custom-API-Session-Upload (Server-Limit, z. B. Vercel)
-SESSION_CHUNK_SIZE = 4 * 1024 * 1024
+# Entspricht Server PROXIED_UPLOAD_CHUNK_BYTES; Vercel-Multipart-Limit ~4.5 MiB Request-Body.
+CHUNK_BYTES = 4 * 1024 * 1024
+
+
+class ApiAuthError(Exception):
+    """401/403: ungueltiger Key oder fehlende 'upload'-Permission — kein Retry."""
+
+
+def _body_suggests_invocation_timeout(text: str) -> bool:
+    if not text:
+        return False
+    return "FUNCTION_INVOCATION_TIMEOUT" in text.upper()
 
 
 def _summarize_api_error_body(text: str, max_len: int = 800) -> str:
@@ -55,6 +66,7 @@ class CustomApiClient(BaseClient):
         self.link_shortener = LinkShortener(config_manager)
         self._last_customer_url = None  # Speichert die letzte customer_url
         self._last_session_id = None  # Letzte Upload-Session fuer spaeteren Link-Check
+        self._last_order_id = None  # order_id aus direct-init / finalize
         self._last_kunde = None  # Letzter Kunde fuer Customer-API-Fallback
         self.session = None  # requests.Session für Connection-Pooling
         self.progress_lock = Lock()  # Lock für Thread-sichere Progress-Updates
@@ -97,10 +109,15 @@ class CustomApiClient(BaseClient):
                 self.log.info("Erfolgreich mit Custom API verbunden (Session-Chunk-Upload).")
                 signals.connection_status_changed.emit("Verbunden")
                 return True
-            else:
-                self.log.error(f"API Connection fehlgeschlagen: {response.status_code}")
-                signals.connection_status_changed.emit(f"Fehler: HTTP {response.status_code}")
+            if response.status_code in (401, 403):
+                msg = "Bearer-Token ungueltig oder ohne 'upload'-Permission"
+                snippet = (response.text or "")[:200]
+                self.log.error("API Connection: %s — %s", msg, snippet)
+                signals.connection_status_changed.emit(f"Fehler: {msg}")
                 return False
+            self.log.error(f"API Connection fehlgeschlagen: {response.status_code}")
+            signals.connection_status_changed.emit(f"Fehler: HTTP {response.status_code}")
+            return False
 
         except requests.exceptions.RequestException as e:
             self.log.error(f"Verbindungsfehler zur API: {e}")
@@ -131,6 +148,280 @@ class CustomApiClient(BaseClient):
     def _upload_api_root(self) -> str:
         """Basis-URL fuer Upload-Routen (z. B. https://host/api/upload)."""
         return f"{self._api_origin()}/api/upload"
+
+    @staticmethod
+    def _session_ctx(session_id: str, file_name: str, offset=None) -> str:
+        if offset is not None:
+            return f"session={session_id!r} file={file_name!r} off={offset}"
+        return f"session={session_id!r} file={file_name!r}"
+
+    @staticmethod
+    def _http_transient(status: int, body: str) -> bool:
+        if status in (408, 429, 502, 503, 504):
+            return True
+        return _body_suggests_invocation_timeout(body or "")
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """attempt 1-basiert: 2–30 s + Jitter."""
+        return min(30.0, 2.0 ** (attempt - 1)) + random.uniform(0.0, 1.5)
+
+    def _post_json_upload(
+        self,
+        path_suffix: str,
+        json_body: dict,
+        *,
+        timeout: int,
+        tag: str,
+        soft_fail_statuses: frozenset | None = None,
+    ):
+        """POST JSON an /api/upload/... mit Retry bei transienten Fehlern."""
+        url = f"{self._upload_api_root()}{path_suffix}"
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = self.session.post(url, json=json_body, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                if attempt >= max_attempts:
+                    self.log.error("%s: %s nach %s Versuchen", tag, e, max_attempts)
+                    raise
+                d = self._backoff_delay(attempt)
+                self.log.warning(
+                    "%s: Netzwerk-Fehler, Versuch %s/%s, warte %.1fs — %s",
+                    tag,
+                    attempt,
+                    max_attempts,
+                    d,
+                    e,
+                )
+                time.sleep(d)
+                continue
+            body = r.text or ""
+            if soft_fail_statuses and r.status_code in soft_fail_statuses:
+                return r
+            if r.status_code in (401, 403):
+                raise ApiAuthError(
+                    f"API-Key fehlt oder hat keine 'upload'-Permission (HTTP {r.status_code}). "
+                    f"{(body or '')[:200]}"
+                )
+            if r.ok:
+                if attempt > 1:
+                    self.log.info("%s: HTTP %s nach Versuch %s", tag, r.status_code, attempt)
+                return r
+            if self._http_transient(r.status_code, body):
+                if attempt >= max_attempts:
+                    summary = _summarize_api_error_body(body)
+                    self.log.error(
+                        "%s: HTTP %s nach %s Versuchen — %s",
+                        tag,
+                        r.status_code,
+                        max_attempts,
+                        summary,
+                    )
+                    raise Exception(f"{tag}: HTTP {r.status_code} — {summary}")
+                d = self._backoff_delay(attempt)
+                self.log.warning(
+                    "%s: HTTP %s, Versuch %s/%s, warte %.1fs — %s",
+                    tag,
+                    r.status_code,
+                    attempt,
+                    max_attempts,
+                    d,
+                    _summarize_api_error_body(body)[:200],
+                )
+                time.sleep(d)
+                continue
+            summary = _summarize_api_error_body(body)
+            self.log.error(
+                "%s: HTTP %s — %s | Body: %s",
+                tag,
+                r.status_code,
+                summary,
+                _full_body_for_log(body),
+            )
+            raise Exception(f"{tag}: HTTP {r.status_code} — {summary}")
+
+    def _post_session_multipart_with_retry(
+        self,
+        subpath: str,
+        fields: dict,
+        *,
+        session_id: str,
+        file_name: str,
+        offset_for_log,
+        per_request_timeout: int = 600,
+    ):
+        """POST multipart an session/start|append|finish mit Retry (503/504/Netz)."""
+        url = f"{self._upload_api_root()}{subpath}"
+        max_attempts = 6
+        ctx = self._session_ctx(session_id, file_name, offset_for_log)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = self.session.post(url, files=fields, timeout=per_request_timeout)
+            except requests.exceptions.RequestException as e:
+                if attempt >= max_attempts:
+                    self.log.error(
+                        "Session %s [%s]: %s nach %s Versuchen",
+                        subpath,
+                        ctx,
+                        e,
+                        max_attempts,
+                    )
+                    raise
+                d = self._backoff_delay(attempt)
+                self.log.warning(
+                    "Session %s [%s]: Netzwerk-Fehler, Versuch %s/%s, warte %.1fs — %s",
+                    subpath,
+                    ctx,
+                    attempt,
+                    max_attempts,
+                    d,
+                    e,
+                )
+                time.sleep(d)
+                continue
+            body = r.text or ""
+            if r.status_code in (401, 403):
+                raise ApiAuthError(
+                    f"API-Key fehlt oder hat keine 'upload'-Permission (HTTP {r.status_code}). "
+                    f"{(body or '')[:200]}"
+                )
+            if r.ok:
+                self.log.info(
+                    "Session %s [%s]: HTTP %s%s",
+                    subpath,
+                    ctx,
+                    r.status_code,
+                    f" (Versuch {attempt})" if attempt > 1 else "",
+                )
+                return r
+            if self._http_transient(r.status_code, body):
+                if attempt >= max_attempts:
+                    summary = _summarize_api_error_body(body)
+                    self.log.error(
+                        "Session %s [%s]: HTTP %s nach %s Versuchen — %s",
+                        subpath,
+                        ctx,
+                        r.status_code,
+                        max_attempts,
+                        summary,
+                    )
+                    raise Exception(f"Session {subpath}: HTTP {r.status_code} — {summary}")
+                d = self._backoff_delay(attempt)
+                self.log.warning(
+                    "Session %s [%s]: HTTP %s, Versuch %s/%s, warte %.1fs — %s",
+                    subpath,
+                    ctx,
+                    r.status_code,
+                    attempt,
+                    max_attempts,
+                    d,
+                    _summarize_api_error_body(body)[:200],
+                )
+                time.sleep(d)
+                continue
+            summary = _summarize_api_error_body(body)
+            self.log.error(
+                "Session %s [%s]: HTTP %s — %s | Body: %s",
+                subpath,
+                ctx,
+                r.status_code,
+                summary,
+                _full_body_for_log(body),
+            )
+            raise Exception(f"Session upload {subpath}: HTTP {r.status_code} — {summary}")
+
+    def _parse_next_offset(
+        self,
+        r: requests.Response,
+        expected_next: int,
+        session_id: str,
+        file_name: str,
+        step: str,
+    ) -> int:
+        try:
+            j = r.json()
+        except (json.JSONDecodeError, TypeError):
+            self.log.warning(
+                "[%s] %s: keine JSON-Antwort, verwende next_offset=%s",
+                self._session_ctx(session_id, file_name),
+                step,
+                expected_next,
+            )
+            return expected_next
+        if isinstance(j, dict) and "next_offset" in j:
+            try:
+                no = int(j["next_offset"])
+            except (ValueError, TypeError):
+                self.log.warning(
+                    "[%s] %s: next_offset unparseable %r, verwende %s",
+                    self._session_ctx(session_id, file_name),
+                    step,
+                    j.get("next_offset"),
+                    expected_next,
+                )
+                return expected_next
+            if no != expected_next:
+                self.log.warning(
+                    "[%s] %s: next_offset Drift server=%s erwartet=%s — Server-Wert",
+                    self._session_ctx(session_id, file_name),
+                    step,
+                    no,
+                    expected_next,
+                )
+            return no
+        self.log.warning(
+            "[%s] %s: keine next_offset in Antwort, verwende %s",
+            self._session_ctx(session_id, file_name),
+            step,
+            expected_next,
+        )
+        return expected_next
+
+    def _session_start(self, session_id: str, file_name: str, expected_size: int, chunk: bytes):
+        return self._post_session_multipart_with_retry(
+            "/session/start",
+            {
+                "session_id": (None, session_id),
+                "file_name": (None, file_name),
+                "expected_size": (None, str(expected_size)),
+                "chunk": ("chunk", chunk, "application/octet-stream"),
+            },
+            session_id=session_id,
+            file_name=file_name,
+            offset_for_log=0,
+        )
+
+    def _session_append(self, session_id: str, file_name: str, offset: int, chunk: bytes):
+        return self._post_session_multipart_with_retry(
+            "/session/append",
+            {
+                "session_id": (None, session_id),
+                "file_name": (None, file_name),
+                "offset": (None, str(offset)),
+                "chunk": ("chunk", chunk, "application/octet-stream"),
+            },
+            session_id=session_id,
+            file_name=file_name,
+            offset_for_log=offset,
+        )
+
+    def _session_finish(
+        self, session_id: str, file_name: str, offset: int, chunk: bytes, mime_type: str
+    ):
+        fields = {
+            "session_id": (None, session_id),
+            "file_name": (None, file_name),
+            "offset": (None, str(offset)),
+            "chunk": ("chunk", chunk, "application/octet-stream"),
+            "mime_type": (None, mime_type or "application/octet-stream"),
+        }
+        return self._post_session_multipart_with_retry(
+            "/session/finish",
+            fields,
+            session_id=session_id,
+            file_name=file_name,
+            offset_for_log=offset,
+        )
 
     def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde = None):
         """Lädt ein Verzeichnis per direct-init, 4-MB-Session-Chunks und finalize hoch."""
@@ -186,6 +477,10 @@ class CustomApiClient(BaseClient):
                 f", order_id={order_id}" if order_id else "",
             )
 
+        except ApiAuthError as e:
+            self.log.error("Session-Initialisierung: %s", e)
+            signals.upload_status_update.emit(str(e))
+            return False
         except Exception as e:
             self.log.error(f"Session-Initialisierung fehlgeschlagen: {e}")
             signals.upload_status_update.emit(f"Fehler: {e}")
@@ -219,6 +514,10 @@ class CustomApiClient(BaseClient):
                 )
             return True
 
+        except ApiAuthError as e:
+            self.log.error("Upload: %s", e)
+            signals.upload_status_update.emit(str(e))
+            return False
         except Exception as e:
             self.log.error(f"Upload fehlgeschlagen: {e}")
             signals.upload_status_update.emit(f"Fehler: {e}")
@@ -229,87 +528,56 @@ class CustomApiClient(BaseClient):
 
         Endpoint: POST /api/upload/direct-init
         """
-        # Metadata aus kunde-Parameter extrahieren
         metadata = {}
         if kunde:
             from dataclasses import asdict, is_dataclass
 
-            # Konvertiere Kunde-Objekt zu Dictionary
             if is_dataclass(kunde):
                 kunde_dict = asdict(kunde)
             elif isinstance(kunde, dict):
-                kunde_dict = kunde
+                kunde_dict = dict(kunde)
             else:
-                kunde_dict = vars(kunde)
+                kunde_dict = dict(vars(kunde))
 
-            metadata = kunde_dict
-            self.log.info(f"Sende Metadata: {metadata}")
+            metadata = dict(kunde_dict)
+
+        metadata["base_folder_name"] = base_folder_name
+        self.log.info("direct-init metadata: %s", metadata)
 
         payload = {
             "files": [
                 {
                     "name": f["name"],
                     "size": f["size"],
-                    "type": f["type"]
+                    "type": f["type"],
                 }
                 for f in files_to_upload
             ],
             "metadata": metadata,
-            "base_folder_name": base_folder_name
+            "base_folder_name": base_folder_name,
         }
 
-        root = self._upload_api_root()
-        response = self.session.post(
-            f"{root}/direct-init",
-            json=payload,
-            timeout=60,
-        )
-
-        if response.status_code != 200:
-            body = response.text or ""
-            summary = _summarize_api_error_body(body)
-            self.log.error(
-                "direct-init fehlgeschlagen: HTTP %s — %s | Body: %s",
-                response.status_code,
-                summary,
-                _full_body_for_log(body),
-            )
-            raise Exception(f"HTTP {response.status_code} — {summary}")
-
+        response = self._post_json_upload("/direct-init", payload, timeout=60, tag="direct-init")
         result = response.json()
         if not result.get("session_id"):
             raise Exception(f"Session-Initialisierung fehlgeschlagen (keine session_id): {result}")
         if result.get("ok") is False:
             raise Exception(f"Session-Initialisierung fehlgeschlagen: {result}")
 
-        return result
+        oid = result.get("order_id")
+        if oid is not None:
+            self._last_order_id = str(oid)
 
-    def _post_session_multipart(self, subpath: str, fields: dict, per_request_timeout: int = 600):
-        """POST multipart/form-data an /api/upload/session/..."""
-        url = f"{self._upload_api_root()}{subpath}"
-        r = self.session.post(url, files=fields, timeout=per_request_timeout)
-        if not r.ok:
-            body = r.text or ""
-            summary = _summarize_api_error_body(body)
-            self.log.error(
-                "Session-Request %s: HTTP %s — %s | Body: %s",
-                subpath,
-                r.status_code,
-                summary,
-                _full_body_for_log(body),
-            )
-            raise Exception(f"Session upload {subpath}: HTTP {r.status_code} — {summary}")
-        return r
+        return result
 
     def _upload_file_via_session(
         self, session_id: str, file_info: dict, total_job_size: int, uploaded_counter: dict
     ):
-        """Eine Datei in 4-MB-Teilen ueber session/start, append, finish."""
+        """Eine Datei: session/start → optional session/append* → session/finish (CHUNK_BYTES)."""
         file_name = file_info["name"]
         file_size = file_info["size"]
         local_path = file_info["local_path"]
         mime_type = file_info["type"]
-        chunk_max = SESSION_CHUNK_SIZE
 
         def emit_progress(bytes_sent_partial: int):
             if file_size <= 0:
@@ -330,59 +598,48 @@ class CustomApiClient(BaseClient):
             signals.upload_progress_file.emit(pct, sent, total_denom)
             signals.upload_progress_total.emit(total_pct, combined, total_job_size)
 
-        self.log.info("Session-Upload: %s (%s bytes)", file_name, file_size)
+        self.log.info(
+            "[%s] Session-Upload: %s bytes",
+            self._session_ctx(session_id, file_name),
+            file_size,
+        )
         signals.upload_status_update.emit(f"Lade hoch: {file_name}")
         emit_progress(0)
         denom = file_size if file_size > 0 else 1
         signals.upload_progress_file.emit(0, 0, denom)
 
         with open(local_path, "rb") as f:
-            first_len = min(chunk_max, file_size) if file_size > 0 else 0
+            first_len = min(CHUNK_BYTES, file_size) if file_size > 0 else 0
             first = f.read(first_len)
-            self._post_session_multipart(
-                "/session/start",
-                {
-                    "session_id": (None, session_id),
-                    "file_name": (None, file_name),
-                    "expected_size": (None, str(file_size)),
-                    "chunk": ("chunk", first, "application/octet-stream"),
-                },
+            r_start = self._session_start(session_id, file_name, file_size, first)
+            off = self._parse_next_offset(
+                r_start, len(first), session_id, file_name, "start"
             )
-            emit_progress(len(first))
-            off = len(first)
+            emit_progress(off)
 
-            while file_size - off > chunk_max:
-                buf = f.read(chunk_max)
-                r = self._post_session_multipart(
-                    "/session/append",
-                    {
-                        "session_id": (None, session_id),
-                        "file_name": (None, file_name),
-                        "offset": (None, str(off)),
-                        "chunk": ("chunk", buf, "application/octet-stream"),
-                    },
+            while file_size - off > CHUNK_BYTES:
+                buf = f.read(CHUNK_BYTES)
+                if len(buf) != CHUNK_BYTES:
+                    raise RuntimeError(
+                        f"{file_name}: append erwartete {CHUNK_BYTES} Bytes, erhalten {len(buf)}"
+                    )
+                if off + len(buf) >= file_size:
+                    raise RuntimeError(
+                        f"{file_name}: append wuerde letzten Block senden — stattdessen finish"
+                    )
+                r_app = self._session_append(session_id, file_name, off, buf)
+                off = self._parse_next_offset(
+                    r_app, off + len(buf), session_id, file_name, "append"
                 )
-                try:
-                    j = r.json()
-                    if isinstance(j, dict) and "next_offset" in j:
-                        off = int(j["next_offset"])
-                    else:
-                        off += len(buf)
-                except (ValueError, TypeError, json.JSONDecodeError):
-                    off += len(buf)
                 emit_progress(off)
 
             last = f.read()
-            self._post_session_multipart(
-                "/session/finish",
-                {
-                    "session_id": (None, session_id),
-                    "file_name": (None, file_name),
-                    "offset": (None, str(off)),
-                    "chunk": ("chunk", last, "application/octet-stream"),
-                    "mime_type": (None, mime_type),
-                },
-            )
+            if off + len(last) != file_size:
+                raise RuntimeError(
+                    f"{file_name}: finish-Invariante verletzt off={off} "
+                    f"len(last)={len(last)} expected_size={file_size}"
+                )
+            self._session_finish(session_id, file_name, off, last, mime_type)
 
         emit_progress(file_size)
 
@@ -397,36 +654,45 @@ class CustomApiClient(BaseClient):
         signals.upload_progress_total.emit(
             total_progress, current_total_bytes, total_job_size
         )
-        self.log.info("Fertig: %s", file_name)
+        self.log.info("[%s] Fertig", self._session_ctx(session_id, file_name))
 
     def _finalize_session(self, session_id: str):
         """POST /api/upload/finalize — liefert u. a. customer_url."""
-        r = self.session.post(
-            f"{self._upload_api_root()}/finalize",
-            json={"session_id": session_id},
+        r = self._post_json_upload(
+            "/finalize",
+            {"session_id": session_id},
             timeout=120,
+            tag="finalize",
+            soft_fail_statuses=frozenset({404, 405, 501}),
         )
         if r.status_code in (404, 405, 501):
             self.log.warning(
-                "finalize nicht unterstuetzt (HTTP %s), nutze Status-Poll-Fallback",
+                "finalize nicht unterstuetzt (HTTP %s), nutze Status-Poll-Fallback [session=%r]",
                 r.status_code,
+                session_id,
             )
             return None
-        if not r.ok:
-            body = r.text or ""
-            summary = _summarize_api_error_body(body)
-            self.log.error(
-                "finalize fehlgeschlagen: HTTP %s — %s | Body: %s",
-                r.status_code,
-                summary,
-                _full_body_for_log(body),
-            )
-            raise Exception(f"finalize: HTTP {r.status_code} — {summary}")
+
         try:
             data = r.json()
         except json.JSONDecodeError:
-            self.log.warning("finalize: keine JSON-Antwort")
+            self.log.warning("finalize: keine JSON-Antwort [session=%r]", session_id)
             return None
+
+        for key in ("archive_url", "media_url", "order_id"):
+            val = data.get(key)
+            if val:
+                self.log.info(
+                    "finalize %s=%s HTTP %s [session=%r]",
+                    key,
+                    val,
+                    r.status_code,
+                    session_id,
+                )
+        oid = data.get("order_id")
+        if oid is not None:
+            self._last_order_id = str(oid)
+
         return self._extract_customer_url(data)
 
     def _wait_for_completion_legacy(self, session_id):
