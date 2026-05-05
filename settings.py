@@ -208,6 +208,11 @@ class SettingsDialog(QDialog):
         self.custom_api_health_endpoint_edit.setPlaceholderText("/health")
         custom_api_layout.addRow("Health Check Endpoint:", self.custom_api_health_endpoint_edit)
 
+        self.custom_api_mode_combo = QComboBox()
+        self.custom_api_mode_combo.addItem("Proxy Session Upload (bestehend)", "proxied_session")
+        self.custom_api_mode_combo.addItem("Direct Dropbox Upload + client-complete (neu)", "direct_dropbox_complete")
+        custom_api_layout.addRow("Upload-Modus:", self.custom_api_mode_combo)
+
         # Verbindungs-Steuerung für Custom API
         self.custom_api_connect_button = QPushButton("Mit Custom API verbinden")
         self.custom_api_connect_button.clicked.connect(self.toggle_custom_api_connection)
@@ -501,6 +506,9 @@ class SettingsDialog(QDialog):
         self.custom_api_upload_endpoint_edit.setText(self.config.get_setting("custom_api_upload_endpoint", "/upload"))
         self.custom_api_share_endpoint_edit.setText(self.config.get_setting("custom_api_share_endpoint", "/share"))
         self.custom_api_health_endpoint_edit.setText(self.config.get_setting("custom_api_health_endpoint", "/health"))
+        custom_mode = self.config.get_setting("custom_api_upload_mode", "proxied_session")
+        idx = self.custom_api_mode_combo.findData(custom_mode)
+        self.custom_api_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
         # Cloud-Dienst Auswahl
         selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
@@ -571,6 +579,10 @@ class SettingsDialog(QDialog):
             self.config.save_setting("custom_api_upload_endpoint", self.custom_api_upload_endpoint_edit.text())
             self.config.save_setting("custom_api_share_endpoint", self.custom_api_share_endpoint_edit.text())
             self.config.save_setting("custom_api_health_endpoint", self.custom_api_health_endpoint_edit.text())
+            self.config.save_setting(
+                "custom_api_upload_mode",
+                self.custom_api_mode_combo.currentData() or "proxied_session",
+            )
 
             # Cloud-Dienst Auswahl
             if self.radio_custom_api.isChecked():
@@ -681,6 +693,10 @@ class SettingsDialog(QDialog):
                                 self.custom_api_share_endpoint_edit.text() or "/share")
         self.config.save_setting("custom_api_health_endpoint",
                                 self.custom_api_health_endpoint_edit.text() or "/health")
+        self.config.save_setting(
+            "custom_api_upload_mode",
+            self.custom_api_mode_combo.currentData() or "proxied_session",
+        )
 
         # Test-Verbindung (vereinfacht, ohne echten Client-Zugriff)
         try:

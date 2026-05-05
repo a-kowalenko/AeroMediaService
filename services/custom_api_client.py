@@ -2,6 +2,7 @@
 import json
 import random
 import requests
+import dropbox
 from requests.adapters import HTTPAdapter
 import logging
 import time
@@ -15,6 +16,8 @@ from utils.link_shortener import LinkShortener
 
 # Entspricht Server PROXIED_UPLOAD_CHUNK_BYTES; Vercel-Multipart-Limit ~4.5 MiB Request-Body.
 CHUNK_BYTES = 4 * 1024 * 1024
+# Direkter Dropbox-Upload soll wie der DropboxClient mit 8 MiB arbeiten.
+DROPBOX_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 class ApiAuthError(Exception):
@@ -70,6 +73,7 @@ class CustomApiClient(BaseClient):
         self._last_kunde = None  # Letzter Kunde fuer Customer-API-Fallback
         self.session = None  # requests.Session für Connection-Pooling
         self.progress_lock = Lock()  # Lock für Thread-sichere Progress-Updates
+        self.dbx: dropbox.Dropbox | None = None
 
     def connect(self, auth_callback=None):
         """Verbindung zur API herstellen."""
@@ -130,6 +134,7 @@ class CustomApiClient(BaseClient):
         if self.session:
             self.session.close()
             self.session = None
+        self.dbx = None
         self.connected = False
         signals.connection_status_changed.emit("Nicht verbunden")
         signals.stop_monitoring.emit()
@@ -431,6 +436,14 @@ class CustomApiClient(BaseClient):
 
         self.log.info(f"Beginne Session-Upload von '{local_dir_path}'")
         self._last_kunde = kunde
+        upload_mode = str(
+            self.config.get_setting("custom_api_upload_mode", "proxied_session")
+            or "proxied_session"
+        ).strip()
+        if upload_mode == "direct_dropbox_complete":
+            self.log.info("Custom API Upload-Modus: direct_dropbox_complete")
+            return self._upload_directory_direct_dropbox_complete(local_dir_path, kunde)
+        self.log.info("Custom API Upload-Modus: proxied_session")
 
         # 1. Dateien sammeln
         files_to_upload = []
@@ -897,6 +910,175 @@ class CustomApiClient(BaseClient):
             self.log.warning(f"Link-Shortener fehlgeschlagen: {e}, verwende Original-Link")
 
         return self._last_customer_url
+
+    def _upload_directory_direct_dropbox_complete(self, local_dir_path, kunde: Kunde = None):
+        """Neuer Modus: direct-init -> direkter Dropbox-Upload -> client-complete."""
+        files_to_upload = []
+        total_size = 0
+        folder_name = os.path.basename(local_dir_path)
+        remote_base_path = f"/{folder_name}"
+
+        for root, _, files in os.walk(local_dir_path):
+            for file in files:
+                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
+                    continue
+
+                local_path = os.path.join(root, file)
+                relative_path = os.path.relpath(str(local_path), str(local_dir_path))
+                try:
+                    file_size = os.path.getsize(local_path)
+                    mime_type = self._get_mime_type(local_path)
+                except FileNotFoundError:
+                    self.log.warning(f"Datei nicht gefunden: {local_path}")
+                    continue
+
+                rel_norm = relative_path.replace(os.path.sep, "/")
+                files_to_upload.append(
+                    {
+                        "name": rel_norm,
+                        "size": file_size,
+                        "type": mime_type,
+                        "local_path": local_path,
+                        "dropbox_path": f"{remote_base_path}/{rel_norm}".replace("//", "/"),
+                    }
+                )
+                total_size += file_size
+
+        if not files_to_upload:
+            self.log.warning("Keine Dateien zum Hochladen gefunden.")
+            return True
+
+        session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
+        session_id = session_data["session_id"]
+        order_id = session_data.get("order_id")
+        self._last_session_id = session_id
+        if order_id is not None:
+            self._last_order_id = str(order_id)
+
+        self.log.info(
+            "Direct-Dropbox Session initialisiert: session_id=%s%s",
+            session_id,
+            f", order_id={order_id}" if order_id else "",
+        )
+
+        self._connect_dropbox_for_direct_mode()
+
+        uploaded_counter = {"bytes": 0}
+        uploaded_files = []
+        for file_info in files_to_upload:
+            md = self._upload_file_direct_to_dropbox(file_info, total_size, uploaded_counter)
+            uploaded_files.append(
+                {
+                    "file_name": file_info["name"],
+                    "file_size": int(md.size if getattr(md, "size", None) is not None else file_info["size"]),
+                    "dropbox_id": getattr(md, "id", "") or "",
+                    "dropbox_path": (getattr(md, "path_lower", None) or getattr(md, "path_display", None) or file_info["dropbox_path"]),
+                }
+            )
+
+        done_resp = self._post_json_upload(
+            "/client-complete",
+            {"session_id": session_id, "files": uploaded_files},
+            timeout=120,
+            tag="client-complete",
+        )
+        done_data = done_resp.json() if done_resp.content else {}
+        self._last_customer_url = self._extract_customer_url(done_data)
+        if not self._last_customer_url:
+            self._last_customer_url = (
+                done_data.get("media_url")
+                or done_data.get("archive_url")
+                or done_data.get("url")
+            )
+
+        for key in ("media_url", "customer_url", "archive_url", "order_id"):
+            val = done_data.get(key) if isinstance(done_data, dict) else None
+            if val:
+                self.log.info("client-complete %s=%s [session=%r]", key, val, session_id)
+        if isinstance(done_data, dict) and done_data.get("order_id") is not None:
+            self._last_order_id = str(done_data["order_id"])
+
+        signals.upload_status_update.emit("Upload abgeschlossen.")
+        return True
+
+    def _connect_dropbox_for_direct_mode(self):
+        """Initialisiert Dropbox-Client mit lokalen Credentials (wie DropboxClient)."""
+        if self.dbx is not None:
+            return
+        app_key = self.config.get_secret("db_app_key")
+        app_secret = self.config.get_secret("db_app_secret")
+        refresh_token = self.config.get_secret("db_refresh_token")
+        if not app_key or not app_secret or not refresh_token:
+            raise Exception(
+                "Dropbox-Credentials fehlen für direct_dropbox_complete "
+                "(db_app_key/db_app_secret/db_refresh_token)."
+            )
+        self.dbx = dropbox.Dropbox(
+            app_key=app_key,
+            app_secret=app_secret,
+            oauth2_refresh_token=refresh_token,
+        )
+        self.dbx.users_get_current_account()
+
+    def _upload_file_direct_to_dropbox(self, file_info: dict, total_job_size: int, uploaded_counter: dict):
+        file_name = file_info["name"]
+        file_size = file_info["size"]
+        local_path = file_info["local_path"]
+        dropbox_path = file_info["dropbox_path"]
+
+        def emit_progress(bytes_sent_partial: int):
+            sent = max(0, int(bytes_sent_partial))
+            pct = min(100, int((sent / file_size) * 100)) if file_size > 0 else 100
+            with self.progress_lock:
+                base = uploaded_counter["bytes"]
+            combined = base + sent
+            total_pct = min(100, int((combined / total_job_size) * 100)) if total_job_size > 0 else 100
+            denom = file_size if file_size > 0 else 1
+            signals.upload_progress_file.emit(pct, sent, denom)
+            signals.upload_progress_total.emit(total_pct, combined, total_job_size)
+
+        self.log.info(
+            "[direct_dropbox session=%r file=%r] Upload nach %s (%s bytes)",
+            self._last_session_id,
+            file_name,
+            dropbox_path,
+            file_size,
+        )
+        signals.upload_status_update.emit(f"Lade hoch: {file_name}")
+        emit_progress(0)
+
+        with open(local_path, "rb") as f:
+            if file_size <= DROPBOX_CHUNK_BYTES:
+                md = self.dbx.files_upload(
+                    f.read(),
+                    dropbox_path,
+                    mode=dropbox.files.WriteMode.overwrite,
+                )
+                emit_progress(file_size)
+            else:
+                start = self.dbx.files_upload_session_start(f.read(DROPBOX_CHUNK_BYTES))
+                cursor = dropbox.files.UploadSessionCursor(session_id=start.session_id, offset=f.tell())
+                emit_progress(cursor.offset)
+                while (file_size - f.tell()) > DROPBOX_CHUNK_BYTES:
+                    chunk = f.read(DROPBOX_CHUNK_BYTES)
+                    self.dbx.files_upload_session_append_v2(chunk, cursor)
+                    cursor.offset = f.tell()
+                    emit_progress(cursor.offset)
+                final_chunk = f.read()
+                commit = dropbox.files.CommitInfo(
+                    path=dropbox_path,
+                    mode=dropbox.files.WriteMode.overwrite,
+                )
+                md = self.dbx.files_upload_session_finish(final_chunk, cursor, commit)
+                emit_progress(file_size)
+
+        with self.progress_lock:
+            uploaded_counter["bytes"] += file_size
+            current_total_bytes = uploaded_counter["bytes"]
+        signals.upload_progress_file.emit(100, file_size, file_size if file_size > 0 else 1)
+        total_progress = int((current_total_bytes / total_job_size) * 100) if total_job_size > 0 else 100
+        signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
+        return md
 
     def _get_mime_type(self, file_path):
         """Ermittelt den MIME-Type einer Datei."""
