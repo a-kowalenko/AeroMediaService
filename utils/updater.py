@@ -18,7 +18,9 @@ if sys.platform == "win32":
     import ctypes
 
 GITHUB_API_URL = "https://api.github.com/repos/a-kowalenko/AeroMediaService/releases/latest"
+GITHUB_RELEASES_API_URL = "https://api.github.com/repos/a-kowalenko/AeroMediaService/releases"
 DOWNLOAD_NAME = "setup_update.exe"
+MIN_SWITCHABLE_VERSION = version.parse("0.2.3.0")
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +114,82 @@ class UpdateCheckWorker(QObject):
             log.error(error_msg)
             self.error.emit(f"Update-Prüfung fehlgeschlagen: {e}")
 
+        finally:
+            self.finished.emit()
+
+
+class VersionListWorker(QObject):
+    """Lädt verfügbare stabile Versionen für den manuellen Versionswechsel."""
+    versionsLoaded = Signal(list)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, include_prereleases=False):
+        super().__init__()
+        self.include_prereleases = include_prereleases
+
+    @Slot()
+    def run(self):
+        releases_for_ui = []
+
+        try:
+            log.info("Lade verfügbare Releases für Versionswechsel...")
+            headers = {"Accept": "application/vnd.github+json"}
+            response = requests.get(
+                GITHUB_RELEASES_API_URL,
+                params={"per_page": 100},
+                headers=headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            releases = response.json()
+
+            for release in releases:
+                if (not self.include_prereleases) and release.get("prerelease", False):
+                    continue
+
+                tag_name = release.get("tag_name", "").strip()
+                if not tag_name:
+                    continue
+
+                parsed_tag = tag_name.lstrip("v")
+                try:
+                    parsed_version = version.parse(parsed_tag)
+                except Exception:
+                    log.warning("Überspringe ungültigen Release-Tag: %s", tag_name)
+                    continue
+
+                if parsed_version < MIN_SWITCHABLE_VERSION:
+                    continue
+
+                installer_url = ""
+                for asset in release.get("assets", []):
+                    if asset.get("name", "").lower().endswith(".exe"):
+                        installer_url = asset.get("browser_download_url", "")
+                        if installer_url:
+                            break
+
+                if not installer_url:
+                    log.warning("Überspringe Release ohne .exe-Asset: %s", tag_name)
+                    continue
+
+                releases_for_ui.append({
+                    "tag_name": tag_name,
+                    "version_str": parsed_tag,
+                    "release_notes": release.get("body", "Keine Details verfügbar."),
+                    "installer_url": installer_url,
+                    "is_prerelease": release.get("prerelease", False)
+                })
+
+            releases_for_ui.sort(key=lambda item: version.parse(item["version_str"]), reverse=True)
+            self.versionsLoaded.emit(releases_for_ui)
+
+        except requests.RequestException as e:
+            log.error("Netzwerkfehler beim Laden der Releases: %s", e)
+            self.error.emit("Konnte die Liste der Versionen nicht laden (Netzwerkfehler).")
+        except Exception as e:
+            log.error("Fehler beim Laden der Releases: %s", e)
+            self.error.emit(f"Konnte die Liste der Versionen nicht laden: {e}")
         finally:
             self.finished.emit()
 
@@ -326,6 +404,32 @@ def initialize_updater(main_window, app_version, config, show_no_update_message=
     main_window.update_thread.finished.connect(lambda: setattr(main_window, 'update_worker', None))
 
     main_window.update_thread.start()
+
+
+def initialize_version_list_loader(target, loaded_slot, error_slot, include_prereleases=False):
+    """
+    Startet einen Worker-Thread, der stabile Release-Versionen lädt.
+    Der Aufrufer muss ein QObject sein (z.B. SettingsDialog).
+    """
+    existing_thread = getattr(target, "version_list_thread", None)
+    if existing_thread and existing_thread.isRunning():
+        log.warning("Versionsliste wird bereits geladen.")
+        return
+
+    target.version_list_thread = QThread(target)
+    target.version_list_worker = VersionListWorker(include_prereleases=include_prereleases)
+    target.version_list_worker.moveToThread(target.version_list_thread)
+
+    target.version_list_thread.started.connect(target.version_list_worker.run)
+    target.version_list_worker.versionsLoaded.connect(loaded_slot)
+    target.version_list_worker.error.connect(error_slot)
+    target.version_list_worker.finished.connect(target.version_list_thread.quit)
+    target.version_list_thread.finished.connect(target.version_list_worker.deleteLater)
+    target.version_list_thread.finished.connect(target.version_list_thread.deleteLater)
+    target.version_list_thread.finished.connect(lambda: setattr(target, "version_list_thread", None))
+    target.version_list_thread.finished.connect(lambda: setattr(target, "version_list_worker", None))
+
+    target.version_list_thread.start()
 
 
 # --- Download-Thread-Funktion ---
