@@ -1,15 +1,17 @@
 import logging
 import requests
+from packaging import version
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLineEdit, QPushButton, QFileDialog, QSpinBox, QLabel,
     QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QInputDialog,
-    QCheckBox
+    QCheckBox, QComboBox, QTextEdit
 )
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl, Slot
 from core.config import ConfigManager
 from services.base_client import BaseClient
+from utils.updater import UpdateProgressDialog, initialize_version_list_loader
 
 
 class SettingsDialog(QDialog):
@@ -42,6 +44,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.create_cloud_tab(), "Cloud-Dienst")
         self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP)")
         self.tabs.addTab(self.create_sms_tab(), "SMS-Dienst")
+        self.tabs.addTab(self.create_extras_tab(), "Extras")
 
         # Standard-Buttons (Speichern, Abbrechen)
         button_layout = QVBoxLayout()  # Eigener Layout-Container für Buttons
@@ -102,32 +105,6 @@ class SettingsDialog(QDialog):
         monitor_layout.addRow("Scan-Intervall:", self.scan_interval_spin)
 
         layout.addWidget(monitor_group)
-
-        # --- Gruppe 2: Software-Update ---
-        update_group = QGroupBox("Software-Update")
-        update_layout = QFormLayout(update_group)  # QFormLayout, damit der Button eine ganze Zeile einnimmt
-
-        # Aktuelle Version anzeigen
-        self.current_version_label = QLabel(f"Aktuell installierte Version: <b>{self.app_version}</b>")
-        update_layout.addRow(self.current_version_label)
-
-        # Letzten bekannten Update-Status anzeigen
-        self.update_status_label = QLabel(f"Update-Status: <b>{self.latest_version_info}</b>")
-        update_layout.addRow(self.update_status_label)
-
-        # Update-Button
-        self.update_check_button = QPushButton("Jetzt auf Updates prüfen")
-
-        # Verbinde mit der 'check_for_updates_manual'-Methode des Parent-Widgets (MainWindow)
-        if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
-            self.update_check_button.clicked.connect(self.on_check_for_updates_clicked)
-        else:
-            # Fallback, falls die Methode nicht gefunden wird
-            self.update_check_button.setEnabled(False)
-            self.update_check_button.setToolTip("Konnte keine Update-Funktion im Hauptfenster finden.")
-
-        update_layout.addRow(self.update_check_button)
-        layout.addWidget(update_group)
 
         layout.addStretch(1)  # Schiebt alles nach oben
 
@@ -357,6 +334,70 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.seven_group)
 
         layout.addStretch(1)  # Füllt den restlichen Platz nach unten auf
+
+        return widget
+
+    def create_extras_tab(self):
+        """Erstellt den Tab 'Extras'."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # --- Gruppe 1: Software-Update ---
+        update_group = QGroupBox("Software-Update")
+        update_layout = QFormLayout(update_group)
+
+        self.current_version_label = QLabel(f"Aktuell installierte Version: <b>{self.app_version}</b>")
+        update_layout.addRow(self.current_version_label)
+
+        self.update_status_label = QLabel(f"Update-Status: <b>{self.latest_version_info}</b>")
+        update_layout.addRow(self.update_status_label)
+
+        self.update_check_button = QPushButton("Jetzt auf Updates prüfen")
+        if self.parent() and hasattr(self.parent(), 'check_for_updates_manual'):
+            self.update_check_button.clicked.connect(self.on_check_for_updates_clicked)
+        else:
+            self.update_check_button.setEnabled(False)
+            self.update_check_button.setToolTip("Konnte keine Update-Funktion im Hauptfenster finden.")
+        update_layout.addRow(self.update_check_button)
+        layout.addWidget(update_group)
+
+        # --- Gruppe 2: Version wechseln ---
+        switch_group = QGroupBox("Version wechseln")
+        switch_layout = QFormLayout(switch_group)
+
+        self.version_hint_label = QLabel(
+            "Verfügbare stabile Versionen ab v0.2.3.0."
+        )
+        switch_layout.addRow(self.version_hint_label)
+
+        self.show_prereleases_check = QCheckBox("Prereleases anzeigen (ab v0.2.3.0)")
+        self.show_prereleases_check.toggled.connect(self.on_show_prereleases_toggled)
+        switch_layout.addRow(self.show_prereleases_check)
+
+        self.version_combo = QComboBox()
+        self.version_combo.currentIndexChanged.connect(self.on_version_selected)
+        switch_layout.addRow("Ziel-Version:", self.version_combo)
+
+        self.refresh_versions_button = QPushButton("Liste neu laden")
+        self.refresh_versions_button.clicked.connect(self.load_switchable_versions)
+        switch_layout.addRow(self.refresh_versions_button)
+
+        self.version_notes_edit = QTextEdit()
+        self.version_notes_edit.setReadOnly(True)
+        self.version_notes_edit.setMaximumHeight(220)
+        switch_layout.addRow("Release-Notes:", self.version_notes_edit)
+
+        self.version_switch_button = QPushButton("Auf diese Version wechseln")
+        self.version_switch_button.clicked.connect(self.on_switch_version_clicked)
+        switch_layout.addRow(self.version_switch_button)
+
+        layout.addWidget(switch_group)
+        layout.addStretch(1)
+
+        self.version_list_thread = None
+        self.version_list_worker = None
+        self._switchable_versions = []
+        self.load_switchable_versions()
 
         return widget
 
@@ -834,4 +875,146 @@ class SettingsDialog(QDialog):
         # Button wieder aktivieren
         self.update_check_button.setEnabled(True)
         self.update_check_button.setText("Jetzt auf Updates prüfen")
+
+    def load_switchable_versions(self):
+        """Lädt alle stabilen, wechselbaren Versionen von GitHub."""
+        self.version_combo.clear()
+        self.version_combo.addItem("Lade Versionen...")
+        self.version_combo.setEnabled(False)
+        self.version_notes_edit.setPlainText("Release-Notes werden geladen...")
+        self.version_switch_button.setEnabled(False)
+        self.refresh_versions_button.setEnabled(False)
+        include_prereleases = self.show_prereleases_check.isChecked()
+
+        initialize_version_list_loader(
+            self,
+            self.on_switchable_versions_loaded,
+            self.on_switchable_versions_error,
+            include_prereleases=include_prereleases
+        )
+
+    @Slot(list)
+    def on_switchable_versions_loaded(self, releases):
+        """Füllt die Versionsauswahl mit den gefilterten Releases."""
+        self._switchable_versions = releases or []
+        self.version_combo.clear()
+
+        if not self._switchable_versions:
+            self.version_combo.addItem("Keine passenden Versionen gefunden")
+            self.version_notes_edit.setPlainText("Es wurden keine Versionen gefunden.")
+            self.version_combo.setEnabled(False)
+            self.version_switch_button.setEnabled(False)
+            self.refresh_versions_button.setEnabled(True)
+            return
+
+        current_str = self.app_version.lstrip("v")
+        for release in self._switchable_versions:
+            tag_name = release.get("tag_name", "")
+            release_str = release.get("version_str", tag_name.lstrip("v"))
+            is_prerelease = release.get("is_prerelease", False)
+            label = tag_name
+            if is_prerelease:
+                label = f"{label} (Prerelease)"
+            if release_str == current_str:
+                label = f"{label} (aktuell)"
+            self.version_combo.addItem(label, release)
+
+        self.version_combo.setEnabled(True)
+        self.refresh_versions_button.setEnabled(True)
+        self.on_version_selected(self.version_combo.currentIndex())
+
+    @Slot(str)
+    def on_switchable_versions_error(self, message):
+        """Zeigt Ladefehler für die Versionsliste an."""
+        self.version_combo.clear()
+        self.version_combo.addItem("Fehler beim Laden")
+        self.version_combo.setEnabled(False)
+        self.version_notes_edit.setPlainText(message)
+        self.version_switch_button.setEnabled(False)
+        self.refresh_versions_button.setEnabled(True)
+        QMessageBox.warning(self, "Versionsliste", message)
+
+    @Slot(int)
+    def on_version_selected(self, index):
+        """Aktualisiert Notes und Button-Status zur ausgewählten Version."""
+        if index < 0:
+            self.version_notes_edit.setPlainText("")
+            self.version_switch_button.setEnabled(False)
+            return
+
+        release = self.version_combo.itemData(index)
+        if not isinstance(release, dict):
+            self.version_notes_edit.setPlainText("")
+            self.version_switch_button.setEnabled(False)
+            return
+
+        notes = release.get("release_notes") or "Keine Release-Notes verfügbar."
+        self.version_notes_edit.setMarkdown(notes)
+
+        selected_version = release.get("version_str", "").lstrip("v")
+        current_version = self.app_version.lstrip("v")
+        self.version_switch_button.setEnabled(bool(release.get("installer_url")) and selected_version != current_version)
+
+    @Slot()
+    def on_switch_version_clicked(self):
+        """Startet den Wechsel zur ausgewählten Version."""
+        index = self.version_combo.currentIndex()
+        release = self.version_combo.itemData(index)
+        if not isinstance(release, dict):
+            return
+
+        installer_url = release.get("installer_url", "")
+        target_tag = release.get("tag_name", "")
+        target_version_str = release.get("version_str", target_tag.lstrip("v"))
+        if not installer_url:
+            QMessageBox.warning(self, "Versionswechsel", "Für diese Version wurde kein Installer gefunden.")
+            return
+
+        try:
+            current_version = version.parse(self.app_version.lstrip("v"))
+            target_version = version.parse(target_version_str.lstrip("v"))
+        except Exception:
+            QMessageBox.warning(self, "Versionswechsel", "Die Version konnte nicht ausgewertet werden.")
+            return
+
+        if target_version == current_version:
+            QMessageBox.information(self, "Versionswechsel", "Diese Version ist bereits installiert.")
+            return
+
+        if target_version < current_version:
+            reply = QMessageBox.warning(
+                self,
+                "Downgrade bestätigen",
+                (
+                    f"Sie wechseln von Version {self.app_version} auf die ältere Version {target_tag}.\n\n"
+                    "Achtung: Neuere Einstellungen oder Daten können inkompatibel sein.\n"
+                    "Möchten Sie trotzdem fortfahren?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+        else:
+            reply = QMessageBox.question(
+                self,
+                "Versionswechsel bestätigen",
+                f"Möchten Sie wirklich auf Version {target_tag} wechseln?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.log.info("Starte manuellen Versionswechsel auf %s", target_tag)
+        progress_dialog = UpdateProgressDialog(self.parent(), installer_url)
+        progress_dialog.exec()
+
+    @Slot(bool)
+    def on_show_prereleases_toggled(self, checked):
+        """Lädt die Versionen neu, wenn die Prerelease-Option geändert wird."""
+        if checked:
+            self.version_hint_label.setText("Verfügbare stabile Versionen und Prereleases ab v0.2.3.0.")
+        else:
+            self.version_hint_label.setText("Verfügbare stabile Versionen ab v0.2.3.0.")
+        self.load_switchable_versions()
 
