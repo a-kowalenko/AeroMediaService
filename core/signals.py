@@ -20,6 +20,9 @@ class GlobalSignals(QObject):
     # Signal zur Anzeige einer Status-Nachricht (z.B. "Lade hoch...")
     upload_status_update = Signal(str)
 
+    # True solange ein Queue-Upload-Job aktiv ist (fuer Pause/Abbrechen-Buttons)
+    upload_job_active = Signal(bool)
+
     # Signale für Upload-Prozess
     upload_started = Signal(int)  # Upload gestartet mit Anzahl der Dateien
     upload_progress = Signal(str)  # Fortschritt-Nachricht (z.B. "Datei 1/10: bild.jpg")

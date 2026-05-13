@@ -12,6 +12,7 @@ from services.base_client import BaseClient
 from services.email_client import EmailClient
 from services.sms_client import SmsClient
 from core.signals import signals
+from core.upload_control import UploadCancelled, UploadControl
 
 
 class UploaderThread(QThread):
@@ -31,6 +32,16 @@ class UploaderThread(QThread):
         self.log = logging.getLogger('uploader')  # Spezieller Logger
 
         self._is_running = False
+        self.upload_control = UploadControl()
+
+    def request_upload_pause(self):
+        self.upload_control.request_pause()
+
+    def request_upload_resume(self):
+        self.upload_control.request_resume()
+
+    def request_upload_cancel(self):
+        self.upload_control.request_cancel()
 
     def stop(self):
         """Signalisiert dem Thread, sicher zu stoppen."""
@@ -66,106 +77,141 @@ class UploaderThread(QThread):
                 dir_name = os.path.basename(local_dir_path)  # dir_name hier setzen
 
                 self.log.info(f"Beginne Verarbeitung von: {dir_name}")
-                signals.upload_status_update.emit(f"Starte Upload: {dir_name}")
-                signals.upload_progress_file.emit(0, 0, 0)
-                signals.upload_progress_total.emit(0, 0, 0)
+                signals.upload_job_active.emit(True)
+                try:
+                    self.upload_control.reset_for_new_job()
+                    signals.upload_status_update.emit(f"Starte Upload: {dir_name}")
+                    signals.upload_progress_file.emit(0, 0, 0)
+                    signals.upload_progress_total.emit(0, 0, 0)
 
-                # History: Start
-                signals.upload_history_update.emit({
-                    "dir_name": dir_name,
-                    "status": "Gestartet",
-                    "first_name": kunde.first_name if kunde else "",
-                    "last_name": kunde.last_name if kunde else "",
-                    "email": kunde.email if kunde else "",
-                    "phone": kunde.phone if kunde else ""
-                })
+                    # History: Start
+                    signals.upload_history_update.emit({
+                        "dir_name": dir_name,
+                        "status": "Gestartet",
+                        "first_name": kunde.first_name if kunde else "",
+                        "last_name": kunde.last_name if kunde else "",
+                        "email": kunde.email if kunde else "",
+                        "phone": kunde.phone if kunde else ""
+                    })
 
-                # Remote-Pfad festlegen (z.B. /App-Ordner/Verzeichnisname)
-                remote_path = f"/{dir_name}"
+                    # Remote-Pfad festlegen (z.B. /App-Ordner/Verzeichnisname)
+                    remote_path = f"/{dir_name}"
 
-                # 1. Upload mit mehreren Versuchen (transiente Netzwerk-/Serverfehler)
-                upload_success = False
-                job_delays_sec = (5, 15)
-                for job_try in range(1, 4):
-                    upload_success = self.client.upload_directory(local_dir_path, remote_path, kunde)
-                    if upload_success:
-                        break
-                    if job_try < 3:
-                        wait_s = job_delays_sec[job_try - 1]
-                        self.log.warning(
-                            "Upload '%s' meldete Fehler (Versuch %s/3). Erneuter Versuch in %ss.",
-                            dir_name,
-                            job_try,
-                            wait_s,
-                        )
-                        time.sleep(wait_s)
+                    # 1. Upload mit mehreren Versuchen (transiente Netzwerk-/Serverfehler)
+                    upload_success = False
+                    job_delays_sec = (5, 15)
+                    for job_try in range(1, 4):
+                        try:
+                            upload_success = self.client.upload_directory(
+                                local_dir_path, remote_path, kunde, self.upload_control
+                            )
+                        except UploadCancelled:
+                            raise
+                        if upload_success:
+                            break
+                        if job_try < 3:
+                            wait_s = job_delays_sec[job_try - 1]
+                            self.log.warning(
+                                "Upload '%s' meldete Fehler (Versuch %s/3). Erneuter Versuch in %ss.",
+                                dir_name,
+                                job_try,
+                                wait_s,
+                            )
+                            end_wait = time.monotonic() + wait_s
+                            while time.monotonic() < end_wait:
+                                self.upload_control.check_cancelled()
+                                rem = end_wait - time.monotonic()
+                                if rem <= 0:
+                                    break
+                                time.sleep(min(0.5, rem))
 
-                if not upload_success:
-                    raise Exception("Upload-Funktion des Clients meldete nach 3 Versuchen weiterhin einen Fehler.")
+                    if not upload_success:
+                        raise Exception("Upload-Funktion des Clients meldete nach 3 Versuchen weiterhin einen Fehler.")
 
-                self.log.info(f"Upload für {dir_name} erfolgreich abgeschlossen.")
+                    self.log.info(f"Upload für {dir_name} erfolgreich abgeschlossen.")
 
-                # 2. Freigabelink erstellen (mit kurzen Retries bei spaeter Finalisierung)
-                share_link = None
-                for attempt in range(1, 4):
-                    share_link = self.client.get_shareable_link(remote_path)
-                    if share_link:
-                        break
-                    if attempt < 3:
-                        self.log.warning(
-                            f"Freigabelink noch nicht verfuegbar (Versuch {attempt}/3), warte 2s..."
-                        )
-                        time.sleep(2)
+                    # 2. Freigabelink erstellen (mit kurzen Retries bei spaeter Finalisierung)
+                    share_link = None
+                    for attempt in range(1, 4):
+                        self.upload_control.check_cancelled()
+                        share_link = self.client.get_shareable_link(remote_path)
+                        if share_link:
+                            break
+                        if attempt < 3:
+                            self.log.warning(
+                                f"Freigabelink noch nicht verfuegbar (Versuch {attempt}/3), warte 2s..."
+                            )
+                            end_wait = time.monotonic() + 2
+                            while time.monotonic() < end_wait:
+                                self.upload_control.check_cancelled()
+                                rem = end_wait - time.monotonic()
+                                if rem <= 0:
+                                    break
+                                time.sleep(min(0.5, rem))
 
-                if not share_link:
-                    # Logge den Fehler, aber fahre fort (Upload war erfolgreich)
-                    self.log.error(f"Konnte Freigabelink für {dir_name} nicht erstellen.")
+                    if not share_link:
+                        # Logge den Fehler, aber fahre fort (Upload war erfolgreich)
+                        self.log.error(f"Konnte Freigabelink für {dir_name} nicht erstellen.")
 
-                # 3. Erfolgs-E-Mail senden
-                email_status = "Übersprungen"
-                sms_status = "Übersprungen"
-                if share_link and kunde and kunde.email:
-                    try:
-                        self.email_client.send_upload_success_email(dir_name, share_link, kunde.email, kunde.first_name)
-                        email_status = "Gesendet"
-                    except Exception as email_e:
-                        email_status = f"Fehler: {email_e}"
-                        self.log.error(f"E-Mail-Versand fehlgeschlagen: {email_e}")
+                    # 3. Erfolgs-E-Mail senden
+                    email_status = "Übersprungen"
+                    sms_status = "Übersprungen"
+                    if share_link and kunde and kunde.email:
+                        try:
+                            self.email_client.send_upload_success_email(dir_name, share_link, kunde.email, kunde.first_name)
+                            email_status = "Gesendet"
+                        except Exception as email_e:
+                            email_status = f"Fehler: {email_e}"
+                            self.log.error(f"E-Mail-Versand fehlgeschlagen: {email_e}")
 
-                    sms_id_val = None
-                    try:
-                        sms_success, sms_id = asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
-                        if sms_success:
-                            sms_status = "Gesendet"
-                            sms_id_val = sms_id
-                        else:
-                            if kunde.phone:
-                                err_text = getattr(self.sms_client, "last_error", "") or "Fehler beim Senden"
-                                sms_status = f"Fehler: {err_text}"
-                    except Exception as sms_e:
-                        sms_status = f"Fehler: {sms_e}"
-                        self.log.error(f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}")
-                elif not kunde:
-                    self.log.warning(f"Keine Kundendaten für {dir_name} gefunden. Benachrichtigungen übersprungen.")
-                    sms_id_val = None
+                        sms_id_val = None
+                        try:
+                            sms_success, sms_id = asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
+                            if sms_success:
+                                sms_status = "Gesendet"
+                                sms_id_val = sms_id
+                            else:
+                                if kunde.phone:
+                                    err_text = getattr(self.sms_client, "last_error", "") or "Fehler beim Senden"
+                                    sms_status = f"Fehler: {err_text}"
+                        except Exception as sms_e:
+                            sms_status = f"Fehler: {sms_e}"
+                            self.log.error(f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}")
+                    elif not kunde:
+                        self.log.warning(f"Keine Kundendaten für {dir_name} gefunden. Benachrichtigungen übersprungen.")
+                        sms_id_val = None
 
-                # History: Success
-                history_data = {
-                    "dir_name": dir_name,
-                    "status": "Erfolgreich",
-                    "email_status": email_status,
-                    "sms_status": sms_status
-                }
+                    # History: Success
+                    history_data = {
+                        "dir_name": dir_name,
+                        "status": "Erfolgreich",
+                        "email_status": email_status,
+                        "sms_status": sms_status
+                    }
 
-                if 'sms_id_val' in locals() and sms_id_val:
-                    history_data["sms_id"] = sms_id_val
+                    if 'sms_id_val' in locals() and sms_id_val:
+                        history_data["sms_id"] = sms_id_val
 
-                signals.upload_history_update.emit(history_data)
+                    signals.upload_history_update.emit(history_data)
 
-                # 4. In Archiv-Ordner verschieben
-                self.archive_directory(local_dir_path, "erfolg")
+                    # 4. In Archiv-Ordner verschieben
+                    self.archive_directory(local_dir_path, "erfolg")
 
-                signals.upload_status_update.emit(f"Erfolgreich: {dir_name}")
+                    signals.upload_status_update.emit(f"Erfolgreich: {dir_name}")
+
+                except UploadCancelled:
+                    self.log.info("Upload abgebrochen: %s", dir_name)
+                    signals.upload_status_update.emit(f"Abgebrochen: {dir_name}")
+                    signals.upload_history_update.emit({
+                        "dir_name": dir_name,
+                        "status": "Abgebrochen",
+                        "first_name": kunde.first_name if kunde else "",
+                        "last_name": kunde.last_name if kunde else "",
+                        "email": kunde.email if kunde else "",
+                        "phone": kunde.phone if kunde else "",
+                    })
+                finally:
+                    signals.upload_job_active.emit(False)
 
             except Exception as e:
                 self.log.error(f"Fehler bei der Verarbeitung von '{dir_name}' (Pfad: {local_dir_path}): {e}")

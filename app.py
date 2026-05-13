@@ -298,6 +298,25 @@ class MainWindow(QMainWindow):
         self.file_progress_bar = QProgressBar(textVisible=False)
         progress_layout.addWidget(self.file_progress_bar)
 
+        upload_ctl_layout = QHBoxLayout()
+        self.upload_pause_toggle_btn = QPushButton("Pause")
+        self.upload_pause_toggle_btn.setEnabled(False)
+        self.upload_pause_toggle_btn.setToolTip(
+            "Upload nach dem aktuellen Datenblock anhalten bzw. pausierten Upload fortsetzen"
+        )
+        self.upload_pause_toggle_btn.clicked.connect(self._on_upload_pause_toggle_clicked)
+        self._upload_toggle_shows_resume = False
+        self.upload_cancel_btn = QPushButton("Abbrechen")
+        self.upload_cancel_btn.setEnabled(False)
+        self.upload_cancel_btn.setToolTip(
+            "Aktuellen Upload abbrechen; Stand bleibt im Checkpoint fuer spaeteres Fortsetzen erhalten"
+        )
+        self.upload_cancel_btn.clicked.connect(self._on_upload_cancel_clicked)
+        upload_ctl_layout.addWidget(self.upload_pause_toggle_btn)
+        upload_ctl_layout.addWidget(self.upload_cancel_btn)
+        upload_ctl_layout.addStretch()
+        progress_layout.addLayout(upload_ctl_layout)
+
         monitor_layout.addLayout(progress_layout)
 
         self.tabs.addTab(self.monitor_tab, "Monitor")
@@ -411,6 +430,7 @@ class MainWindow(QMainWindow):
         signals.upload_progress_file.connect(self.update_file_progress)
         signals.upload_progress_total.connect(self.update_total_progress)
         signals.upload_status_update.connect(self.status_label.setText)
+        signals.upload_job_active.connect(self._on_upload_job_active_changed)
         signals.monitoring_status_changed.connect(self.update_monitoring_status)
 
         # Upload-Fortschritt-Signale
@@ -1147,6 +1167,32 @@ class MainWindow(QMainWindow):
         """Hilfsfunktion zur Formatierung von Bytes in MB."""
         mb = b / (1024 * 1024)
         return f"{mb:.1f} MB"
+
+    @Slot(bool)
+    def _on_upload_job_active_changed(self, active: bool):
+        self.upload_cancel_btn.setEnabled(active)
+        self._upload_toggle_shows_resume = False
+        self.upload_pause_toggle_btn.setText("Pause")
+        self.upload_pause_toggle_btn.setEnabled(active)
+
+    @Slot()
+    def _on_upload_pause_toggle_clicked(self):
+        if not self._upload_toggle_shows_resume:
+            self.uploader_thread.request_upload_pause()
+            self._upload_toggle_shows_resume = True
+            self.upload_pause_toggle_btn.setText("Weiter")
+            self.status_label.setText("Upload pausiert …")
+        else:
+            self.uploader_thread.request_upload_resume()
+            self._upload_toggle_shows_resume = False
+            self.upload_pause_toggle_btn.setText("Pause")
+            self.status_label.setText("Upload wird fortgesetzt …")
+
+    @Slot()
+    def _on_upload_cancel_clicked(self):
+        self.uploader_thread.request_upload_cancel()
+        self.upload_pause_toggle_btn.setEnabled(False)
+        self.upload_cancel_btn.setEnabled(False)
 
     @Slot(int, int, int)
     def update_file_progress(self, percent, current_bytes, total_bytes):

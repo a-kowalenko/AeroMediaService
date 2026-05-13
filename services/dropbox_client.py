@@ -9,6 +9,7 @@ from models.kunde import Kunde
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
+from core.upload_control import UploadCancelled
 from utils.link_shortener import LinkShortener
 from utils.upload_checkpoint import (
     clear_checkpoint,
@@ -30,6 +31,12 @@ class DropboxClient(BaseClient):
         self.dbx: dropbox.Dropbox = None
         self.log = logging.getLogger(__name__)
         self.link_shortener = LinkShortener(config_manager)
+        self._upload_control = None
+
+    def _upload_coop_tick(self):
+        ctl = getattr(self, "_upload_control", None)
+        if ctl:
+            ctl.wait_if_paused()
 
     def connect(self, auth_callback=None):
         """
@@ -199,8 +206,9 @@ class DropboxClient(BaseClient):
             self.log.error(f"Verbindungsprüfung fehlgeschlagen: {e}")
             return "Verbindungsfehler"
 
-    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde=None):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde = None, control=None):
         """Lädt ein Verzeichnis rekursiv hoch und meldet den Fortschritt."""
+        self._upload_control = control
         if not self.dbx:
             self.log.error("Upload fehlgeschlagen: Nicht mit Dropbox verbunden.")
             return False
@@ -296,6 +304,7 @@ class DropboxClient(BaseClient):
         try:
             for i in range(start_idx, len(files_to_upload)):
                 local_path, dropbox_path, file_size, rel_norm = files_to_upload[i]
+                self._upload_coop_tick()
                 ro = outer_resume if i == start_idx else None
 
                 status_msg = f"Lade hoch: {os.path.basename(local_path)} ({file_size / 1024 ** 2:.2f} MB)"
@@ -308,6 +317,7 @@ class DropboxClient(BaseClient):
 
                 with open(local_path, 'rb') as f:
                     if file_size <= CHUNK_SIZE:
+                        self._upload_coop_tick()
                         data = f.read()
 
                         def _do_small_upload(data_blob=data, path=dropbox_path):
@@ -359,6 +369,8 @@ class DropboxClient(BaseClient):
             self.log.info(f"Upload für '{remote_base_path}' abgeschlossen.")
             return True
 
+        except UploadCancelled:
+            raise
         except Exception as e:
             self.log.error(f"Fehler beim Upload von {local_path}: {e}")
             signals.upload_status_update.emit(f"Fehler: {e}")
@@ -401,6 +413,7 @@ class DropboxClient(BaseClient):
             if on_progress_save:
                 on_progress_save(cursor)
         else:
+            self._upload_coop_tick()
 
             def _session_start():
                 f.seek(0)
@@ -412,6 +425,7 @@ class DropboxClient(BaseClient):
             if on_progress_save:
                 on_progress_save(cursor)
 
+        self._upload_coop_tick()
         bytes_sent = f.tell()
         file_progress = int((bytes_sent / file_size) * 100)
         signals.upload_progress_file.emit(file_progress, bytes_sent, total_job_size)
@@ -420,7 +434,9 @@ class DropboxClient(BaseClient):
         total_progress = int((current_total_bytes / total_job_size) * 100)
         signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
 
+        self._upload_coop_tick()
         while (file_size - f.tell()) > CHUNK_SIZE:
+            self._upload_coop_tick()
             chunk_pos = f.tell()
 
             def _append():
@@ -441,6 +457,7 @@ class DropboxClient(BaseClient):
             if on_progress_save:
                 on_progress_save(cursor)
 
+        self._upload_coop_tick()
         finish_pos = f.tell()
 
         def _finish():

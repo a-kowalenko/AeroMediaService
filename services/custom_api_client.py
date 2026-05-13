@@ -12,6 +12,7 @@ from models.kunde import Kunde
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
+from core.upload_control import UploadCancelled
 from utils.link_shortener import LinkShortener
 from utils.upload_checkpoint import (
     clear_checkpoint,
@@ -81,6 +82,12 @@ class CustomApiClient(BaseClient):
         self.session = None  # requests.Session für Connection-Pooling
         self.progress_lock = Lock()  # Lock für Thread-sichere Progress-Updates
         self.dbx: dropbox.Dropbox | None = None
+        self._upload_control = None
+
+    def _upload_coop_tick(self):
+        ctl = getattr(self, "_upload_control", None)
+        if ctl:
+            ctl.wait_if_paused()
 
     def connect(self, auth_callback=None):
         """Verbindung zur API herstellen."""
@@ -435,8 +442,9 @@ class CustomApiClient(BaseClient):
             offset_for_log=offset,
         )
 
-    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde = None):
+    def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde = None, control=None):
         """Lädt ein Verzeichnis per direct-init, 4-MB-Session-Chunks und finalize hoch."""
+        self._upload_control = control
         if not self.connected:
             self.log.error("Upload fehlgeschlagen: Nicht verbunden.")
             return False
@@ -510,6 +518,7 @@ class CustomApiClient(BaseClient):
                 if resume_ck.get("order_id") is not None:
                     self._last_order_id = str(resume_ck["order_id"])
                 signals.upload_status_update.emit("Finalisiere Upload...")
+                self._upload_coop_tick()
                 customer_url = self._finalize_session(sid)
                 if not customer_url:
                     customer_url = self._wait_for_completion_legacy(sid)
@@ -527,6 +536,8 @@ class CustomApiClient(BaseClient):
                 self.log.error("Finalize (Recovery): %s", e)
                 signals.upload_status_update.emit(str(e))
                 return False
+            except UploadCancelled:
+                raise
             except Exception as e:
                 self.log.error("Finalize (Recovery) fehlgeschlagen: %s", e)
                 signals.upload_status_update.emit(f"Fehler: {e}")
@@ -578,6 +589,8 @@ class CustomApiClient(BaseClient):
             self.log.error("Session-Initialisierung: %s", e)
             signals.upload_status_update.emit(str(e))
             return False
+        except UploadCancelled:
+            raise
         except Exception as e:
             self.log.error(f"Session-Initialisierung fehlgeschlagen: {e}")
             signals.upload_status_update.emit(f"Fehler: {e}")
@@ -613,6 +626,7 @@ class CustomApiClient(BaseClient):
         # 3. Dateien nacheinander (Session-Offsets pro Datei seriell)
         try:
             for i in range(start_idx, len(files_to_upload)):
+                self._upload_coop_tick()
                 file_info = files_to_upload[i]
                 roff = resume_server_offset if i == start_idx else None
                 resume_server_offset = None
@@ -651,6 +665,7 @@ class CustomApiClient(BaseClient):
 
             # 4. Session abschliessen (Kunden-URL)
             self.log.info("Alle Dateien hochgeladen, finalisiere Session...")
+            self._upload_coop_tick()
             save_proxied_ck(
                 completed_bytes=total_size,
                 next_file_index=len(files_to_upload),
@@ -679,6 +694,8 @@ class CustomApiClient(BaseClient):
             self.log.error("Upload: %s", e)
             signals.upload_status_update.emit(str(e))
             return False
+        except UploadCancelled:
+            raise
         except Exception as e:
             self.log.error(f"Upload fehlgeschlagen: {e}")
             signals.upload_status_update.emit(f"Fehler: {e}")
@@ -784,6 +801,7 @@ class CustomApiClient(BaseClient):
         denom = file_size if file_size > 0 else 1
         signals.upload_progress_file.emit(0, 0, denom)
 
+        self._upload_coop_tick()
         with open(local_path, "rb") as f:
             off = 0
             if resume_server_offset is not None and resume_server_offset > 0:
@@ -797,6 +815,7 @@ class CustomApiClient(BaseClient):
                     off,
                 )
             else:
+                self._upload_coop_tick()
                 first_len = min(CHUNK_BYTES, file_size) if file_size > 0 else 0
                 first = f.read(first_len)
                 r_start = self._session_start(session_id, file_name, file_size, first)
@@ -808,6 +827,7 @@ class CustomApiClient(BaseClient):
                     on_chunk_committed(file_index, off)
 
             while file_size - off > CHUNK_BYTES:
+                self._upload_coop_tick()
                 buf = f.read(CHUNK_BYTES)
                 if len(buf) != CHUNK_BYTES:
                     raise RuntimeError(
@@ -825,6 +845,7 @@ class CustomApiClient(BaseClient):
                 if on_chunk_committed:
                     on_chunk_committed(file_index, off)
 
+            self._upload_coop_tick()
             last = f.read()
             if off + len(last) != file_size:
                 raise RuntimeError(
@@ -918,6 +939,7 @@ class CustomApiClient(BaseClient):
                 except Exception as e:
                     self.log.debug("Status-Poll %s: %s", status_url, e)
             time.sleep(poll_interval)
+            self._upload_coop_tick()
 
         self.log.warning("Timeout beim Status-Poll, letzte Versuche...")
         for status_url in status_urls:
@@ -1257,6 +1279,7 @@ class CustomApiClient(BaseClient):
 
         outer_resume_dd = resume_dd
         for i in range(start_idx, len(files_to_upload)):
+            self._upload_coop_tick()
             file_info = files_to_upload[i]
             ro = outer_resume_dd if i == start_idx else None
 
@@ -1305,6 +1328,7 @@ class CustomApiClient(BaseClient):
             phase="client_complete_pending",
         )
 
+        self._upload_coop_tick()
         done_resp = self._post_json_upload(
             "/client-complete",
             {"session_id": session_id, "files": uploaded_files},
@@ -1394,8 +1418,10 @@ class CustomApiClient(BaseClient):
                 "dropbox_path": dropbox_path,
             }
 
+        self._upload_coop_tick()
         with open(local_path, "rb") as f:
             if file_size <= DROPBOX_CHUNK_BYTES:
+                self._upload_coop_tick()
                 md = self.dbx.files_upload(
                     f.read(),
                     dropbox_path,
@@ -1428,6 +1454,7 @@ class CustomApiClient(BaseClient):
                     if on_dd_progress:
                         on_dd_progress(_active_state(cursor))
                 else:
+                    self._upload_coop_tick()
                     start = self.dbx.files_upload_session_start(f.read(DROPBOX_CHUNK_BYTES))
                     cursor = dropbox.files.UploadSessionCursor(
                         session_id=start.session_id, offset=f.tell()
@@ -1437,6 +1464,7 @@ class CustomApiClient(BaseClient):
                         on_dd_progress(_active_state(cursor))
 
                 while (file_size - f.tell()) > DROPBOX_CHUNK_BYTES:
+                    self._upload_coop_tick()
                     chunk = f.read(DROPBOX_CHUNK_BYTES)
                     self.dbx.files_upload_session_append_v2(chunk, cursor)
                     cursor.offset = f.tell()
@@ -1444,6 +1472,7 @@ class CustomApiClient(BaseClient):
                     if on_dd_progress:
                         on_dd_progress(_active_state(cursor))
 
+                self._upload_coop_tick()
                 final_chunk = f.read()
                 commit = dropbox.files.CommitInfo(
                     path=dropbox_path,

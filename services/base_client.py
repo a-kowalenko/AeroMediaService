@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 from models.kunde import Kunde
+
+if TYPE_CHECKING:
+    from core.upload_control import UploadControl
 
 
 class BaseClient(ABC):
@@ -30,11 +34,18 @@ class BaseClient(ABC):
         pass
 
     @abstractmethod
-    def upload_directory(self, local_dir_path, remote_base_path, kunde : Kunde =None):
+    def upload_directory(
+        self,
+        local_dir_path,
+        remote_base_path,
+        kunde: Kunde = None,
+        control: "UploadControl | None" = None,
+    ):
         """
         Lädt ein komplettes Verzeichnis hoch.
         Muss Signale aus core.signals verwenden, um den Fortschritt zu melden.
         Gibt True bei Erfolg, False bei Misserfolg zurück.
+        control: optional; Pause/Abbrechen zwischen Upload-Chunks.
         """
         pass
 
