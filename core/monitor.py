@@ -1,12 +1,148 @@
 import json
 import logging
 import os
-import time
-import shutil
 import requests
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
 from models.kunde import Kunde
+
+
+def _normalize_marker_type(raw_type):
+    """Normalisiert den Typ für den API-Call."""
+    value = str(raw_type or "").strip()
+    if value == "Handcam":
+        return "Handycam"
+    return value
+
+
+def parse_marker_payload(marker_content):
+    """Validiert Marker-Inhalt und liefert API-Query-Parameter plus Lookup-Modus."""
+    if not marker_content:
+        raise ValueError("Marker-Datei ist leer.")
+
+    try:
+        data = json.loads(marker_content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Marker-Datei ist kein gültiges JSON: {exc}") from exc
+
+    marker_type = _normalize_marker_type(data.get("type"))
+    if not marker_type:
+        raise ValueError("Pflichtfeld 'type' fehlt.")
+
+    if "kunden_id_hash" in data and "booking_id_hash" in data:
+        return {
+            "customer_id": str(data["kunden_id_hash"]).strip(),
+            "booking_id": str(data["booking_id_hash"]).strip(),
+            "type": marker_type
+        }, "hash"
+
+    if "kunden_id" in data and "booking_id" in data:
+        return {
+            "customer_id": str(data["kunden_id"]).strip(),
+            "booking_id": str(data["booking_id"]).strip(),
+            "type": marker_type
+        }, "id"
+
+    raise ValueError(
+        "Ungültiges Marker-Format. Erwartet entweder "
+        "'kunden_id_hash' + 'booking_id_hash' oder 'kunden_id' + 'booking_id'."
+    )
+
+
+def fetch_customer_data(config_manager, query_params, lookup_mode):
+    """Lädt Kundendaten über den passenden Customer-Endpoint."""
+    api_base_url = config_manager.get_secret("aero_customer_base_url")
+    api_token = config_manager.get_secret("aero_customer_api_token")
+
+    if not api_base_url or not api_token:
+        raise RuntimeError("API-Credentials fehlen (aero_customer_base_url/aero_customer_api_token).")
+
+    endpoint = "/aero-media-customer"
+    params = dict(query_params)
+    if lookup_mode == "id":
+        endpoint = "/aero-media-customer-fallback"
+        params["Fallback"] = "true"
+
+    response = requests.get(
+        f"{api_base_url}{endpoint}",
+        headers={
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        },
+        params=params,
+        timeout=15
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Customer-Lookup fehlgeschlagen: HTTP {response.status_code} - {response.text[:300]}")
+
+    payload = response.json()
+    customer = payload.get("customer")
+    if not customer:
+        raise RuntimeError("Customer-Lookup lieferte kein 'customer'-Objekt.")
+
+    return customer
+
+
+def build_kunde_from_customer(customer):
+    """Mappt API-Response auf Kunde-Modell."""
+    return Kunde(
+        customer_number=str(customer.get("customer_id", "")),
+        booking_number=str(customer.get("booking_id", "")),
+        email=str(customer.get("email", "")),
+        first_name=str(customer.get("vorname", "")),
+        last_name=str(customer.get("nachname", "")),
+        phone=str(customer.get("telefon", "")),
+        type=str(customer.get("typ", ""))
+    )
+
+
+def recover_stalled_upload_folders(config_manager, upload_queue, log):
+    """
+    Legt Verzeichnisse mit _in_verarbeitung.txt (z. B. nach Absturz) erneut in die Upload-Queue.
+    Marker bleibt _in_verarbeitung.txt bis der Uploader archiviert.
+    """
+    scan_path = config_manager.get_setting("monitor_path")
+    if not scan_path or not os.path.isdir(scan_path):
+        return 0
+
+    recovered = 0
+    try:
+        names = os.listdir(scan_path)
+    except OSError as e:
+        log.warning("Recovery: Konnte Überwachungsordner nicht lesen: %s", e)
+        return 0
+
+    for dir_name in names:
+        full_dir_path = os.path.join(scan_path, dir_name)
+        if not os.path.isdir(full_dir_path):
+            continue
+        processing_marker = os.path.join(full_dir_path, "_in_verarbeitung.txt")
+        if not os.path.exists(processing_marker):
+            continue
+        try:
+            with open(processing_marker, "r", encoding="utf-8") as marker_file:
+                marker_raw = marker_file.read().strip()
+            lookup_params, lookup_mode = parse_marker_payload(marker_raw)
+            log.info(
+                "Recovery: unterbrochener Auftrag '%s', Customer-Lookup (%s).",
+                dir_name,
+                lookup_mode,
+            )
+            customer = fetch_customer_data(config_manager, lookup_params, lookup_mode)
+            kunde = build_kunde_from_customer(customer)
+            upload_queue.put({
+                "dir_path": full_dir_path,
+                "kunde": kunde,
+            })
+            recovered += 1
+            log.info("Recovery: '%s' erneut in Upload-Warteschlange gelegt.", dir_name)
+        except Exception as e:
+            log.error("Recovery: Verzeichnis '%s' konnte nicht wiederaufgenommen werden: %s", dir_name, e)
+
+    if recovered:
+        log.info("Recovery: %s unterbrochene Aufträge in die Warteschlange gelegt.", recovered)
+    return recovered
 
 
 class MonitorThread(QThread):
@@ -37,90 +173,16 @@ class MonitorThread(QThread):
         self._wait_condition.wakeAll()
 
     def _normalize_type(self, raw_type):
-        """Normalisiert den Typ für den API-Call."""
-        value = str(raw_type or "").strip()
-        if value == "Handcam":
-            return "Handycam"
-        return value
+        return _normalize_marker_type(raw_type)
 
     def _parse_marker_payload(self, marker_content):
-        """Validiert Marker-Inhalt und liefert API-Query-Parameter plus Lookup-Modus."""
-        if not marker_content:
-            raise ValueError("Marker-Datei ist leer.")
-
-        try:
-            data = json.loads(marker_content)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Marker-Datei ist kein gültiges JSON: {exc}") from exc
-
-        marker_type = self._normalize_type(data.get("type"))
-        if not marker_type:
-            raise ValueError("Pflichtfeld 'type' fehlt.")
-
-        if "kunden_id_hash" in data and "booking_id_hash" in data:
-            return {
-                "customer_id": str(data["kunden_id_hash"]).strip(),
-                "booking_id": str(data["booking_id_hash"]).strip(),
-                "type": marker_type
-            }, "hash"
-
-        if "kunden_id" in data and "booking_id" in data:
-            return {
-                "customer_id": str(data["kunden_id"]).strip(),
-                "booking_id": str(data["booking_id"]).strip(),
-                "type": marker_type
-            }, "id"
-
-        raise ValueError(
-            "Ungültiges Marker-Format. Erwartet entweder "
-            "'kunden_id_hash' + 'booking_id_hash' oder 'kunden_id' + 'booking_id'."
-        )
+        return parse_marker_payload(marker_content)
 
     def _fetch_customer_data(self, query_params, lookup_mode):
-        """Lädt Kundendaten über den passenden Customer-Endpoint."""
-        api_base_url = self.config.get_secret("aero_customer_base_url")
-        api_token = self.config.get_secret("aero_customer_api_token")
-
-        if not api_base_url or not api_token:
-            raise RuntimeError("API-Credentials fehlen (aero_customer_base_url/aero_customer_api_token).")
-
-        endpoint = "/aero-media-customer"
-        params = dict(query_params)
-        if lookup_mode == "id":
-            endpoint = "/aero-media-customer-fallback"
-            params["Fallback"] = "true"
-
-        response = requests.get(
-            f"{api_base_url}{endpoint}",
-            headers={
-                "Authorization": f"Bearer {api_token}",
-                "Content-Type": "application/json"
-            },
-            params=params,
-            timeout=15
-        )
-
-        if not response.ok:
-            raise RuntimeError(f"Customer-Lookup fehlgeschlagen: HTTP {response.status_code} - {response.text[:300]}")
-
-        payload = response.json()
-        customer = payload.get("customer")
-        if not customer:
-            raise RuntimeError("Customer-Lookup lieferte kein 'customer'-Objekt.")
-
-        return customer
+        return fetch_customer_data(self.config, query_params, lookup_mode)
 
     def _build_kunde_from_customer(self, customer):
-        """Mappt API-Response auf Kunde-Modell."""
-        return Kunde(
-            customer_number=str(customer.get("customer_id", "")),
-            booking_number=str(customer.get("booking_id", "")),
-            email=str(customer.get("email", "")),
-            first_name=str(customer.get("vorname", "")),
-            last_name=str(customer.get("nachname", "")),
-            phone=str(customer.get("telefon", "")),
-            type=str(customer.get("typ", ""))
-        )
+        return build_kunde_from_customer(customer)
 
     def run(self):
         """Die Hauptschleife des Monitor-Threads."""

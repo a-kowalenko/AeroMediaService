@@ -17,7 +17,7 @@ from core import APP_VERSION
 from core.config import ConfigManager
 from core.logger import setup_logging
 from core.signals import signals
-from core.monitor import MonitorThread
+from core.monitor import MonitorThread, recover_stalled_upload_folders
 from core.uploader import UploaderThread
 from services.dropbox_client import DropboxClient
 from services.custom_api_client import CustomApiClient
@@ -193,6 +193,13 @@ class MainWindow(QMainWindow):
         self.update_worker = None
 
         self.history_manager = HistoryManager()
+        self._upload_recovery_done = False
+        self._history_pending_by_dir = {}
+        self._history_debounce_timer = QTimer(self)
+        self._history_debounce_timer.setSingleShot(True)
+        self._history_debounce_timer.setInterval(400)
+        self._history_debounce_timer.timeout.connect(self._flush_debounced_history_updates)
+
         self.current_history_page = 0
         self.history_items_per_page = 25
         self._history_refresh_overlay_refs = 0
@@ -494,22 +501,47 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def on_history_update(self, data):
         """Wird aufgerufen, wenn ein Upload aktualisiert wird."""
-        selected_id = self.get_selected_history_id()
+        updated_dir = data.get("dir_name")
+        if not updated_dir:
+            selected_id = self.get_selected_history_id()
+            self.history_manager.add_or_update(data)
+            self.refresh_history_table(maintain_page=True)
+            self._refresh_history_detail_if_needed(data, selected_id)
+            return
 
+        existing = self._history_pending_by_dir.get(updated_dir)
+        if existing:
+            existing.update(data)
+        else:
+            self._history_pending_by_dir[updated_dir] = dict(data)
+        self._history_debounce_timer.start()
+
+    @Slot()
+    def _flush_debounced_history_updates(self):
+        batch = self._history_pending_by_dir
+        self._history_pending_by_dir = {}
+        if not batch:
+            return
+        selected_id = self.get_selected_history_id()
+        for merged in batch.values():
+            self.history_manager.add_or_update(merged)
+        self.refresh_history_table(maintain_page=True)
+        if selected_id:
+            for merged in batch.values():
+                self._refresh_history_detail_if_needed(merged, selected_id)
+
+    def _refresh_history_detail_if_needed(self, data, selected_id):
+        """Detail-Grid aktualisieren, wenn der selektierte Eintrag zu diesem Update passt."""
+        if not selected_id:
+            return
         updated_id = data.get("id")
         updated_dir = data.get("dir_name")
-
-        self.history_manager.add_or_update(data)
-        self.refresh_history_table(maintain_page=True)
-
-        # Detail Grid offen halten + live aktualisieren, wenn selektierter Eintrag betroffen ist.
-        if selected_id:
-            if (updated_id and updated_id == selected_id) or (
-                not updated_id and updated_dir and self._selected_entry_matches_dir(selected_id, updated_dir)
-            ):
-                item_data = self.get_history_entry_by_id(selected_id)
-                if item_data:
-                    self.populate_detail_table(item_data)
+        if (updated_id and updated_id == selected_id) or (
+            not updated_id and updated_dir and self._selected_entry_matches_dir(selected_id, updated_dir)
+        ):
+            item_data = self.get_history_entry_by_id(selected_id)
+            if item_data:
+                self.populate_detail_table(item_data)
 
     def _selected_entry_matches_dir(self, selected_id, dir_name):
         """Hilfsfunktion: Prüft, ob die selektierte ID zu einem Verzeichnisnamen gehört."""
@@ -1154,6 +1186,10 @@ class MainWindow(QMainWindow):
             self.update_monitoring_status(False)
             return
 
+        if not self._upload_recovery_done:
+            recover_stalled_upload_folders(self.config, self.upload_queue, self.log)
+            self._upload_recovery_done = True
+
         self.log.info("Starte Monitor-Thread...")
         self.monitor_thread = MonitorThread(self.config, self.upload_queue)
         self.monitor_thread.start()
@@ -1172,6 +1208,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Wird aufgerufen, wenn das Fenster geschlossen wird."""
         self.log.info("Anwendung wird beendet...")
+
+        if getattr(self, "_history_debounce_timer", None) is not None:
+            self._history_debounce_timer.stop()
+        if getattr(self, "_history_pending_by_dir", None) and self._history_pending_by_dir:
+            self._flush_debounced_history_updates()
 
         # Alle Threads sauber herunterfahren
         self.stop_monitoring()

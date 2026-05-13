@@ -13,6 +13,13 @@ from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
+from utils.upload_checkpoint import (
+    clear_checkpoint,
+    load_checkpoint,
+    manifest_fingerprint,
+    save_checkpoint,
+    should_skip_upload_file,
+)
 
 # Entspricht Server PROXIED_UPLOAD_CHUNK_BYTES; Vercel-Multipart-Limit ~4.5 MiB Request-Body.
 CHUNK_BYTES = 4 * 1024 * 1024
@@ -451,7 +458,7 @@ class CustomApiClient(BaseClient):
 
         for root, _, files in os.walk(local_dir_path):
             for file in files:
-                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
+                if should_skip_upload_file(file):
                     continue
 
                 local_path = os.path.join(root, file)
@@ -475,20 +482,97 @@ class CustomApiClient(BaseClient):
             self.log.warning("Keine Dateien zum Hochladen gefunden.")
             return True
 
-        # 2. Direct Upload Session initialisieren
-        try:
-            # Extrahiere den exakten Verzeichnisnamen für den Server
-            folder_name = os.path.basename(local_dir_path)
-            session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
-            session_id = session_data["session_id"]
-            order_id = session_data.get("order_id")
-            self._last_session_id = session_id
+        files_to_upload.sort(key=lambda x: x["name"])
+        manifest = [{"name": f["name"], "size": f["size"], "type": f["type"]} for f in files_to_upload]
+        manifest_fp = manifest_fingerprint(manifest)
+        folder_name = os.path.basename(local_dir_path)
 
+        raw_ck = load_checkpoint(local_dir_path)
+        resume_ck = None
+        if (
+            raw_ck
+            and raw_ck.get("kind") == "custom_api_proxied"
+            and raw_ck.get("manifest_fp") == manifest_fp
+        ):
+            resume_ck = raw_ck
+        elif raw_ck:
+            self.log.warning("Upload-Checkpoint verworfen (Manifest/Typ passt nicht).")
+            clear_checkpoint(local_dir_path)
+
+        session_id = None
+        order_id = None
+
+        if resume_ck and resume_ck.get("phase") == "finalizing" and resume_ck.get("api_session_id"):
+            self.log.info("Checkpoint: Finalisierung der Upload-Session wird fortgesetzt.")
+            try:
+                sid = resume_ck["api_session_id"]
+                self._last_session_id = sid
+                if resume_ck.get("order_id") is not None:
+                    self._last_order_id = str(resume_ck["order_id"])
+                signals.upload_status_update.emit("Finalisiere Upload...")
+                customer_url = self._finalize_session(sid)
+                if not customer_url:
+                    customer_url = self._wait_for_completion_legacy(sid)
+                self._last_customer_url = customer_url if customer_url else None
+                clear_checkpoint(local_dir_path)
+                signals.upload_status_update.emit("Upload abgeschlossen.")
+                if customer_url:
+                    self.log.info("Upload erfolgreich: %s", customer_url)
+                else:
+                    self.log.warning(
+                        "Upload finalisiert, aber customer_url noch nicht verfuegbar."
+                    )
+                return True
+            except ApiAuthError as e:
+                self.log.error("Finalize (Recovery): %s", e)
+                signals.upload_status_update.emit(str(e))
+                return False
+            except Exception as e:
+                self.log.error("Finalize (Recovery) fehlgeschlagen: %s", e)
+                signals.upload_status_update.emit(f"Fehler: {e}")
+                return False
+
+        if resume_ck and resume_ck.get("api_session_id"):
+            session_id = resume_ck["api_session_id"]
+            order_id = resume_ck.get("order_id")
+            self._last_session_id = session_id
+            if order_id is not None:
+                self._last_order_id = str(order_id)
             self.log.info(
-                "Upload-Session initialisiert: session_id=%s%s",
+                "Proxied-Session wird fortgesetzt (session_id=%s, next_file_index=%s).",
                 session_id,
-                f", order_id={order_id}" if order_id else "",
+                resume_ck.get("next_file_index", 0),
             )
+
+        # 2. Direct Upload Session initialisieren (falls kein Resume)
+        try:
+            if not session_id:
+                session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
+                session_id = session_data["session_id"]
+                order_id = session_data.get("order_id")
+                self._last_session_id = session_id
+                if order_id is not None:
+                    self._last_order_id = str(order_id)
+                self.log.info(
+                    "Upload-Session initialisiert: session_id=%s%s",
+                    session_id,
+                    f", order_id={order_id}" if order_id else "",
+                )
+                save_checkpoint(
+                    local_dir_path,
+                    {
+                        "kind": "custom_api_proxied",
+                        "manifest_fp": manifest_fp,
+                        "folder_name": folder_name,
+                        "api_session_id": session_id,
+                        "order_id": order_id,
+                        "total_size": total_size,
+                        "completed_bytes": 0,
+                        "next_file_index": 0,
+                        "custom_active": None,
+                        "phase": "uploading",
+                    },
+                )
 
         except ApiAuthError as e:
             self.log.error("Session-Initialisierung: %s", e)
@@ -499,17 +583,80 @@ class CustomApiClient(BaseClient):
             signals.upload_status_update.emit(f"Fehler: {e}")
             return False
 
-        # 3. Dateien nacheinander (Session-Offsets pro Datei seriell)
-        uploaded_counter = {"bytes": 0}
+        start_idx = 0
+        resume_server_offset = None
+        if resume_ck:
+            start_idx = min(int(resume_ck.get("next_file_index", 0)), len(files_to_upload))
+            ca = resume_ck.get("custom_active") or {}
+            if start_idx < len(files_to_upload) and ca.get("file_name") == files_to_upload[start_idx]["name"]:
+                ro = int(ca.get("server_offset", 0))
+                if ro > 0:
+                    resume_server_offset = ro
 
+        uploaded_counter = {
+            "bytes": int(resume_ck.get("completed_bytes", 0)) if resume_ck else 0
+        }
+
+        def save_proxied_ck(**kwargs):
+            payload = {
+                "kind": "custom_api_proxied",
+                "manifest_fp": manifest_fp,
+                "folder_name": folder_name,
+                "api_session_id": session_id,
+                "order_id": order_id,
+                "total_size": total_size,
+                "phase": "uploading",
+            }
+            payload.update(kwargs)
+            save_checkpoint(local_dir_path, payload)
+
+        # 3. Dateien nacheinander (Session-Offsets pro Datei seriell)
         try:
-            for file_info in files_to_upload:
+            for i in range(start_idx, len(files_to_upload)):
+                file_info = files_to_upload[i]
+                roff = resume_server_offset if i == start_idx else None
+                resume_server_offset = None
+
+                def make_handlers():
+                    def on_chunk_committed(fi, server_off):
+                        save_proxied_ck(
+                            completed_bytes=sum(f["size"] for f in files_to_upload[:fi]),
+                            next_file_index=fi,
+                            custom_active={
+                                "file_name": files_to_upload[fi]["name"],
+                                "server_offset": server_off,
+                            },
+                        )
+
+                    def on_file_completed(fi):
+                        save_proxied_ck(
+                            completed_bytes=sum(f["size"] for f in files_to_upload[: fi + 1]),
+                            next_file_index=fi + 1,
+                            custom_active=None,
+                        )
+
+                    return on_chunk_committed, on_file_completed
+
+                on_chunk, on_done = make_handlers()
                 self._upload_file_via_session(
-                    session_id, file_info, total_size, uploaded_counter
+                    session_id,
+                    file_info,
+                    total_size,
+                    uploaded_counter,
+                    file_index=i,
+                    resume_server_offset=roff,
+                    on_chunk_committed=on_chunk,
+                    on_file_completed=on_done,
                 )
 
             # 4. Session abschliessen (Kunden-URL)
             self.log.info("Alle Dateien hochgeladen, finalisiere Session...")
+            save_proxied_ck(
+                completed_bytes=total_size,
+                next_file_index=len(files_to_upload),
+                custom_active=None,
+                phase="finalizing",
+            )
             signals.upload_status_update.emit("Finalisiere Upload...")
             customer_url = self._finalize_session(session_id)
             if not customer_url:
@@ -518,6 +665,7 @@ class CustomApiClient(BaseClient):
             # Speichere customer_url für get_shareable_link (nur wenn vorhanden)
             self._last_customer_url = customer_url if customer_url else None
 
+            clear_checkpoint(local_dir_path)
             signals.upload_status_update.emit(f"Upload abgeschlossen.")
             if customer_url:
                 self.log.info(f"Upload erfolgreich: {customer_url}")
@@ -584,9 +732,23 @@ class CustomApiClient(BaseClient):
         return result
 
     def _upload_file_via_session(
-        self, session_id: str, file_info: dict, total_job_size: int, uploaded_counter: dict
+        self,
+        session_id: str,
+        file_info: dict,
+        total_job_size: int,
+        uploaded_counter: dict,
+        *,
+        file_index: int = 0,
+        resume_server_offset: int | None = None,
+        on_chunk_committed=None,
+        on_file_completed=None,
     ):
-        """Eine Datei: session/start → optional session/append* → session/finish (CHUNK_BYTES)."""
+        """Eine Datei: session/start → optional session/append* → session/finish (CHUNK_BYTES).
+
+        resume_server_offset: Server-Offset zum Fortsetzen (kein erneuter session/start).
+        on_chunk_committed(file_index, server_offset): nach jedem bestätigten Offset.
+        on_file_completed(file_index): nach erfolgreichem Abschluss der Datei.
+        """
         file_name = file_info["name"]
         file_size = file_info["size"]
         local_path = file_info["local_path"]
@@ -612,9 +774,10 @@ class CustomApiClient(BaseClient):
             signals.upload_progress_total.emit(total_pct, combined, total_job_size)
 
         self.log.info(
-            "[%s] Session-Upload: %s bytes",
+            "[%s] Session-Upload: %s bytes%s",
             self._session_ctx(session_id, file_name),
             file_size,
+            f", resume_off={resume_server_offset}" if resume_server_offset is not None else "",
         )
         signals.upload_status_update.emit(f"Lade hoch: {file_name}")
         emit_progress(0)
@@ -622,13 +785,27 @@ class CustomApiClient(BaseClient):
         signals.upload_progress_file.emit(0, 0, denom)
 
         with open(local_path, "rb") as f:
-            first_len = min(CHUNK_BYTES, file_size) if file_size > 0 else 0
-            first = f.read(first_len)
-            r_start = self._session_start(session_id, file_name, file_size, first)
-            off = self._parse_next_offset(
-                r_start, len(first), session_id, file_name, "start"
-            )
-            emit_progress(off)
+            off = 0
+            if resume_server_offset is not None and resume_server_offset > 0:
+                off = int(resume_server_offset)
+                if off > file_size:
+                    raise RuntimeError(f"{file_name}: Checkpoint-Offset {off} > Dateigröße {file_size}")
+                f.seek(off)
+                self.log.info(
+                    "[%s] Setze Upload bei Byte %s fort.",
+                    self._session_ctx(session_id, file_name),
+                    off,
+                )
+            else:
+                first_len = min(CHUNK_BYTES, file_size) if file_size > 0 else 0
+                first = f.read(first_len)
+                r_start = self._session_start(session_id, file_name, file_size, first)
+                off = self._parse_next_offset(
+                    r_start, len(first), session_id, file_name, "start"
+                )
+                emit_progress(off)
+                if on_chunk_committed:
+                    on_chunk_committed(file_index, off)
 
             while file_size - off > CHUNK_BYTES:
                 buf = f.read(CHUNK_BYTES)
@@ -645,6 +822,8 @@ class CustomApiClient(BaseClient):
                     r_app, off + len(buf), session_id, file_name, "append"
                 )
                 emit_progress(off)
+                if on_chunk_committed:
+                    on_chunk_committed(file_index, off)
 
             last = f.read()
             if off + len(last) != file_size:
@@ -668,6 +847,8 @@ class CustomApiClient(BaseClient):
             total_progress, current_total_bytes, total_job_size
         )
         self.log.info("[%s] Fertig", self._session_ctx(session_id, file_name))
+        if on_file_completed:
+            on_file_completed(file_index)
 
     def _finalize_session(self, session_id: str):
         """POST /api/upload/finalize — liefert u. a. customer_url."""
@@ -920,7 +1101,7 @@ class CustomApiClient(BaseClient):
 
         for root, _, files in os.walk(local_dir_path):
             for file in files:
-                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
+                if should_skip_upload_file(file):
                     continue
 
                 local_path = os.path.join(root, file)
@@ -948,33 +1129,181 @@ class CustomApiClient(BaseClient):
             self.log.warning("Keine Dateien zum Hochladen gefunden.")
             return True
 
-        session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
-        session_id = session_data["session_id"]
-        order_id = session_data.get("order_id")
-        self._last_session_id = session_id
-        if order_id is not None:
-            self._last_order_id = str(order_id)
+        files_to_upload.sort(key=lambda x: x["name"])
+        manifest = [{"name": f["name"], "size": f["size"], "type": f["type"]} for f in files_to_upload]
+        manifest_fp = manifest_fingerprint(manifest)
 
-        self.log.info(
-            "Direct-Dropbox Session initialisiert: session_id=%s%s",
-            session_id,
-            f", order_id={order_id}" if order_id else "",
-        )
+        raw_ck = load_checkpoint(local_dir_path)
+        resume_ck = None
+        if (
+            raw_ck
+            and raw_ck.get("kind") == "custom_api_direct_dropbox"
+            and raw_ck.get("manifest_fp") == manifest_fp
+        ):
+            resume_ck = raw_ck
+        elif raw_ck:
+            self.log.warning("Direct-Dropbox-Checkpoint verworfen.")
+            clear_checkpoint(local_dir_path)
+
+        session_id = None
+        order_id = None
+        uploaded_files: list = []
+
+        if resume_ck and resume_ck.get("phase") == "client_complete_pending" and resume_ck.get("api_session_id"):
+            session_id = resume_ck["api_session_id"]
+            uploaded_files = list(resume_ck.get("uploaded_files") or [])
+            self._last_session_id = session_id
+            if resume_ck.get("order_id") is not None:
+                self._last_order_id = str(resume_ck["order_id"])
+            self.log.info("Checkpoint: client-complete wird fortgesetzt (session_id=%s).", session_id)
+            self._connect_dropbox_for_direct_mode()
+            done_resp = self._post_json_upload(
+                "/client-complete",
+                {"session_id": session_id, "files": uploaded_files},
+                timeout=120,
+                tag="client-complete",
+            )
+            done_data = done_resp.json() if done_resp.content else {}
+            self._last_customer_url = self._extract_customer_url(done_data)
+            if not self._last_customer_url:
+                self._last_customer_url = (
+                    done_data.get("media_url")
+                    or done_data.get("archive_url")
+                    or done_data.get("url")
+                )
+            for key in ("media_url", "customer_url", "archive_url", "order_id"):
+                val = done_data.get(key) if isinstance(done_data, dict) else None
+                if val:
+                    self.log.info("client-complete %s=%s [session=%r]", key, val, session_id)
+            if isinstance(done_data, dict) and done_data.get("order_id") is not None:
+                self._last_order_id = str(done_data["order_id"])
+            clear_checkpoint(local_dir_path)
+            signals.upload_status_update.emit("Upload abgeschlossen.")
+            return True
+
+        if resume_ck and resume_ck.get("api_session_id"):
+            session_id = resume_ck["api_session_id"]
+            order_id = resume_ck.get("order_id")
+            uploaded_files = list(resume_ck.get("uploaded_files") or [])
+            self._last_session_id = session_id
+            if order_id is not None:
+                self._last_order_id = str(order_id)
+            self.log.info(
+                "Direct-Dropbox-Upload fortsetzen (session_id=%s, next_file_index=%s).",
+                session_id,
+                resume_ck.get("next_file_index", 0),
+            )
+
+        if not session_id:
+            session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
+            session_id = session_data["session_id"]
+            order_id = session_data.get("order_id")
+            self._last_session_id = session_id
+            if order_id is not None:
+                self._last_order_id = str(order_id)
+            self.log.info(
+                "Direct-Dropbox Session initialisiert: session_id=%s%s",
+                session_id,
+                f", order_id={order_id}" if order_id else "",
+            )
+            save_checkpoint(
+                local_dir_path,
+                {
+                    "kind": "custom_api_direct_dropbox",
+                    "manifest_fp": manifest_fp,
+                    "api_session_id": session_id,
+                    "order_id": order_id,
+                    "uploaded_files": [],
+                    "next_file_index": 0,
+                    "dd_active": None,
+                    "phase": "uploading",
+                },
+            )
 
         self._connect_dropbox_for_direct_mode()
 
-        uploaded_counter = {"bytes": 0}
-        uploaded_files = []
-        for file_info in files_to_upload:
-            md = self._upload_file_direct_to_dropbox(file_info, total_size, uploaded_counter)
-            uploaded_files.append(
-                {
-                    "file_name": file_info["name"],
-                    "file_size": int(md.size if getattr(md, "size", None) is not None else file_info["size"]),
-                    "dropbox_id": getattr(md, "id", "") or "",
-                    "dropbox_path": (getattr(md, "path_lower", None) or getattr(md, "path_display", None) or file_info["dropbox_path"]),
-                }
+        start_idx = 0
+        resume_dd = None
+        if resume_ck:
+            start_idx = min(int(resume_ck.get("next_file_index", 0)), len(files_to_upload))
+            dd = resume_ck.get("dd_active") or {}
+            if start_idx < len(files_to_upload) and dd.get("file_name") == files_to_upload[start_idx]["name"]:
+                if int(dd.get("offset", 0)) > 0 and dd.get("session_id"):
+                    resume_dd = {
+                        "session_id": str(dd["session_id"]),
+                        "offset": int(dd["offset"]),
+                        "file_name": dd["file_name"],
+                        "dropbox_path": dd.get("dropbox_path") or files_to_upload[start_idx]["dropbox_path"],
+                    }
+
+        def names_done() -> set:
+            return {row["file_name"] for row in uploaded_files}
+
+        uploaded_counter = {
+            "bytes": sum(f["size"] for f in files_to_upload if f["name"] in names_done())
+        }
+
+        def save_dd_ck(**kwargs):
+            payload = {
+                "kind": "custom_api_direct_dropbox",
+                "manifest_fp": manifest_fp,
+                "api_session_id": session_id,
+                "order_id": order_id,
+                "uploaded_files": uploaded_files,
+                "phase": "uploading",
+            }
+            payload.update(kwargs)
+            save_checkpoint(local_dir_path, payload)
+
+        outer_resume_dd = resume_dd
+        for i in range(start_idx, len(files_to_upload)):
+            file_info = files_to_upload[i]
+            ro = outer_resume_dd if i == start_idx else None
+
+            def on_dd_progress(active: dict | None, _i=i):
+                if active:
+                    save_dd_ck(
+                        next_file_index=_i,
+                        dd_active={
+                            "session_id": active["session_id"],
+                            "offset": active["offset"],
+                            "file_name": active["file_name"],
+                            "dropbox_path": active["dropbox_path"],
+                        },
+                    )
+                else:
+                    save_dd_ck(next_file_index=_i, dd_active=None)
+
+            md = self._upload_file_direct_to_dropbox(
+                file_info,
+                total_size,
+                uploaded_counter,
+                resume_dd=ro,
+                on_dd_progress=on_dd_progress,
             )
+            row = {
+                "file_name": file_info["name"],
+                "file_size": int(md.size if getattr(md, "size", None) is not None else file_info["size"]),
+                "dropbox_id": getattr(md, "id", "") or "",
+                "dropbox_path": (
+                    getattr(md, "path_lower", None)
+                    or getattr(md, "path_display", None)
+                    or file_info["dropbox_path"]
+                ),
+            }
+            uploaded_files.append(row)
+            save_dd_ck(
+                uploaded_files=list(uploaded_files),
+                next_file_index=i + 1,
+                dd_active=None,
+            )
+
+        save_dd_ck(
+            uploaded_files=list(uploaded_files),
+            next_file_index=len(files_to_upload),
+            dd_active=None,
+            phase="client_complete_pending",
+        )
 
         done_resp = self._post_json_upload(
             "/client-complete",
@@ -998,6 +1327,7 @@ class CustomApiClient(BaseClient):
         if isinstance(done_data, dict) and done_data.get("order_id") is not None:
             self._last_order_id = str(done_data["order_id"])
 
+        clear_checkpoint(local_dir_path)
         signals.upload_status_update.emit("Upload abgeschlossen.")
         return True
 
@@ -1020,7 +1350,15 @@ class CustomApiClient(BaseClient):
         )
         self.dbx.users_get_current_account()
 
-    def _upload_file_direct_to_dropbox(self, file_info: dict, total_job_size: int, uploaded_counter: dict):
+    def _upload_file_direct_to_dropbox(
+        self,
+        file_info: dict,
+        total_job_size: int,
+        uploaded_counter: dict,
+        *,
+        resume_dd: dict | None = None,
+        on_dd_progress=None,
+    ):
         file_name = file_info["name"]
         file_size = file_info["size"]
         local_path = file_info["local_path"]
@@ -1038,14 +1376,23 @@ class CustomApiClient(BaseClient):
             signals.upload_progress_total.emit(total_pct, combined, total_job_size)
 
         self.log.info(
-            "[direct_dropbox session=%r file=%r] Upload nach %s (%s bytes)",
+            "[direct_dropbox session=%r file=%r] Upload nach %s (%s bytes)%s",
             self._last_session_id,
             file_name,
             dropbox_path,
             file_size,
+            ", resume" if resume_dd else "",
         )
         signals.upload_status_update.emit(f"Lade hoch: {file_name}")
         emit_progress(0)
+
+        def _active_state(cursor_obj):
+            return {
+                "session_id": str(cursor_obj.session_id),
+                "offset": int(cursor_obj.offset),
+                "file_name": file_name,
+                "dropbox_path": dropbox_path,
+            }
 
         with open(local_path, "rb") as f:
             if file_size <= DROPBOX_CHUNK_BYTES:
@@ -1055,15 +1402,48 @@ class CustomApiClient(BaseClient):
                     mode=dropbox.files.WriteMode.overwrite,
                 )
                 emit_progress(file_size)
+                if on_dd_progress:
+                    on_dd_progress(None)
             else:
-                start = self.dbx.files_upload_session_start(f.read(DROPBOX_CHUNK_BYTES))
-                cursor = dropbox.files.UploadSessionCursor(session_id=start.session_id, offset=f.tell())
-                emit_progress(cursor.offset)
+                cursor = None
+                if (
+                    resume_dd
+                    and int(resume_dd.get("offset", 0)) > 0
+                    and str(resume_dd.get("file_name", "")) == file_name
+                ):
+                    off = int(resume_dd["offset"])
+                    if off > file_size:
+                        raise RuntimeError(f"{file_name}: Resume-Offset {off} > Dateigröße {file_size}")
+                    f.seek(off)
+                    cursor = dropbox.files.UploadSessionCursor(
+                        session_id=str(resume_dd["session_id"]),
+                        offset=off,
+                    )
+                    self.log.info(
+                        "[direct_dropbox] Setze Dropbox-Session bei Byte %s fort (session_id=%r).",
+                        off,
+                        resume_dd.get("session_id"),
+                    )
+                    emit_progress(off)
+                    if on_dd_progress:
+                        on_dd_progress(_active_state(cursor))
+                else:
+                    start = self.dbx.files_upload_session_start(f.read(DROPBOX_CHUNK_BYTES))
+                    cursor = dropbox.files.UploadSessionCursor(
+                        session_id=start.session_id, offset=f.tell()
+                    )
+                    emit_progress(cursor.offset)
+                    if on_dd_progress:
+                        on_dd_progress(_active_state(cursor))
+
                 while (file_size - f.tell()) > DROPBOX_CHUNK_BYTES:
                     chunk = f.read(DROPBOX_CHUNK_BYTES)
                     self.dbx.files_upload_session_append_v2(chunk, cursor)
                     cursor.offset = f.tell()
                     emit_progress(cursor.offset)
+                    if on_dd_progress:
+                        on_dd_progress(_active_state(cursor))
+
                 final_chunk = f.read()
                 commit = dropbox.files.CommitInfo(
                     path=dropbox_path,
@@ -1071,6 +1451,8 @@ class CustomApiClient(BaseClient):
                 )
                 md = self.dbx.files_upload_session_finish(final_chunk, cursor, commit)
                 emit_progress(file_size)
+                if on_dd_progress:
+                    on_dd_progress(None)
 
         with self.progress_lock:
             uploaded_counter["bytes"] += file_size

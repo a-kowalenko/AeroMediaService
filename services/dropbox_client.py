@@ -1,12 +1,22 @@
 import dropbox
 import os
 import logging
+import time
+
+import requests
 
 from models.kunde import Kunde
 from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
 from utils.link_shortener import LinkShortener
+from utils.upload_checkpoint import (
+    clear_checkpoint,
+    load_checkpoint,
+    manifest_fingerprint,
+    save_checkpoint,
+    should_skip_upload_file,
+)
 
 # Maximale Chunk-Größe für Dropbox-Uploads (8 MB)
 CHUNK_SIZE = 8 * 1024 * 1024
@@ -120,6 +130,64 @@ class DropboxClient(BaseClient):
         # beende Monitoring
         signals.stop_monitoring.emit()
 
+    def _should_retry_dropbox_error(self, exc):
+        """True bei typischen transienten Fehlern (Rate-Limit, Netz, 5xx)."""
+        if isinstance(
+            exc,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        ):
+            return True
+        http_err_cls = getattr(dropbox.exceptions, "HttpError", None)
+        if http_err_cls is not None and isinstance(exc, http_err_cls):
+            return True
+        if isinstance(exc, dropbox.exceptions.ApiError):
+            err = getattr(exc, "error", None)
+            if err is not None:
+                for name in ("is_rate_limit", "is_internal_error"):
+                    pred = getattr(err, name, None)
+                    if callable(pred):
+                        try:
+                            if pred():
+                                return True
+                        except Exception:
+                            pass
+            lowered = str(exc).lower()
+            if any(
+                s in lowered
+                for s in ("too_many_requests", "rate_limit", "internal_server", "503", "502", "504")
+            ):
+                return True
+        return False
+
+    def _with_dropbox_retry(self, tag, operation, max_attempts=5):
+        """Führt eine Dropbox-API-Operation mit begrenzten Wiederholungen aus."""
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return operation()
+            except dropbox.exceptions.AuthError:
+                raise
+            except Exception as e:
+                last_exc = e
+                if attempt >= max_attempts or not self._should_retry_dropbox_error(e):
+                    raise
+                delay = min(60.0, 2.0 ** attempt)
+                self.log.warning(
+                    "%s: Versuch %s/%s fehlgeschlagen, warte %.1fs — %s",
+                    tag,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+        raise last_exc
+
     def get_connection_status(self):
         """Prüft die Verbindung und gibt den Status zurück."""
         if not self.dbx:
@@ -145,8 +213,7 @@ class DropboxClient(BaseClient):
         for root, _, files in os.walk(local_dir_path):
             for file in files:
                 local_path = os.path.join(root, file)
-                # Ignoriere die Marker-Datei und Systemdateien
-                if file in ["_fertig.txt", "_in_verarbeitung.txt", ".DS_Store", ".apdisk", "Thumbs.db", "desktop.ini"] or file.startswith("._"):
+                if should_skip_upload_file(file):
                     continue
 
                 # Relativen Pfad für Dropbox berechnen
@@ -155,7 +222,8 @@ class DropboxClient(BaseClient):
 
                 try:
                     file_size = os.path.getsize(local_path)
-                    files_to_upload.append((local_path, dropbox_path, file_size))
+                    rel_norm = relative_path.replace(os.path.sep, '/')
+                    files_to_upload.append((local_path, dropbox_path, file_size, rel_norm))
                     total_size += file_size
                 except FileNotFoundError:
                     self.log.warning(f"Datei nicht gefunden, überspringe: {local_path}")
@@ -165,10 +233,71 @@ class DropboxClient(BaseClient):
             signals.upload_progress_total.emit(100, 0, 0)
             return True  # Technisch gesehen erfolgreich, da nichts zu tun war
 
+        files_to_upload.sort(key=lambda t: t[3])
+        manifest = [{"name": t[3], "size": t[2]} for t in files_to_upload]
+        manifest_fp = manifest_fingerprint(manifest)
+
+        raw_ck = load_checkpoint(local_dir_path)
+        resume_ck = None
+        if (
+            raw_ck
+            and raw_ck.get("kind") == "dropbox_native"
+            and raw_ck.get("manifest_fp") == manifest_fp
+            and raw_ck.get("remote_base_path") == remote_base_path
+        ):
+            resume_ck = raw_ck
+        elif raw_ck:
+            self.log.warning("Dropbox-Native-Checkpoint verworfen.")
+            clear_checkpoint(local_dir_path)
+
+        start_idx = 0
+        resume_db = None
+        if resume_ck:
+            start_idx = min(int(resume_ck.get("next_file_index", 0)), len(files_to_upload))
+            da = resume_ck.get("db_active") or {}
+            if start_idx < len(files_to_upload) and da.get("rel_path") == files_to_upload[start_idx][3]:
+                if int(da.get("offset", 0)) > 0 and da.get("session_id"):
+                    resume_db = {
+                        "session_id": str(da["session_id"]),
+                        "offset": int(da["offset"]),
+                        "rel_path": da["rel_path"],
+                        "dropbox_path": da.get("dropbox_path") or files_to_upload[start_idx][1],
+                    }
+            self.log.info(
+                "Dropbox-Upload fortsetzen (next_file_index=%s).",
+                start_idx,
+            )
+
+        bytes_uploaded = (
+            sum(t[2] for t in files_to_upload[:start_idx]) if start_idx else 0
+        )
+
+        def save_native_ck(**kwargs):
+            payload = {
+                "kind": "dropbox_native",
+                "manifest_fp": manifest_fp,
+                "remote_base_path": remote_base_path,
+                "total_size": total_size,
+                "phase": "uploading",
+            }
+            payload.update(kwargs)
+            save_checkpoint(local_dir_path, payload)
+
+        if resume_ck is None:
+            save_native_ck(
+                next_file_index=0,
+                db_active=None,
+            )
+
+        outer_resume = resume_db
+
         # 2. Dateien hochladen und Fortschritt melden
-        bytes_uploaded = 0
+        local_path = ""
         try:
-            for local_path, dropbox_path, file_size in files_to_upload:
+            for i in range(start_idx, len(files_to_upload)):
+                local_path, dropbox_path, file_size, rel_norm = files_to_upload[i]
+                ro = outer_resume if i == start_idx else None
+
                 status_msg = f"Lade hoch: {os.path.basename(local_path)} ({file_size / 1024 ** 2:.2f} MB)"
                 signals.upload_status_update.emit(status_msg)
                 self.log.debug(status_msg)
@@ -179,18 +308,53 @@ class DropboxClient(BaseClient):
 
                 with open(local_path, 'rb') as f:
                     if file_size <= CHUNK_SIZE:
-                        # Einfacher Upload für kleine Dateien
-                        self.dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+                        data = f.read()
+
+                        def _do_small_upload(data_blob=data, path=dropbox_path):
+                            return self.dbx.files_upload(
+                                data_blob, path, mode=dropbox.files.WriteMode.overwrite
+                            )
+
+                        self._with_dropbox_retry(
+                            f"files_upload:{os.path.basename(local_path)}",
+                            _do_small_upload,
+                        )
                         signals.upload_progress_file.emit(100, file_size_in_mb, file_size_in_mb)
                         total_progress = int((bytes_uploaded / total_size) * 100)
                         signals.upload_progress_total.emit(total_progress, bytes_uploaded, total_size)
                     else:
-                        # Session-Upload für große Dateien
-                        self._upload_large_file(f, dropbox_path, file_size, bytes_uploaded, total_size)
+                        def on_db_progress(cursor, _rel=rel_norm, _dp=dropbox_path, _i=i):
+                            if cursor is None:
+                                save_native_ck(next_file_index=_i, db_active=None)
+                            else:
+                                save_native_ck(
+                                    next_file_index=_i,
+                                    db_active={
+                                        "rel_path": _rel,
+                                        "session_id": str(cursor.session_id),
+                                        "offset": int(cursor.offset),
+                                        "dropbox_path": _dp,
+                                    },
+                                )
+
+                        self._upload_large_file(
+                            f,
+                            dropbox_path,
+                            file_size,
+                            bytes_uploaded,
+                            total_size,
+                            resume=ro,
+                            rel_path=rel_norm,
+                            on_progress_save=on_db_progress,
+                        )
                     bytes_uploaded += file_size
 
+                save_native_ck(
+                    next_file_index=i + 1,
+                    db_active=None,
+                )
 
-
+            clear_checkpoint(local_dir_path)
             signals.upload_status_update.emit(f"Upload für '{remote_base_path}' abgeschlossen.")
             self.log.info(f"Upload für '{remote_base_path}' abgeschlossen.")
             return True
@@ -200,11 +364,53 @@ class DropboxClient(BaseClient):
             signals.upload_status_update.emit(f"Fehler: {e}")
             return False
 
-    def _upload_large_file(self, f, dropbox_path, file_size, base_bytes_uploaded, total_job_size):
-        """Privater Helfer für große Datei-Uploads mit Fortschritt."""
-        session_start_result = self.dbx.files_upload_session_start(f.read(CHUNK_SIZE))
-        session_id = session_start_result.session_id
-        cursor = dropbox.files.UploadSessionCursor(session_id=session_id, offset=f.tell())
+    def _upload_large_file(
+        self,
+        f,
+        dropbox_path,
+        file_size,
+        base_bytes_uploaded,
+        total_job_size,
+        *,
+        resume: dict | None = None,
+        rel_path: str = "",
+        on_progress_save=None,
+    ):
+        """Große Datei per Session-Upload; optional Fortsetzung mit resume (session_id, offset)."""
+
+        cursor = None
+
+        if (
+            resume
+            and int(resume.get("offset", 0)) > 0
+            and str(resume.get("rel_path", "")) == rel_path
+        ):
+            off = int(resume["offset"])
+            if off > file_size:
+                raise RuntimeError(f"{rel_path}: Resume-Offset {off} > Dateigröße {file_size}")
+            f.seek(off)
+            cursor = dropbox.files.UploadSessionCursor(
+                session_id=str(resume["session_id"]),
+                offset=off,
+            )
+            self.log.info(
+                "Dropbox-Session wird bei Byte %s fortgesetzt (session_id=%r).",
+                off,
+                resume.get("session_id"),
+            )
+            if on_progress_save:
+                on_progress_save(cursor)
+        else:
+
+            def _session_start():
+                f.seek(0)
+                return self.dbx.files_upload_session_start(f.read(CHUNK_SIZE))
+
+            session_start_result = self._with_dropbox_retry("files_upload_session_start", _session_start)
+            session_id = session_start_result.session_id
+            cursor = dropbox.files.UploadSessionCursor(session_id=session_id, offset=f.tell())
+            if on_progress_save:
+                on_progress_save(cursor)
 
         bytes_sent = f.tell()
         file_progress = int((bytes_sent / file_size) * 100)
@@ -215,8 +421,14 @@ class DropboxClient(BaseClient):
         signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
 
         while (file_size - f.tell()) > CHUNK_SIZE:
-            chunk = f.read(CHUNK_SIZE)
-            self.dbx.files_upload_session_append_v2(chunk, cursor)
+            chunk_pos = f.tell()
+
+            def _append():
+                f.seek(chunk_pos)
+                chunk = f.read(CHUNK_SIZE)
+                return self.dbx.files_upload_session_append_v2(chunk, cursor)
+
+            self._with_dropbox_retry("files_upload_session_append_v2", _append)
             cursor.offset = f.tell()
 
             bytes_sent = f.tell()
@@ -226,11 +438,20 @@ class DropboxClient(BaseClient):
             current_total_bytes = base_bytes_uploaded + bytes_sent
             total_progress = int((current_total_bytes / total_job_size) * 100)
             signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
+            if on_progress_save:
+                on_progress_save(cursor)
 
-        # Letztes Stück hochladen
-        chunk = f.read()
-        commit = dropbox.files.CommitInfo(path=dropbox_path, mode=dropbox.files.WriteMode.overwrite)
-        self.dbx.files_upload_session_finish(chunk, cursor, commit)
+        finish_pos = f.tell()
+
+        def _finish():
+            f.seek(finish_pos)
+            chunk = f.read()
+            commit = dropbox.files.CommitInfo(path=dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+            return self.dbx.files_upload_session_finish(chunk, cursor, commit)
+
+        self._with_dropbox_retry("files_upload_session_finish", _finish)
+        if on_progress_save:
+            on_progress_save(None)
         signals.upload_progress_file.emit(100, file_size, file_size)
 
         current_total_bytes = base_bytes_uploaded + file_size
@@ -246,7 +467,11 @@ class DropboxClient(BaseClient):
         try:
             self.log.info(f"Erstelle Freigabelink für: {remote_path}")
             # Prüfen, ob bereits ein Link existiert
-            links = self.dbx.sharing_list_shared_links(path=remote_path).links
+            links_result = self._with_dropbox_retry(
+                "sharing_list_shared_links",
+                lambda: self.dbx.sharing_list_shared_links(path=remote_path),
+            )
+            links = links_result.links
             if links:
                 self.log.debug("Link existiert bereits, verwende existierenden Link.")
                 # Link kürzen und zurückgeben
@@ -255,7 +480,10 @@ class DropboxClient(BaseClient):
             # Neuen Link erstellen
             settings = dropbox.sharing.SharedLinkSettings(
                 requested_visibility=dropbox.sharing.RequestedVisibility.public)
-            link = self.dbx.sharing_create_shared_link_with_settings(remote_path, settings=settings)
+            link = self._with_dropbox_retry(
+                "sharing_create_shared_link_with_settings",
+                lambda: self.dbx.sharing_create_shared_link_with_settings(remote_path, settings=settings),
+            )
             self.log.info(f"Link erfolgreich erstellt: {link.url}")
             # Link kürzen und zurückgeben
             return self.link_shortener.shorten(link.url)
@@ -266,7 +494,11 @@ class DropboxClient(BaseClient):
                 self.log.warning("API-Fehler 'Link existiert bereits', versuche Abruf...")
                 try:
                     # Workaround: Manchmal schlägt der erste Check fehl
-                    links = self.dbx.sharing_list_shared_links(path=remote_path).links
+                    links_result = self._with_dropbox_retry(
+                        "sharing_list_shared_links_retry",
+                        lambda: self.dbx.sharing_list_shared_links(path=remote_path),
+                    )
+                    links = links_result.links
                     if links:
                         # Link kürzen und zurückgeben
                         return self.link_shortener.shorten(links[0].url)

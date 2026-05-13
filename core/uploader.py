@@ -83,11 +83,25 @@ class UploaderThread(QThread):
                 # Remote-Pfad festlegen (z.B. /App-Ordner/Verzeichnisname)
                 remote_path = f"/{dir_name}"
 
-                # 1. Upload durchführen
-                upload_success = self.client.upload_directory(local_dir_path, remote_path, kunde)
+                # 1. Upload mit mehreren Versuchen (transiente Netzwerk-/Serverfehler)
+                upload_success = False
+                job_delays_sec = (5, 15)
+                for job_try in range(1, 4):
+                    upload_success = self.client.upload_directory(local_dir_path, remote_path, kunde)
+                    if upload_success:
+                        break
+                    if job_try < 3:
+                        wait_s = job_delays_sec[job_try - 1]
+                        self.log.warning(
+                            "Upload '%s' meldete Fehler (Versuch %s/3). Erneuter Versuch in %ss.",
+                            dir_name,
+                            job_try,
+                            wait_s,
+                        )
+                        time.sleep(wait_s)
 
                 if not upload_success:
-                    raise Exception("Upload-Funktion des Clients meldete einen Fehler.")
+                    raise Exception("Upload-Funktion des Clients meldete nach 3 Versuchen weiterhin einen Fehler.")
 
                 self.log.info(f"Upload für {dir_name} erfolgreich abgeschlossen.")
 
