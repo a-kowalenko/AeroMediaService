@@ -1,4 +1,5 @@
-﻿import os
+﻿import io
+import os
 import json
 import random
 import requests
@@ -26,6 +27,74 @@ from utils.upload_checkpoint import (
 CHUNK_BYTES = 4 * 1024 * 1024
 # Direkter Dropbox-Upload soll wie der DropboxClient mit 8 MiB arbeiten.
 DROPBOX_CHUNK_BYTES = 8 * 1024 * 1024
+
+# Mindestabstand zwischen Fortschritts-Signalen während ein Chunk-POST noch läuft (Qt/UI).
+_STREAM_PROGRESS_EMIT_INTERVAL_S = 0.05
+# Schrittgröße, falls der HTTP-Stack read(-1) auf dem Chunk-Body aufruft (sonst kein Zwischenstand).
+_STREAM_READALL_SLICE = 256 * 1024
+
+
+class _ChunkReadProgressBytesIO(io.BytesIO):
+    """BytesIO, das read()/readinto() meldet — Fortschritt innerhalb eines Multipart-Chunks."""
+
+    __slots__ = ("_notify", "_throttle_s", "_last_emit_t", "_total")
+
+    def __init__(self, initial_bytes: bytes, notify, throttle_s: float = _STREAM_PROGRESS_EMIT_INTERVAL_S):
+        super().__init__(initial_bytes)
+        self._notify = notify
+        self._throttle_s = throttle_s
+        self._last_emit_t = 0.0
+        self._total = len(initial_bytes)
+
+    def _emit_if_needed(self, pos_after: int) -> None:
+        if not self._notify or self._total <= 0:
+            return
+        now = time.monotonic()
+        end_reached = pos_after >= self._total
+        if end_reached or now - self._last_emit_t >= self._throttle_s:
+            self._notify(pos_after)
+            self._last_emit_t = now
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            pieces = []
+            sub = _STREAM_READALL_SLICE
+            while True:
+                piece = super().read(sub)
+                if not piece:
+                    break
+                pieces.append(piece)
+                self._emit_if_needed(self.tell())
+            return b"".join(pieces)
+        data = super().read(n)
+        if data:
+            self._emit_if_needed(self.tell())
+        return data
+
+    def readinto(self, b):
+        n = super().readinto(b)
+        if n > 0:
+            self._emit_if_needed(self.tell())
+        return n
+
+
+def _multipart_fields_with_chunk_stream_monitor(fields: dict, on_chunk_stream_progress):
+    """Ersetzt das 'chunk'-Feld durch einen BytesIO, der Lesefortschritt meldet."""
+    if not on_chunk_stream_progress:
+        return fields
+    out = {}
+    for key, val in fields.items():
+        if key == "chunk" and isinstance(val, tuple) and len(val) >= 2:
+            fn, payload = val[0], val[1]
+            rest = val[2:]
+            if isinstance(payload, bytes) and len(payload) > 0:
+                bio = _ChunkReadProgressBytesIO(payload, on_chunk_stream_progress)
+                out[key] = (fn, bio) + rest
+            else:
+                out[key] = val
+        else:
+            out[key] = val
+    return out
 
 
 class ApiAuthError(Exception):
@@ -268,6 +337,7 @@ class CustomApiClient(BaseClient):
         file_name: str,
         offset_for_log,
         per_request_timeout: int = 600,
+        on_chunk_stream_progress=None,
     ):
         """POST multipart an session/start|append|finish mit Retry (503/504/Netz)."""
         url = f"{self._upload_api_root()}{subpath}"
@@ -275,7 +345,10 @@ class CustomApiClient(BaseClient):
         ctx = self._session_ctx(session_id, file_name, offset_for_log)
         for attempt in range(1, max_attempts + 1):
             try:
-                r = self.session.post(url, files=fields, timeout=per_request_timeout)
+                files_to_send = _multipart_fields_with_chunk_stream_monitor(
+                    fields, on_chunk_stream_progress
+                )
+                r = self.session.post(url, files=files_to_send, timeout=per_request_timeout)
             except requests.exceptions.RequestException as e:
                 if attempt >= max_attempts:
                     self.log.error(
@@ -396,7 +469,15 @@ class CustomApiClient(BaseClient):
         )
         return expected_next
 
-    def _session_start(self, session_id: str, file_name: str, expected_size: int, chunk: bytes):
+    def _session_start(
+        self,
+        session_id: str,
+        file_name: str,
+        expected_size: int,
+        chunk: bytes,
+        *,
+        on_chunk_stream_progress=None,
+    ):
         return self._post_session_multipart_with_retry(
             "/session/start",
             {
@@ -408,9 +489,18 @@ class CustomApiClient(BaseClient):
             session_id=session_id,
             file_name=file_name,
             offset_for_log=0,
+            on_chunk_stream_progress=on_chunk_stream_progress,
         )
 
-    def _session_append(self, session_id: str, file_name: str, offset: int, chunk: bytes):
+    def _session_append(
+        self,
+        session_id: str,
+        file_name: str,
+        offset: int,
+        chunk: bytes,
+        *,
+        on_chunk_stream_progress=None,
+    ):
         return self._post_session_multipart_with_retry(
             "/session/append",
             {
@@ -422,10 +512,18 @@ class CustomApiClient(BaseClient):
             session_id=session_id,
             file_name=file_name,
             offset_for_log=offset,
+            on_chunk_stream_progress=on_chunk_stream_progress,
         )
 
     def _session_finish(
-        self, session_id: str, file_name: str, offset: int, chunk: bytes, mime_type: str
+        self,
+        session_id: str,
+        file_name: str,
+        offset: int,
+        chunk: bytes,
+        mime_type: str,
+        *,
+        on_chunk_stream_progress=None,
     ):
         fields = {
             "session_id": (None, session_id),
@@ -440,6 +538,7 @@ class CustomApiClient(BaseClient):
             session_id=session_id,
             file_name=file_name,
             offset_for_log=offset,
+            on_chunk_stream_progress=on_chunk_stream_progress,
         )
 
     def upload_directory(self, local_dir_path, remote_base_path, kunde: Kunde = None, control=None):
@@ -818,7 +917,13 @@ class CustomApiClient(BaseClient):
                 self._upload_coop_tick()
                 first_len = min(CHUNK_BYTES, file_size) if file_size > 0 else 0
                 first = f.read(first_len)
-                r_start = self._session_start(session_id, file_name, file_size, first)
+                r_start = self._session_start(
+                    session_id,
+                    file_name,
+                    file_size,
+                    first,
+                    on_chunk_stream_progress=(lambda n: emit_progress(n)) if first else None,
+                )
                 off = self._parse_next_offset(
                     r_start, len(first), session_id, file_name, "start"
                 )
@@ -837,7 +942,13 @@ class CustomApiClient(BaseClient):
                     raise RuntimeError(
                         f"{file_name}: append wuerde letzten Block senden — stattdessen finish"
                     )
-                r_app = self._session_append(session_id, file_name, off, buf)
+                r_app = self._session_append(
+                    session_id,
+                    file_name,
+                    off,
+                    buf,
+                    on_chunk_stream_progress=lambda n, _off=off: emit_progress(_off + n),
+                )
                 off = self._parse_next_offset(
                     r_app, off + len(buf), session_id, file_name, "append"
                 )
@@ -852,7 +963,16 @@ class CustomApiClient(BaseClient):
                     f"{file_name}: finish-Invariante verletzt off={off} "
                     f"len(last)={len(last)} expected_size={file_size}"
                 )
-            self._session_finish(session_id, file_name, off, last, mime_type)
+            self._session_finish(
+                session_id,
+                file_name,
+                off,
+                last,
+                mime_type,
+                on_chunk_stream_progress=(
+                    (lambda n, _off=off: emit_progress(_off + n)) if last else None
+                ),
+            )
 
         emit_progress(file_size)
 
