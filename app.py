@@ -19,6 +19,7 @@ from core.logger import setup_logging
 from core.signals import signals
 from core.monitor import MonitorThread, recover_stalled_upload_folders
 from core.uploader import UploaderThread
+from core.upload_queue_registry import UploadQueueRegistry
 from services.dropbox_client import DropboxClient
 from services.custom_api_client import CustomApiClient
 from services.email_client import EmailClient
@@ -168,6 +169,7 @@ class MainWindow(QMainWindow):
         self.log.info("Anwendung wird gestartet...")
 
         self.upload_queue = queue.Queue()
+        self.upload_registry = UploadQueueRegistry()
 
         # --- Dienste (Clients) ---
         # (Clients benötigen ConfigManager)
@@ -186,7 +188,8 @@ class MainWindow(QMainWindow):
                                               self.upload_queue,
                                               self.active_cloud_client,
                                               self.email_client,
-                                              self.sms_client)
+                                              self.sms_client,
+                                              self.upload_registry)
 
         # --- Update-Worker ---
         self.update_thread = None
@@ -1233,11 +1236,15 @@ class MainWindow(QMainWindow):
             return
 
         if not self._upload_recovery_done:
-            recover_stalled_upload_folders(self.config, self.upload_queue, self.log)
+            recover_stalled_upload_folders(
+                self.config, self.upload_queue, self.upload_registry, self.log
+            )
             self._upload_recovery_done = True
 
         self.log.info("Starte Monitor-Thread...")
-        self.monitor_thread = MonitorThread(self.config, self.upload_queue)
+        self.monitor_thread = MonitorThread(
+            self.config, self.upload_queue, self.upload_registry
+        )
         self.monitor_thread.start()
         self.update_monitoring_status(True)
 

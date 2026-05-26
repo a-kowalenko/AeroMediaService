@@ -13,6 +13,8 @@ from services.email_client import EmailClient
 from services.sms_client import SmsClient
 from core.signals import signals
 from core.upload_control import UploadCancelled, UploadControl
+from core.upload_markers import remove_upload_markers
+from core.upload_queue_registry import UploadQueueRegistry
 
 
 class UploaderThread(QThread):
@@ -22,10 +24,12 @@ class UploaderThread(QThread):
     """
 
     def __init__(self, config_manager: ConfigManager, upload_queue: queue.Queue, client: BaseClient,
-                 email_client: EmailClient, sms_client: SmsClient):
+                 email_client: EmailClient, sms_client: SmsClient,
+                 upload_registry: UploadQueueRegistry | None = None):
         super().__init__()
         self.config = config_manager
         self.upload_queue = upload_queue
+        self.upload_registry = upload_registry
         self.client = client
         self.email_client = email_client
         self.sms_client = sms_client
@@ -129,6 +133,7 @@ class UploaderThread(QThread):
                         raise Exception("Upload-Funktion des Clients meldete nach 3 Versuchen weiterhin einen Fehler.")
 
                     self.log.info(f"Upload für {dir_name} erfolgreich abgeschlossen.")
+                    remove_upload_markers(local_dir_path, self.log)
 
                     # 2. Freigabelink erstellen (mit kurzen Retries bei spaeter Finalisierung)
                     share_link = None
@@ -235,6 +240,8 @@ class UploaderThread(QThread):
                 self.email_client.send_upload_failure_email(dir_name, str(e))
 
             finally:
+                if self.upload_registry and local_dir_path:
+                    self.upload_registry.unregister(local_dir_path)
                 if self._is_running:
                     signals.upload_progress_file.emit(0, 0, 0)
                     signals.upload_progress_total.emit(0, 0, 0)
@@ -269,10 +276,7 @@ class UploaderThread(QThread):
 
         try:
             shutil.move(local_dir_path, destination_path)
-            # Entferne marker files, falls vorhanden
-            processing_marker_path = os.path.join(destination_path, "_in_verarbeitung.txt")
-            if os.path.exists(processing_marker_path):
-                os.remove(processing_marker_path)
+            remove_upload_markers(destination_path, self.log)
             self.log.info(f"Verzeichnis verschoben nach: {destination_path}")
         except Exception as e:
             self.log.error(f"Konnte Verzeichnis nicht nach {destination_path} verschieben: {e}")

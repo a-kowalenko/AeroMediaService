@@ -5,6 +5,8 @@ import requests
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
 from models.kunde import Kunde
+from core.upload_markers import discard_stale_fertig_marker, marker_paths
+from core.upload_queue_registry import UploadQueueRegistry
 
 
 def _normalize_marker_type(raw_type):
@@ -164,10 +166,63 @@ def build_kunde_from_customer(customer):
     )
 
 
-def recover_stalled_upload_folders(config_manager, upload_queue, log):
+def attempt_queue_upload_folder(
+    config_manager,
+    full_dir_path: str,
+    dir_name: str,
+    upload_queue,
+    upload_registry: UploadQueueRegistry,
+    log,
+) -> bool:
+    """
+    Übernimmt einen Ordner (Claim) und legt ihn in die Upload-Queue.
+    Returns True, wenn ein neuer Auftrag eingereiht wurde.
+    """
+    if not os.path.isdir(full_dir_path):
+        return False
+
+    fertig_path, processing_path = marker_paths(full_dir_path)
+
+    if os.path.isfile(processing_path):
+        discard_stale_fertig_marker(full_dir_path, log)
+        return False
+
+    if not os.path.isfile(fertig_path):
+        return False
+
+    if not upload_registry.register(full_dir_path):
+        log.debug("'%s' bereits in Upload-Warteschlange vorgemerkt.", dir_name)
+        return False
+
+    try:
+        with open(fertig_path, "r", encoding="utf-8") as marker_file:
+            marker_raw = marker_file.read().strip()
+        log.debug("Marker-Daten für '%s': %s", dir_name, marker_raw)
+        kunde = resolve_kunde_from_marker(config_manager, marker_raw)
+        log.info("Kundendaten erfolgreich geladen für '%s': %s", dir_name, kunde)
+
+        try:
+            os.rename(fertig_path, processing_path)
+        except OSError as exc:
+            raise OSError(
+                f"Marker-Umbenennung fehlgeschlagen ({fertig_path} -> {processing_path}): {exc}"
+            ) from exc
+
+        upload_queue.put({
+            "dir_path": full_dir_path,
+            "kunde": kunde,
+        })
+        log.info("'%s' zur Upload-Warteschlange hinzugefügt.", dir_name)
+        return True
+    except Exception:
+        upload_registry.unregister(full_dir_path)
+        raise
+
+
+def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry, log):
     """
     Legt Verzeichnisse mit _in_verarbeitung.txt (z. B. nach Absturz) erneut in die Upload-Queue.
-    Marker bleibt _in_verarbeitung.txt bis der Uploader archiviert.
+    Marker bleibt _in_verarbeitung.txt bis der Uploader die Marker nach Upload entfernt/archiviert.
     """
     scan_path = config_manager.get_setting("monitor_path")
     if not scan_path or not os.path.isdir(scan_path):
@@ -184,11 +239,15 @@ def recover_stalled_upload_folders(config_manager, upload_queue, log):
         full_dir_path = os.path.join(scan_path, dir_name)
         if not os.path.isdir(full_dir_path):
             continue
-        processing_marker = os.path.join(full_dir_path, "_in_verarbeitung.txt")
-        if not os.path.exists(processing_marker):
+        _, processing_path = marker_paths(full_dir_path)
+        if not os.path.isfile(processing_path):
+            continue
+        discard_stale_fertig_marker(full_dir_path, log)
+        if not upload_registry.register(full_dir_path):
+            log.debug("Recovery: '%s' bereits vorgemerkt, überspringe.", dir_name)
             continue
         try:
-            with open(processing_marker, "r", encoding="utf-8") as marker_file:
+            with open(processing_path, "r", encoding="utf-8") as marker_file:
                 marker_raw = marker_file.read().strip()
             kunde = resolve_kunde_from_marker(config_manager, marker_raw)
             log.info("Recovery: unterbrochener Auftrag '%s', Kundendaten geladen.", dir_name)
@@ -199,6 +258,7 @@ def recover_stalled_upload_folders(config_manager, upload_queue, log):
             recovered += 1
             log.info("Recovery: '%s' erneut in Upload-Warteschlange gelegt.", dir_name)
         except Exception as e:
+            upload_registry.unregister(full_dir_path)
             log.error("Recovery: Verzeichnis '%s' konnte nicht wiederaufgenommen werden: %s", dir_name, e)
 
     if recovered:
@@ -213,10 +273,11 @@ class MonitorThread(QThread):
     Gefundene Verzeichnisse werden in die 'upload_queue' verschoben.
     """
 
-    def __init__(self, config_manager, upload_queue):
+    def __init__(self, config_manager, upload_queue, upload_registry: UploadQueueRegistry):
         super().__init__()
         self.config = config_manager
         self.upload_queue = upload_queue
+        self.upload_registry = upload_registry
         self.log = logging.getLogger(__name__)
 
         self._is_running = False
@@ -277,35 +338,27 @@ class MonitorThread(QThread):
                         break  # Sofort beenden, wenn 'stop' aufgerufen wurde
 
                     full_dir_path = os.path.join(scan_path, dir_name)
-                    marker_file_path = os.path.join(full_dir_path, "_fertig.txt")
+                    if not os.path.isdir(full_dir_path):
+                        continue
 
-                    # Prüfen, ob es ein Verzeichnis ist UND die Marker-Datei existiert
-                    if os.path.isdir(full_dir_path) and os.path.exists(marker_file_path):
-                        try:
-                            self.log.info(f"Neues Verzeichnis gefunden: {dir_name}")
+                    fertig_path, processing_path = marker_paths(full_dir_path)
+                    if not os.path.isfile(fertig_path) and not os.path.isfile(processing_path):
+                        continue
 
-                            with open(marker_file_path, 'r', encoding='utf-8') as marker_file:
-                                marker_raw = marker_file.read().strip()
-                            self.log.debug(f"Marker-Daten für '{dir_name}': {marker_raw}")
-
-                            kunde = self._resolve_kunde_from_marker(marker_raw)
-                            self.log.info(f"Kundendaten erfolgreich geladen für '{dir_name}': {kunde}")
-
-                            # Wir fügen den Pfad direkt zur Queue hinzu.
-                            # Der Uploader ist dafür verantwortlich, ihn nach dem Upload zu verschieben.
-                            # Um ein doppeltes Hinzufügen zu verhindern, benennen wir die Marker-Datei um.
-                            processing_marker_path = os.path.join(full_dir_path, "_in_verarbeitung.txt")
-                            os.rename(marker_file_path, processing_marker_path)
-
-                            # Verzeichnis zur Upload-Warteschlange hinzufügen
-                            self.upload_queue.put({
-                                "dir_path": full_dir_path,
-                                "kunde": kunde
-                            })
-                            self.log.info(f"'{dir_name}' zur Upload-Warteschlange hinzugefügt.")
+                    try:
+                        if os.path.isfile(fertig_path) and not os.path.isfile(processing_path):
+                            self.log.info("Neues Verzeichnis gefunden: %s", dir_name)
+                        if attempt_queue_upload_folder(
+                            self.config,
+                            full_dir_path,
+                            dir_name,
+                            self.upload_queue,
+                            self.upload_registry,
+                            self.log,
+                        ):
                             found_items += 1
-                        except Exception as e:
-                            self.log.error(f"Fehler bei Verarbeitung von '{dir_name}': {e}")
+                    except Exception as e:
+                        self.log.error("Fehler bei Verarbeitung von '%s': %s", dir_name, e)
 
             except FileNotFoundError:
                 self.log.error(f"Überwachungsordner '{scan_path}' wurde gelöscht.")
