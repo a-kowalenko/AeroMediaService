@@ -23,6 +23,9 @@ class GlobalSignals(QObject):
     # True solange ein Queue-Upload-Job aktiv ist (fuer Pause/Abbrechen-Buttons)
     upload_job_active = Signal(bool)
 
+    # Geordnete Warteschlangen-Snapshot-Liste (list[dict]) fuer die Monitor-UI
+    upload_queue_changed = Signal(object)
+
     # Signale für Upload-Prozess
     upload_started = Signal(int)  # Upload gestartet mit Anzahl der Dateien
     upload_progress = Signal(str)  # Fortschritt-Nachricht (z.B. "Datei 1/10: bild.jpg")

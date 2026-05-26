@@ -16,6 +16,20 @@ def marker_paths(folder_path: str) -> tuple[str, str]:
     )
 
 
+def read_marker_raw(folder_path: str) -> Optional[str]:
+    """Liest Marker-Inhalt aus _in_verarbeitung.txt oder _fertig.txt."""
+    fertig_path, processing_path = marker_paths(folder_path)
+    for path in (processing_path, fertig_path):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as marker_file:
+                return marker_file.read().strip()
+        except OSError:
+            continue
+    return None
+
+
 def remove_upload_markers(folder_path: str, logger: Optional[logging.Logger] = None) -> None:
     """Entfernt Claim-Marker im Ordner (unabhängig vom Archiv-Move)."""
     for name in (MARKER_FERTIG, MARKER_PROCESSING):

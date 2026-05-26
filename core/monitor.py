@@ -6,8 +6,10 @@ from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
 from models.kunde import Kunde
 from core.archive import handle_customer_lookup_failure, is_customer_lookup_failure
-from core.upload_markers import discard_stale_fertig_marker, marker_paths
+from core.signals import signals
+from core.upload_markers import discard_stale_fertig_marker, marker_paths, read_marker_raw
 from core.upload_queue_registry import UploadQueueRegistry
+from core.folder_stability import FolderStabilityTracker
 
 
 def _normalize_marker_type(raw_type):
@@ -195,12 +197,24 @@ def attempt_queue_upload_folder(
         log.debug("'%s' bereits in Upload-Warteschlange vorgemerkt.", dir_name)
         return False
 
+    marker_raw = None
     try:
         with open(fertig_path, "r", encoding="utf-8") as marker_file:
             marker_raw = marker_file.read().strip()
         log.debug("Marker-Daten für '%s': %s", dir_name, marker_raw)
         kunde = resolve_kunde_from_marker(config_manager, marker_raw)
         log.info("Kundendaten erfolgreich geladen für '%s': %s", dir_name, kunde)
+        signals.upload_history_update.emit({
+            "dir_name": dir_name,
+            "marker_raw": marker_raw,
+            "first_name": kunde.first_name or "",
+            "last_name": kunde.last_name or "",
+            "email": kunde.email or "",
+            "phone": kunde.phone or "",
+            "customer_number": kunde.customer_number or "",
+            "booking_number": kunde.booking_number or "",
+            "type": kunde.type or "",
+        })
 
         try:
             os.rename(fertig_path, processing_path)
@@ -209,10 +223,12 @@ def attempt_queue_upload_folder(
                 f"Marker-Umbenennung fehlgeschlagen ({fertig_path} -> {processing_path}): {exc}"
             ) from exc
 
-        upload_queue.put({
-            "dir_path": full_dir_path,
-            "kunde": kunde,
-        })
+        upload_registry.enqueue(
+            upload_queue,
+            {"dir_path": full_dir_path, "kunde": kunde},
+            log,
+            already_registered=True,
+        )
         log.info("'%s' zur Upload-Warteschlange hinzugefügt.", dir_name)
         return True
     except Exception as exc:
@@ -223,7 +239,13 @@ def attempt_queue_upload_folder(
                 dir_name,
                 exc,
             )
-            handle_customer_lookup_failure(config_manager, full_dir_path, exc, log)
+            handle_customer_lookup_failure(
+                config_manager,
+                full_dir_path,
+                exc,
+                log,
+                marker_raw=marker_raw or read_marker_raw(full_dir_path),
+            )
             return False
         raise
 
@@ -252,20 +274,31 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
         if not os.path.isfile(processing_path):
             continue
         discard_stale_fertig_marker(full_dir_path, log)
-        if not upload_registry.register(full_dir_path):
-            log.debug("Recovery: '%s' bereits vorgemerkt, überspringe.", dir_name)
-            continue
         try:
             with open(processing_path, "r", encoding="utf-8") as marker_file:
                 marker_raw = marker_file.read().strip()
             kunde = resolve_kunde_from_marker(config_manager, marker_raw)
             log.info("Recovery: unterbrochener Auftrag '%s', Kundendaten geladen.", dir_name)
-            upload_queue.put({
-                "dir_path": full_dir_path,
-                "kunde": kunde,
+            signals.upload_history_update.emit({
+                "dir_name": dir_name,
+                "marker_raw": marker_raw,
+                "first_name": kunde.first_name or "",
+                "last_name": kunde.last_name or "",
+                "email": kunde.email or "",
+                "phone": kunde.phone or "",
+                "customer_number": kunde.customer_number or "",
+                "booking_number": kunde.booking_number or "",
+                "type": kunde.type or "",
             })
-            recovered += 1
-            log.info("Recovery: '%s' erneut in Upload-Warteschlange gelegt.", dir_name)
+            if upload_registry.enqueue(
+                upload_queue,
+                {"dir_path": full_dir_path, "kunde": kunde},
+                log,
+            ):
+                recovered += 1
+                log.info("Recovery: '%s' erneut in Upload-Warteschlange gelegt.", dir_name)
+            else:
+                log.debug("Recovery: '%s' bereits vorgemerkt, überspringe.", dir_name)
         except Exception as e:
             upload_registry.unregister(full_dir_path)
             if is_customer_lookup_failure(e):
@@ -274,7 +307,13 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
                     dir_name,
                     e,
                 )
-                handle_customer_lookup_failure(config_manager, full_dir_path, e, log)
+                handle_customer_lookup_failure(
+                    config_manager,
+                    full_dir_path,
+                    e,
+                    log,
+                    marker_raw=read_marker_raw(full_dir_path),
+                )
             else:
                 log.error("Recovery: Verzeichnis '%s' konnte nicht wiederaufgenommen werden: %s", dir_name, e)
 
@@ -300,11 +339,26 @@ class MonitorThread(QThread):
         self._is_running = False
         self._mutex = QMutex()
         self._wait_condition = QWaitCondition()  # Zum Aufwecken bei Einstellungsänderungen
+        self._stability_tracker = FolderStabilityTracker(
+            float(config_manager.get_setting("folder_stability_seconds", 15)),
+            self.log,
+        )
+
+    def _stability_enabled(self) -> bool:
+        return str(self.config.get_setting("folder_stability_enabled", "true")).lower() != "false"
+
+    def _apply_stability_settings(self) -> None:
+        if self._stability_enabled():
+            seconds = int(self.config.get_setting("folder_stability_seconds", 15))
+            self._stability_tracker.set_required_seconds(float(seconds))
+        else:
+            self._stability_tracker.set_required_seconds(0.0)
 
     def stop(self):
         """Signalisiert dem Thread, sicher zu stoppen."""
         self.log.info("Monitor-Thread wird gestoppt...")
         self._is_running = False
+        self._stability_tracker.clear()
         self._wait_condition.wakeAll()  # Weckt den Thread auf, damit er beendet werden kann
 
     def wake_up(self):
@@ -349,6 +403,8 @@ class MonitorThread(QThread):
 
             try:
                 self.log.debug(f"Scanne Verzeichnis: {scan_path}")
+                self._apply_stability_settings()
+                stability_enabled = self._stability_enabled()
                 found_items = 0
                 for dir_name in os.listdir(scan_path):
                     if not self._is_running:
@@ -363,6 +419,15 @@ class MonitorThread(QThread):
                         continue
 
                     try:
+                        if os.path.isfile(processing_path):
+                            self._stability_tracker.discard(full_dir_path)
+                        elif os.path.isfile(fertig_path) and stability_enabled:
+                            stability_result = self._stability_tracker.observe(full_dir_path)
+                            if stability_result == "removed":
+                                continue
+                            if stability_result != "stable":
+                                continue
+
                         if os.path.isfile(fertig_path) and not os.path.isfile(processing_path):
                             self.log.info("Neues Verzeichnis gefunden: %s", dir_name)
                         if attempt_queue_upload_folder(

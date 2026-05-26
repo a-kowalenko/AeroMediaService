@@ -3,7 +3,7 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap, QPalette, QPen
+from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap, QPalette, QPen, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
@@ -21,6 +21,7 @@ from core.signals import signals
 from core.monitor import MonitorThread, recover_stalled_upload_folders
 from core.uploader import UploaderThread
 from core.upload_queue_registry import UploadQueueRegistry
+from core.retry_upload import retry_upload_from_history, RETRYABLE_STATUSES
 from services.dropbox_client import DropboxClient
 from services.custom_api_client import CustomApiClient
 from services.email_client import EmailClient
@@ -223,6 +224,7 @@ class MainWindow(QMainWindow):
 
         # --- Signale verbinden ---
         self.connect_signals()
+        self._refresh_upload_queue_table(self.upload_registry.snapshot_dicts())
 
         # --- Threads starten ---
         self.uploader_thread.start()
@@ -336,7 +338,28 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.monitor_tab, "Monitor")
 
-        # --- Tab 2: Upload-Historie ---
+        # --- Tab 2: Warteschlange ---
+        self.queue_tab = QWidget()
+        queue_tab_layout = QVBoxLayout(self.queue_tab)
+
+        self.upload_queue_summary_label = QLabel("Keine ausstehenden Uploads.")
+        queue_tab_layout.addWidget(self.upload_queue_summary_label)
+
+        self.upload_queue_table = QTableWidget()
+        self.upload_queue_table.setColumnCount(4)
+        self.upload_queue_table.setHorizontalHeaderLabels(["#", "Ordner", "Kunde", "Status"])
+        self.upload_queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.upload_queue_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.upload_queue_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.upload_queue_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.upload_queue_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.upload_queue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.upload_queue_table.verticalHeader().setVisible(False)
+        queue_tab_layout.addWidget(self.upload_queue_table)
+
+        self._queue_tab_index = self.tabs.addTab(self.queue_tab, "Warteschlange")
+
+        # --- Tab 3: Upload-Historie ---
         self.history_tab = QWidget()
         history_layout = QVBoxLayout(self.history_tab)
 
@@ -363,6 +386,14 @@ class MainWindow(QMainWindow):
         self._history_refresh_timer.timeout.connect(self._on_history_refresh_timer_tick)
         self._history_refresh_timer.start(1000)
         self._update_history_refresh_countdown_label()
+
+        self.retry_upload_btn = QPushButton("Erneut hochladen")
+        self.retry_upload_btn.setEnabled(False)
+        self.retry_upload_btn.setToolTip(
+            "Fehlgeschlagenen oder abgebrochenen Upload aus dem Archiv erneut einreihen"
+        )
+        self.retry_upload_btn.clicked.connect(self.on_retry_upload_clicked)
+        hist_top_layout.addWidget(self.retry_upload_btn)
 
         self.delete_selected_btn = QPushButton("Ausgewählte löschen")
         self.delete_selected_btn.clicked.connect(self.delete_selected_history)
@@ -446,6 +477,7 @@ class MainWindow(QMainWindow):
         signals.upload_progress_total.connect(self.update_total_progress)
         signals.upload_status_update.connect(self.status_label.setText)
         signals.upload_job_active.connect(self._on_upload_job_active_changed)
+        signals.upload_queue_changed.connect(self._refresh_upload_queue_table)
         signals.monitoring_status_changed.connect(self.update_monitoring_status)
 
         # Upload-Fortschritt-Signale
@@ -890,20 +922,99 @@ class MainWindow(QMainWindow):
         selected_items = self.history_table.selectedItems()
         if not selected_items:
             self.detail_table.setRowCount(0)
+            self._update_retry_upload_button_state()
             return
 
         row = selected_items[0].row()
         date_item = self.history_table.item(row, 0)
         if not date_item:
             self.detail_table.setRowCount(0)
+            self._update_retry_upload_button_state()
             return
 
         item_data = date_item.data(Qt.ItemDataRole.UserRole + 1)
         if not item_data:
             self.detail_table.setRowCount(0)
+            self._update_retry_upload_button_state()
             return
 
         self.populate_detail_table(item_data)
+        self._update_retry_upload_button_state(item_data)
+
+    def _update_retry_upload_button_state(self, item_data=None):
+        if item_data is None:
+            entry_id = self.get_selected_history_id()
+            item_data = self.get_history_entry_by_id(entry_id) if entry_id else None
+        can_retry = bool(
+            item_data
+            and (item_data.get("status") or "").strip() in RETRYABLE_STATUSES
+        )
+        self.retry_upload_btn.setEnabled(can_retry)
+
+    @Slot()
+    def on_retry_upload_clicked(self):
+        entry_id = self.get_selected_history_id()
+        entry = self.get_history_entry_by_id(entry_id)
+        if not entry:
+            return
+
+        status = (entry.get("status") or "").strip()
+        if status not in RETRYABLE_STATUSES:
+            QMessageBox.warning(
+                self,
+                "Erneut hochladen",
+                f"Status „{status}“ unterstützt keinen erneuten Upload.",
+            )
+            return
+
+        active_client = self.get_active_cloud_client()
+        if active_client.get_connection_status() != "Verbunden":
+            QMessageBox.warning(
+                self,
+                "Erneut hochladen",
+                "Keine Cloud-Verbindung. Bitte zuerst verbinden.",
+            )
+            return
+
+        dir_name = entry.get("dir_name", "")
+        error_hint = (entry.get("error_msg") or "").strip()
+        confirm_lines = [f"Upload für „{dir_name}“ erneut starten?"]
+        if error_hint:
+            confirm_lines.append("")
+            confirm_lines.append(f"Letzter Fehler: {error_hint}")
+
+        reply = QMessageBox.question(
+            self,
+            "Erneut hochladen",
+            "\n".join(confirm_lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            message = retry_upload_from_history(
+                self.config,
+                entry,
+                self.upload_queue,
+                self.upload_registry,
+                self.log,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Erneut hochladen", str(exc))
+            return
+        except Exception as exc:
+            self.log.exception("Retry-Upload fehlgeschlagen: %s", exc)
+            QMessageBox.critical(
+                self,
+                "Erneut hochladen",
+                f"Upload konnte nicht erneut gestartet werden:\n{exc}",
+            )
+            return
+
+        QMessageBox.information(self, "Erneut hochladen", message)
+        self.refresh_history_table(maintain_page=True)
+        self._update_retry_upload_button_state()
 
     def populate_detail_table(self, item_data):
         """Befüllt das Detail Grid aus einem Historien-Eintrag."""
@@ -1187,6 +1298,68 @@ class MainWindow(QMainWindow):
         """Hilfsfunktion zur Formatierung von Bytes in MB."""
         mb = b / (1024 * 1024)
         return f"{mb:.1f} MB"
+
+    @staticmethod
+    def _format_queue_wait_seconds(seconds: float) -> str:
+        total = int(seconds)
+        if total < 60:
+            return f"{total} Sek."
+        minutes, secs = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes} Min." if secs == 0 else f"{minutes} Min. {secs} Sek."
+        hours, rem = divmod(minutes, 60)
+        return f"{hours} Std. {rem} Min."
+
+    @staticmethod
+    def _format_queue_status(entry: dict) -> str:
+        state = entry.get("state", "waiting")
+        wait = MainWindow._format_queue_wait_seconds(entry.get("wait_seconds", 0))
+        if state == "active":
+            return f"Aktiv · {wait}"
+        return f"Wartend · {wait}"
+
+    @Slot(object)
+    def _refresh_upload_queue_table(self, entries):
+        if entries is None:
+            entries = []
+        active_count = sum(1 for e in entries if e.get("state") == "active")
+        waiting_count = len(entries) - active_count
+        if not entries:
+            tab_title = "Warteschlange"
+            summary = "Keine ausstehenden Uploads."
+        elif active_count and waiting_count:
+            tab_title = f"Warteschlange ({len(entries)})"
+            summary = f"{active_count} aktiv, {waiting_count} wartend"
+        elif active_count:
+            tab_title = f"Warteschlange ({len(entries)})"
+            summary = f"{active_count} aktiv"
+        else:
+            tab_title = f"Warteschlange ({len(entries)})"
+            summary = f"{waiting_count} wartend"
+        self.tabs.setTabText(self._queue_tab_index, tab_title)
+        self.upload_queue_summary_label.setText(summary)
+
+        self.upload_queue_table.setRowCount(0)
+        self.upload_queue_table.clearSpans()
+        if not entries:
+            return
+
+        bold_font = QFont()
+        bold_font.setBold(True)
+        for row, entry in enumerate(entries):
+            self.upload_queue_table.insertRow(row)
+            is_active = entry.get("state") == "active"
+            cells = [
+                str(entry.get("position", row + 1)),
+                entry.get("dir_name", ""),
+                entry.get("customer_label", "—"),
+                self._format_queue_status(entry),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if is_active:
+                    item.setFont(bold_font)
+                self.upload_queue_table.setItem(row, col, item)
 
     @Slot(bool)
     def _on_upload_job_active_changed(self, active: bool):

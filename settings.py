@@ -104,6 +104,16 @@ class SettingsDialog(QDialog):
         self.scan_interval_spin.setSuffix(" Sekunden")
         monitor_layout.addRow("Scan-Intervall:", self.scan_interval_spin)
 
+        self.folder_stability_check = QCheckBox(
+            "Ordner-Stabilität vor Upload (wartet auf unveränderten Inhalt)"
+        )
+        monitor_layout.addRow("", self.folder_stability_check)
+
+        self.folder_stability_seconds_spin = QSpinBox()
+        self.folder_stability_seconds_spin.setRange(5, 300)
+        self.folder_stability_seconds_spin.setSuffix(" Sekunden")
+        monitor_layout.addRow("Stabilitätsdauer:", self.folder_stability_seconds_spin)
+
         layout.addWidget(monitor_group)
 
         layout.addStretch(1)  # Schiebt alles nach oben
@@ -494,6 +504,11 @@ class SettingsDialog(QDialog):
         self.archive_path_edit.setText(self.config.get_setting("archive_path"))
         self.log_path_edit.setText(self.config.get_setting("log_file_path"))
         self.scan_interval_spin.setValue(int(self.config.get_setting("scan_interval", 10)))
+        folder_stability_enabled_str = self.config.get_setting("folder_stability_enabled", "true")
+        self.folder_stability_check.setChecked(folder_stability_enabled_str.lower() != "false")
+        self.folder_stability_seconds_spin.setValue(
+            int(self.config.get_setting("folder_stability_seconds", 15))
+        )
 
         # Dropbox
         self.db_app_key_edit.setText(self.config.get_secret("db_app_key"))
@@ -571,6 +586,13 @@ class SettingsDialog(QDialog):
             self.config.save_setting("archive_path", self.archive_path_edit.text())
             self.config.save_setting("log_file_path", self.log_path_edit.text())
             self.config.save_setting("scan_interval", self.scan_interval_spin.value())
+            folder_stability_enabled_str = (
+                "true" if self.folder_stability_check.isChecked() else "false"
+            )
+            self.config.save_setting("folder_stability_enabled", folder_stability_enabled_str)
+            self.config.save_setting(
+                "folder_stability_seconds", self.folder_stability_seconds_spin.value()
+            )
 
             # Dropbox (Key/Secret werden nur gespeichert, nicht der Token)
             self.config.save_secret("db_app_key", self.db_app_key_edit.text())

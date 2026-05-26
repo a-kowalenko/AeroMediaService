@@ -80,6 +80,9 @@ class UploaderThread(QThread):
                 kunde: Kunde = current_queue_item['kunde']
                 dir_name = os.path.basename(local_dir_path)  # dir_name hier setzen
 
+                if self.upload_registry and local_dir_path:
+                    self.upload_registry.mark_active(local_dir_path)
+
                 self.log.info(f"Beginne Verarbeitung von: {dir_name}")
                 signals.upload_job_active.emit(True)
                 try:
