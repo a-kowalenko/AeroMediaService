@@ -1,11 +1,11 @@
 import asyncio
 import logging
 import os
-import shutil
 import queue
 import time
 
 from PySide6.QtCore import QThread
+from core.archive import archive_directory
 from core.config import ConfigManager
 from models.kunde import Kunde
 from services.base_client import BaseClient
@@ -200,7 +200,7 @@ class UploaderThread(QThread):
                     signals.upload_history_update.emit(history_data)
 
                     # 4. In Archiv-Ordner verschieben
-                    self.archive_directory(local_dir_path, "erfolg")
+                    archive_directory(self.config, local_dir_path, "erfolg", self.log)
 
                     signals.upload_status_update.emit(f"Erfolgreich: {dir_name}")
 
@@ -216,7 +216,7 @@ class UploaderThread(QThread):
                         "phone": kunde.phone if kunde else "",
                     })
                     if local_dir_path:
-                        self.archive_directory(local_dir_path, "abgebrochen")
+                        archive_directory(self.config, local_dir_path, "abgebrochen", self.log)
                 finally:
                     signals.upload_job_active.emit(False)
 
@@ -234,7 +234,7 @@ class UploaderThread(QThread):
                 # 5. Bei Fehler in Fehler-Ordner verschieben
                 # Nur archivieren, wenn local_dir_path auch einen Wert hat.
                 if local_dir_path:
-                    self.archive_directory(local_dir_path, "fehler")
+                    archive_directory(self.config, local_dir_path, "fehler", self.log)
 
                 # 6. Fehler-E-Mail senden
                 self.email_client.send_upload_failure_email(dir_name, str(e))
@@ -250,33 +250,3 @@ class UploaderThread(QThread):
                     signals.upload_status_update.emit("Warte auf nächsten Auftrag...")
 
         self.log.info("Uploader-Thread beendet.")
-
-    def archive_directory(self, local_dir_path, subfolder_name):
-        """Verschiebt das Verzeichnis unter archive_path/<subfolder_name> (z. B. erfolg, fehler, abgebrochen)."""
-        archive_base_path = self.config.get_setting("archive_path")
-        if not archive_base_path:
-            self.log.warning(f"Kein Archiv-Pfad konfiguriert. {local_dir_path} wird nicht verschoben.")
-            return
-
-        target_dir = os.path.join(archive_base_path, subfolder_name)
-        if not os.path.exists(target_dir):
-            try:
-                os.makedirs(target_dir)
-            except OSError as e:
-                self.log.error(f"Konnte {subfolder_name}-Ordner nicht erstellen: {e}")
-                return
-
-        dir_name = os.path.basename(local_dir_path)
-        destination_path = os.path.join(target_dir, dir_name)
-
-        # Sicherstellen, dass das Ziel nicht bereits existiert
-        if os.path.exists(destination_path):
-            destination_path = f"{destination_path}_{int(time.time())}"
-            self.log.warning(f"Zielpfad existiert, benenne um zu: {destination_path}")
-
-        try:
-            shutil.move(local_dir_path, destination_path)
-            remove_upload_markers(destination_path, self.log)
-            self.log.info(f"Verzeichnis verschoben nach: {destination_path}")
-        except Exception as e:
-            self.log.error(f"Konnte Verzeichnis nicht nach {destination_path} verschieben: {e}")

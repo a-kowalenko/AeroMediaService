@@ -5,6 +5,7 @@ import requests
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
 from models.kunde import Kunde
+from core.archive import handle_customer_lookup_failure, is_customer_lookup_failure
 from core.upload_markers import discard_stale_fertig_marker, marker_paths
 from core.upload_queue_registry import UploadQueueRegistry
 
@@ -214,8 +215,16 @@ def attempt_queue_upload_folder(
         })
         log.info("'%s' zur Upload-Warteschlange hinzugefügt.", dir_name)
         return True
-    except Exception:
+    except Exception as exc:
         upload_registry.unregister(full_dir_path)
+        if is_customer_lookup_failure(exc):
+            log.error(
+                "Customer-Lookup für '%s' fehlgeschlagen, verschiebe nach Archiv/fehler: %s",
+                dir_name,
+                exc,
+            )
+            handle_customer_lookup_failure(config_manager, full_dir_path, exc, log)
+            return False
         raise
 
 
@@ -259,7 +268,15 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
             log.info("Recovery: '%s' erneut in Upload-Warteschlange gelegt.", dir_name)
         except Exception as e:
             upload_registry.unregister(full_dir_path)
-            log.error("Recovery: Verzeichnis '%s' konnte nicht wiederaufgenommen werden: %s", dir_name, e)
+            if is_customer_lookup_failure(e):
+                log.error(
+                    "Recovery: Customer-Lookup für '%s' fehlgeschlagen, verschiebe nach Archiv/fehler: %s",
+                    dir_name,
+                    e,
+                )
+                handle_customer_lookup_failure(config_manager, full_dir_path, e, log)
+            else:
+                log.error("Recovery: Verzeichnis '%s' konnte nicht wiederaufgenommen werden: %s", dir_name, e)
 
     if recovered:
         log.info("Recovery: %s unterbrochene Aufträge in die Warteschlange gelegt.", recovered)
