@@ -15,8 +15,8 @@ def _normalize_marker_type(raw_type):
     return value
 
 
-def parse_marker_payload(marker_content):
-    """Validiert Marker-Inhalt und liefert API-Query-Parameter plus Lookup-Modus."""
+def _load_marker_data(marker_content):
+    """Parst Marker-JSON und liefert das Wurzelobjekt."""
     if not marker_content:
         raise ValueError("Marker-Datei ist leer.")
 
@@ -25,6 +25,24 @@ def parse_marker_payload(marker_content):
     except json.JSONDecodeError as exc:
         raise ValueError(f"Marker-Datei ist kein gültiges JSON: {exc}") from exc
 
+    if not isinstance(data, dict):
+        raise ValueError("Marker-JSON muss ein Objekt sein.")
+    return data
+
+
+def _has_api_lookup_fields(data):
+    return (
+        ("kunden_id_hash" in data and "booking_id_hash" in data)
+        or ("kunden_id" in data and "booking_id" in data)
+    )
+
+
+def _has_direct_contact_fields(data):
+    return "vorname" in data and "nachname" in data and "email" in data
+
+
+def parse_api_marker_data(data):
+    """Validiert API-Marker-Daten und liefert Query-Parameter plus Lookup-Modus."""
     marker_type = _normalize_marker_type(data.get("type"))
     if not marker_type:
         raise ValueError("Pflichtfeld 'type' fehlt.")
@@ -46,6 +64,55 @@ def parse_marker_payload(marker_content):
     raise ValueError(
         "Ungültiges Marker-Format. Erwartet entweder "
         "'kunden_id_hash' + 'booking_id_hash' oder 'kunden_id' + 'booking_id'."
+    )
+
+
+def parse_marker_payload(marker_content):
+    """Validiert Marker-Inhalt und liefert API-Query-Parameter plus Lookup-Modus."""
+    return parse_api_marker_data(_load_marker_data(marker_content))
+
+
+def build_kunde_from_marker(data):
+    """Mappt Direkt-Marker (Dropbox) auf Kunde-Modell."""
+    for field in ("vorname", "nachname", "email"):
+        if not str(data.get(field, "")).strip():
+            raise ValueError(f"Pflichtfeld '{field}' fehlt oder ist leer.")
+
+    phone = str(data.get("telefon", "")).strip() or None
+    return Kunde(
+        first_name=str(data["vorname"]).strip(),
+        last_name=str(data["nachname"]).strip(),
+        email=str(data["email"]).strip(),
+        phone=phone,
+        customer_number=None,
+        booking_number=None,
+        type=None,
+    )
+
+
+def resolve_kunde_from_marker(config_manager, marker_content):
+    """
+    Löst Marker-Inhalt zu einem Kunde-Objekt auf.
+    API-Lookup (type + IDs) oder Direktformat (vorname/nachname/email) bei Dropbox.
+    """
+    data = _load_marker_data(marker_content)
+
+    if _has_api_lookup_fields(data):
+        query_params, lookup_mode = parse_api_marker_data(data)
+        customer = fetch_customer_data(config_manager, query_params, lookup_mode)
+        return build_kunde_from_customer(customer)
+
+    if _has_direct_contact_fields(data):
+        if config_manager.get_setting("selected_cloud_service", "dropbox") != "dropbox":
+            raise ValueError(
+                "Direktes Kundenformat (vorname/nachname/email) ist nur bei Dropbox gültig."
+            )
+        return build_kunde_from_marker(data)
+
+    raise ValueError(
+        "Ungültiges Marker-Format. Erwartet entweder "
+        "'kunden_id_hash' + 'booking_id_hash', 'kunden_id' + 'booking_id' "
+        "oder bei Dropbox 'vorname' + 'nachname' + 'email'."
     )
 
 
@@ -123,14 +190,8 @@ def recover_stalled_upload_folders(config_manager, upload_queue, log):
         try:
             with open(processing_marker, "r", encoding="utf-8") as marker_file:
                 marker_raw = marker_file.read().strip()
-            lookup_params, lookup_mode = parse_marker_payload(marker_raw)
-            log.info(
-                "Recovery: unterbrochener Auftrag '%s', Customer-Lookup (%s).",
-                dir_name,
-                lookup_mode,
-            )
-            customer = fetch_customer_data(config_manager, lookup_params, lookup_mode)
-            kunde = build_kunde_from_customer(customer)
+            kunde = resolve_kunde_from_marker(config_manager, marker_raw)
+            log.info("Recovery: unterbrochener Auftrag '%s', Kundendaten geladen.", dir_name)
             upload_queue.put({
                 "dir_path": full_dir_path,
                 "kunde": kunde,
@@ -184,6 +245,9 @@ class MonitorThread(QThread):
     def _build_kunde_from_customer(self, customer):
         return build_kunde_from_customer(customer)
 
+    def _resolve_kunde_from_marker(self, marker_content):
+        return resolve_kunde_from_marker(self.config, marker_content)
+
     def run(self):
         """Die Hauptschleife des Monitor-Threads."""
         self._is_running = True
@@ -224,11 +288,7 @@ class MonitorThread(QThread):
                                 marker_raw = marker_file.read().strip()
                             self.log.debug(f"Marker-Daten für '{dir_name}': {marker_raw}")
 
-                            lookup_params, lookup_mode = self._parse_marker_payload(marker_raw)
-                            self.log.info(f"Starte Customer-Lookup für '{dir_name}' mit Variante '{lookup_mode}'.")
-
-                            customer = self._fetch_customer_data(lookup_params, lookup_mode)
-                            kunde = self._build_kunde_from_customer(customer)
+                            kunde = self._resolve_kunde_from_marker(marker_raw)
                             self.log.info(f"Kundendaten erfolgreich geladen für '{dir_name}': {kunde}")
 
                             # Wir fügen den Pfad direkt zur Queue hinzu.

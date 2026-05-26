@@ -89,7 +89,7 @@ class SettingsDialog(QDialog):
         self.archive_path_edit = QLineEdit()
         self.archive_path_button = QPushButton("Durchsuchen...")
         self.archive_path_button.clicked.connect(lambda: self.select_directory(self.archive_path_edit))
-        monitor_layout.addRow("Archiv-Ordner (für 'erfolgreich' / 'fehler'):",
+        monitor_layout.addRow("Archiv-Ordner (erfolg / fehler / abgebrochen):",
                               self.create_path_widget(self.archive_path_edit, self.archive_path_button))
 
         # Log-Ordner

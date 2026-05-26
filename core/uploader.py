@@ -210,6 +210,8 @@ class UploaderThread(QThread):
                         "email": kunde.email if kunde else "",
                         "phone": kunde.phone if kunde else "",
                     })
+                    if local_dir_path:
+                        self.archive_directory(local_dir_path, "abgebrochen")
                 finally:
                     signals.upload_job_active.emit(False)
 
@@ -243,7 +245,7 @@ class UploaderThread(QThread):
         self.log.info("Uploader-Thread beendet.")
 
     def archive_directory(self, local_dir_path, subfolder_name):
-        """Verschiebt das verarbeitete Verzeichnis in den Archiv- oder Fehlerordner."""
+        """Verschiebt das Verzeichnis unter archive_path/<subfolder_name> (z. B. erfolg, fehler, abgebrochen)."""
         archive_base_path = self.config.get_setting("archive_path")
         if not archive_base_path:
             self.log.warning(f"Kein Archiv-Pfad konfiguriert. {local_dir_path} wird nicht verschoben.")
