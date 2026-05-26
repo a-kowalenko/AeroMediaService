@@ -15,6 +15,18 @@ class EmailClient:
 
     def send_email(self, to_recipient, subject, body):
         """Stellt die Verbindung zum SMTP-Server her und versendet die E-Mail."""
+        original_recipient = to_recipient
+        sandbox_str = self.config.get_setting("smtp_sandbox_mode", "false")
+        if sandbox_str.lower() == "true":
+            fallback = self.config.get_setting("smtp_fallback_recipient")
+            if not fallback:
+                self.log.error("E-Mail-Versand fehlgeschlagen: Sandbox-Modus aktiv, aber kein Fallback-Empfänger konfiguriert.")
+                return False
+            if original_recipient != fallback:
+                self.log.info(
+                    f"Sandbox-Modus: E-Mail für {original_recipient} wird an Fallback {fallback} gesendet."
+                )
+            to_recipient = fallback
 
         # Lade SMTP-Einstellungen
         host = self.config.get_setting("smtp_host")

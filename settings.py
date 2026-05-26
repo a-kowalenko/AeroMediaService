@@ -24,7 +24,7 @@ class SettingsDialog(QDialog):
                  app_version: str, latest_version_info: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Einstellungen")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(700)
 
         self.config = config_manager
         self.client = client
@@ -273,6 +273,11 @@ class SettingsDialog(QDialog):
         self.smtp_fallback_recipient_edit = QLineEdit()
         sender_layout.addRow("Fallback-Empfänger (für Status-Mails):", self.smtp_fallback_recipient_edit)
 
+        self.smtp_sandbox_check = QCheckBox(
+            "Sandbox-Modus aktivieren (alle E-Mails gehen an den Fallback-Empfänger)"
+        )
+        sender_layout.addRow("Test-Modus:", self.smtp_sandbox_check)
+
         layout.addWidget(sender_group)
 
         layout.addStretch(1)  # Schiebt alles nach oben
@@ -371,11 +376,11 @@ class SettingsDialog(QDialog):
         switch_layout = QFormLayout(switch_group)
 
         self.version_hint_label = QLabel(
-            "Verfügbare stabile Versionen ab v0.2.3.0."
+            "Verfügbare stabile Versionen"
         )
         switch_layout.addRow(self.version_hint_label)
 
-        self.show_prereleases_check = QCheckBox("Prereleases anzeigen (ab v0.2.3.0)")
+        self.show_prereleases_check = QCheckBox("Prereleases anzeigen")
         self.show_prereleases_check.toggled.connect(self.on_show_prereleases_toggled)
         switch_layout.addRow(self.show_prereleases_check)
 
@@ -525,6 +530,8 @@ class SettingsDialog(QDialog):
         self.smtp_sender_addr_edit.setText(self.config.get_setting("smtp_sender_addr"))
         self.smtp_sender_name_edit.setText(self.config.get_setting("smtp_sender_name", "Dropbox Uploader"))
         self.smtp_fallback_recipient_edit.setText(self.config.get_setting("smtp_fallback_recipient"))
+        smtp_sandbox_mode_str = self.config.get_setting("smtp_sandbox_mode", "false")
+        self.smtp_sandbox_check.setChecked(smtp_sandbox_mode_str.lower() == "true")
 
         # SMS
         self.sms_api_key_edit.setText(self.config.get_secret("seven_api_key"))
@@ -598,6 +605,8 @@ class SettingsDialog(QDialog):
             self.config.save_setting("smtp_sender_addr", self.smtp_sender_addr_edit.text())
             self.config.save_setting("smtp_sender_name", self.smtp_sender_name_edit.text())
             self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
+            smtp_sandbox_mode_str = "true" if self.smtp_sandbox_check.isChecked() else "false"
+            self.config.save_setting("smtp_sandbox_mode", smtp_sandbox_mode_str)
 
             # SMS
             self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
@@ -1029,8 +1038,8 @@ class SettingsDialog(QDialog):
     def on_show_prereleases_toggled(self, checked):
         """Lädt die Versionen neu, wenn die Prerelease-Option geändert wird."""
         if checked:
-            self.version_hint_label.setText("Verfügbare stabile Versionen und Prereleases ab v0.2.3.0.")
+            self.version_hint_label.setText("Verfügbare stabile Versionen und Prereleases")
         else:
-            self.version_hint_label.setText("Verfügbare stabile Versionen ab v0.2.3.0.")
+            self.version_hint_label.setText("Verfügbare stabile Versionen")
         self.load_switchable_versions()
 

@@ -1,3 +1,4 @@
+import os
 import sys
 import logging
 import queue
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter,
-    QDialog, QDialogButtonBox
+    QDialog, QDialogButtonBox, QCheckBox
 )
 
 from PySide6.QtCore import QCoreApplication, QProcess, QThread, QTimer, QRectF, Slot, Qt, Signal
@@ -166,6 +167,9 @@ class MainWindow(QMainWindow):
         # Logging MUSS nach ConfigManager initialisiert werden
         setup_logging(self.config)
         self.log = logging.getLogger(__name__)
+        self._last_log_file_path = os.path.normpath(
+            self.config.get_setting("log_file_path", ".") or "."
+        )
         self.log.info("Anwendung wird gestartet...")
 
         self.upload_queue = queue.Queue()
@@ -253,6 +257,13 @@ class MainWindow(QMainWindow):
         self.status_light.setToolTip(
             "Status:\nRot: Nicht verbunden\nGelb: Verbunden, Monitoring aus\nGrün: Verbunden, Monitoring aktiv")
 
+        self.autoscroll_check = QCheckBox("Auto-Scroll")
+        self.autoscroll_check.setToolTip(
+            "Log-Anzeige bei neuen Einträgen automatisch nach unten scrollen")
+        autoscroll_enabled = str(self.config.get_setting("monitor_autoscroll", "true")).lower() != "false"
+        self.autoscroll_check.setChecked(autoscroll_enabled)
+        self.autoscroll_check.toggled.connect(self._on_autoscroll_toggled)
+
         self.settings_button = QPushButton("Einstellungen")
         self.settings_button.clicked.connect(self.open_settings)
 
@@ -261,6 +272,7 @@ class MainWindow(QMainWindow):
 
         button_layout.addWidget(self.monitor_button)
         button_layout.addWidget(self.status_light)
+        button_layout.addWidget(self.autoscroll_check)
         button_layout.addStretch()
         button_layout.addWidget(self.settings_button)
         button_layout.addWidget(self.restart_button)
@@ -518,8 +530,13 @@ class MainWindow(QMainWindow):
         formatted_msg = message.replace('\n', '<br>')
         html_message = f"<span style='color:{color};'>{formatted_msg}</span>"
         self.log_display.append(html_message)
-        # Auto-Scroll
-        self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+        if self.autoscroll_check.isChecked():
+            scrollbar = self.log_display.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    @Slot(bool)
+    def _on_autoscroll_toggled(self, checked):
+        self.config.save_setting("monitor_autoscroll", "true" if checked else "false")
 
     @Slot(dict)
     def on_history_update(self, data):
@@ -1118,10 +1135,10 @@ class MainWindow(QMainWindow):
         if self.monitor_thread:
             self.monitor_thread.wake_up()
 
-        # Logging neu konfigurieren, falls sich der Pfad geändert hat
-        # (Einfacher Ansatz: Logging beim Start konfigurieren.
-        # Für dynamische Änderung wäre mehr Aufwand nötig, z.B. Handler entfernen/hinzufügen)
-        self.log.warning("Log-Pfad-Änderungen erfordern einen Neustart.")
+        new_log_path = os.path.normpath(self.config.get_setting("log_file_path", ".") or ".")
+        if new_log_path != self._last_log_file_path:
+            self.log.warning("Log-Pfad-Änderungen erfordern einen Neustart.")
+            self._last_log_file_path = new_log_path
 
     @Slot()
     def open_settings(self):
