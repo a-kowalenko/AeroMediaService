@@ -11,7 +11,15 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl, Slot
 from core.config import ConfigManager
 from services.base_client import BaseClient
-from utils.link_shortener import LinkShortener
+from utils.link_shortener import (
+    EXPIRES_PRESET_14D,
+    EXPIRES_PRESET_1M,
+    EXPIRES_PRESET_1Y,
+    EXPIRES_PRESET_3M,
+    EXPIRES_PRESET_6M,
+    EXPIRES_PRESET_PERMANENT,
+    LinkShortener,
+)
 from utils.updater import UpdateProgressDialog, initialize_version_list_loader
 
 
@@ -231,6 +239,20 @@ class SettingsDialog(QDialog):
 
         return widget
 
+    def _populate_shortener_expires_combo(self):
+        """Füllt die Gültigkeits-Auswahl für den Link-Shortener."""
+        self.shortener_expires_combo.clear()
+        options = [
+            ("Permanent", EXPIRES_PRESET_PERMANENT),
+            ("14 Tage", EXPIRES_PRESET_14D),
+            ("1 Monat", EXPIRES_PRESET_1M),
+            ("3 Monate", EXPIRES_PRESET_3M),
+            ("6 Monate", EXPIRES_PRESET_6M),
+            ("1 Jahr", EXPIRES_PRESET_1Y),
+        ]
+        for label, key in options:
+            self.shortener_expires_combo.addItem(label, key)
+
     def create_shortener_tab(self):
         """Erstellt den Tab 'Link-Shortener'."""
         widget = QWidget()
@@ -253,11 +275,9 @@ class SettingsDialog(QDialog):
         self.shortener_api_key_edit.setPlaceholderText("key_<id>.<secret>")
         form.addRow("API-Key:", self.shortener_api_key_edit)
 
-        self.shortener_expires_edit = QLineEdit()
-        self.shortener_expires_edit.setPlaceholderText(
-            "Optional, ISO-8601 (z. B. 2026-12-31T23:59:59Z); leer = permanent"
-        )
-        form.addRow("Ablauf (expires_at):", self.shortener_expires_edit)
+        self.shortener_expires_combo = QComboBox()
+        self._populate_shortener_expires_combo()
+        form.addRow("Gültigkeit ab Erstellung:", self.shortener_expires_combo)
 
         hint = QLabel(
             "API-Key mit Permission <b>shorten</b> (Bearer <code>key_…secret</code>). "
@@ -476,7 +496,7 @@ class SettingsDialog(QDialog):
                 override_base=base,
                 override_key=api_key,
                 override_enabled=True,
-                override_expires=self.shortener_expires_edit.text().strip() or None,
+                override_preset=self.shortener_expires_combo.currentData(),
             )
             if result != test_url:
                 QMessageBox.information(
@@ -598,9 +618,11 @@ class SettingsDialog(QDialog):
             api_key = self.config.get_secret("skylink_api_key") or ""
         self.shortener_base_edit.setText(base_url or "")
         self.shortener_api_key_edit.setText(api_key or "")
-        self.shortener_expires_edit.setText(
-            self.config.get_setting("shortener_expires_at", "") or ""
+        preset = self.config.get_setting(
+            "shortener_expires_preset", EXPIRES_PRESET_PERMANENT
         )
+        idx = self.shortener_expires_combo.findData(preset)
+        self.shortener_expires_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
         # Custom API
         self.custom_api_url_edit.setText(self.config.get_secret("custom_api_url"))
@@ -690,7 +712,8 @@ class SettingsDialog(QDialog):
             self.config.save_secret("shortener_base_url", self.shortener_base_edit.text().strip())
             self.config.save_secret("shortener_api_key", self.shortener_api_key_edit.text().strip())
             self.config.save_setting(
-                "shortener_expires_at", self.shortener_expires_edit.text().strip()
+                "shortener_expires_preset",
+                self.shortener_expires_combo.currentData() or EXPIRES_PRESET_PERMANENT,
             )
 
             # Custom API

@@ -1,6 +1,58 @@
+import calendar
 import logging
+from datetime import datetime, timedelta, timezone
 
 import requests
+
+# Preset-Keys für shortener_expires_preset (Settings-ComboBox)
+EXPIRES_PRESET_PERMANENT = "permanent"
+EXPIRES_PRESET_14D = "14d"
+EXPIRES_PRESET_1M = "1m"
+EXPIRES_PRESET_3M = "3m"
+EXPIRES_PRESET_6M = "6m"
+EXPIRES_PRESET_1Y = "1y"
+
+EXPIRES_PRESET_KEYS = (
+    EXPIRES_PRESET_PERMANENT,
+    EXPIRES_PRESET_14D,
+    EXPIRES_PRESET_1M,
+    EXPIRES_PRESET_3M,
+    EXPIRES_PRESET_6M,
+    EXPIRES_PRESET_1Y,
+)
+
+
+def expires_at_from_preset(preset: str) -> str | None:
+    """
+    Berechnet expires_at (ISO-8601 UTC) ab jetzt.
+    None = permanent (Feld wird nicht gesendet).
+    """
+    key = (preset or EXPIRES_PRESET_PERMANENT).strip().lower()
+    if key == EXPIRES_PRESET_PERMANENT or key not in EXPIRES_PRESET_KEYS:
+        return None
+
+    now = datetime.now(timezone.utc)
+    if key == EXPIRES_PRESET_14D:
+        exp = now + timedelta(days=14)
+    else:
+        months = {
+            EXPIRES_PRESET_1M: 1,
+            EXPIRES_PRESET_3M: 3,
+            EXPIRES_PRESET_6M: 6,
+            EXPIRES_PRESET_1Y: 12,
+        }[key]
+        exp = _add_calendar_months(now, months)
+
+    return exp.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _add_calendar_months(dt: datetime, months: int) -> datetime:
+    """Addiert Kalendermonate (z. B. 31. Jan. + 1 Monat → 28./29. Feb.)."""
+    m = dt.month - 1 + months
+    year = dt.year + m // 12
+    month = m % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
 
 
 class LinkShortener:
@@ -16,15 +68,17 @@ class LinkShortener:
         raw = self.config.get_setting("link_shortener_enabled", "false")
         return str(raw).lower() == "true"
 
-    def _resolve_credentials(self, override_base=None, override_key=None, override_expires=None):
+    def _resolve_preset(self, override_preset=None) -> str:
+        if override_preset is not None:
+            return str(override_preset).strip().lower() or EXPIRES_PRESET_PERMANENT
+        return (
+            self.config.get_setting("shortener_expires_preset", EXPIRES_PRESET_PERMANENT)
+            or EXPIRES_PRESET_PERMANENT
+        ).strip().lower()
+
+    def _resolve_credentials(self, override_base=None, override_key=None):
         base = (override_base or "").strip() or self.config.get_secret("shortener_base_url")
         api_key = (override_key or "").strip() or self.config.get_secret("shortener_api_key")
-        expires = (
-            override_expires
-            if override_expires is not None
-            else self.config.get_setting("shortener_expires_at", "")
-        )
-        expires = (expires or "").strip()
 
         if not base or not api_key:
             legacy_url = self.config.get_secret("skylink_api_url")
@@ -34,7 +88,7 @@ class LinkShortener:
             if legacy_url and not base:
                 base = self._legacy_url_to_base(legacy_url)
 
-        return base, api_key, expires
+        return base, api_key
 
     @staticmethod
     def _legacy_url_to_base(api_url: str) -> str:
@@ -52,7 +106,7 @@ class LinkShortener:
         override_base=None,
         override_key=None,
         override_enabled=None,
-        override_expires=None,
+        override_preset=None,
     ):
         """Kürzt eine URL; bei Fehler oder deaktiviertem Shortener die Original-URL."""
 
@@ -60,12 +114,13 @@ class LinkShortener:
             self.log.debug("Link-Shortener deaktiviert, überspringe Kürzen.")
             return long_url
 
-        base, api_key, expires = self._resolve_credentials(
-            override_base, override_key, override_expires
-        )
+        base, api_key = self._resolve_credentials(override_base, override_key)
         if not base or not api_key:
             self.log.debug("Shortener Basis-URL oder API-Key fehlt, überspringe Kürzen.")
             return long_url
+
+        preset = self._resolve_preset(override_preset)
+        expires_at = expires_at_from_preset(preset)
 
         endpoint = f"{base.rstrip('/')}/api/shorten"
         self.log.info("Versuche, URL zu kürzen: %s", long_url)
@@ -76,8 +131,8 @@ class LinkShortener:
             "Authorization": f"Bearer {api_key}",
         }
         body = {"url": long_url}
-        if expires:
-            body["expires_at"] = expires
+        if expires_at:
+            body["expires_at"] = expires_at
 
         try:
             response = requests.post(endpoint, json=body, headers=headers, timeout=30)
