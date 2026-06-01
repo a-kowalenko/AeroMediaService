@@ -11,13 +11,14 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl, Slot
 from core.config import ConfigManager
 from services.base_client import BaseClient
+from utils.link_shortener import LinkShortener
 from utils.updater import UpdateProgressDialog, initialize_version_list_loader
 
 
 class SettingsDialog(QDialog):
     """
     Der Einstellungsdialog, der dem Benutzer die Konfiguration
-    der Anwendung in Tabs (Allgemein, Dropbox, E-Mail, SMS) ermöglicht.
+    der Anwendung in Tabs (Allgemein, Cloud, E-Mail, SMS, Link-Shortener, Extras) ermöglicht.
     """
 
     def __init__(self, config_manager: ConfigManager, client: BaseClient,
@@ -44,6 +45,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.create_cloud_tab(), "Cloud-Dienst")
         self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP)")
         self.tabs.addTab(self.create_sms_tab(), "SMS-Dienst")
+        self.tabs.addTab(self.create_shortener_tab(), "Link-Shortener")
         self.tabs.addTab(self.create_extras_tab(), "Extras")
 
         # Standard-Buttons (Speichern, Abbrechen)
@@ -176,13 +178,6 @@ class SettingsDialog(QDialog):
         self.dropbox_group.setLayout(db_layout)
         layout.addWidget(self.dropbox_group)
 
-        # --- SkyLink Shortener Einstellungen (derzeit ausgeblendet) ---
-        self.skylink_group = QGroupBox("SkyLink API (Link Shortener)")
-        skylink_layout = QFormLayout()
-
-        self.skylink_url_edit = QLineEdit()
-        self.skylink_url_edit.setPlaceholderText("z.B. https://skydive.de/api/create")
-        skylink_layout.addRow("SkyLink API URL:", self.skylink_url_edit)
         # --- Custom API Einstellungen ---
         self.custom_api_group = QGroupBox("Custom API-Einstellungen")
         custom_api_layout = QFormLayout()
@@ -232,16 +227,54 @@ class SettingsDialog(QDialog):
         self.custom_api_group.setLayout(custom_api_layout)
         layout.addWidget(self.custom_api_group)
 
-
-        self.skylink_key_edit = QLineEdit()
-        self.skylink_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        skylink_layout.addRow("SkyLink API Key:", self.skylink_key_edit)
-
-        self.skylink_group.setLayout(skylink_layout)
-        self.skylink_group.setVisible(False)
-
         layout.addStretch(1)  # Schiebt alles nach oben
 
+        return widget
+
+    def create_shortener_tab(self):
+        """Erstellt den Tab 'Link-Shortener'."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        shortener_group = QGroupBox("Link-Shortener (vor E-Mail/SMS)")
+        form = QFormLayout(shortener_group)
+
+        self.shortener_enabled_check = QCheckBox(
+            "Freigabe-Links vor dem Versand kürzen"
+        )
+        form.addRow("", self.shortener_enabled_check)
+
+        self.shortener_base_edit = QLineEdit()
+        self.shortener_base_edit.setPlaceholderText("z.B. https://skydive-media.de")
+        form.addRow("Basis-URL:", self.shortener_base_edit)
+
+        self.shortener_api_key_edit = QLineEdit()
+        self.shortener_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.shortener_api_key_edit.setPlaceholderText("key_<id>.<secret>")
+        form.addRow("API-Key:", self.shortener_api_key_edit)
+
+        self.shortener_expires_edit = QLineEdit()
+        self.shortener_expires_edit.setPlaceholderText(
+            "Optional, ISO-8601 (z. B. 2026-12-31T23:59:59Z); leer = permanent"
+        )
+        form.addRow("Ablauf (expires_at):", self.shortener_expires_edit)
+
+        hint = QLabel(
+            "API-Key mit Permission <b>shorten</b> (Bearer <code>key_…secret</code>). "
+            "Endpoint: <code>POST {Basis-URL}/api/shorten</code>"
+        )
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+
+        test_layout = QHBoxLayout()
+        self.shortener_test_button = QPushButton("Verbindung testen")
+        self.shortener_test_button.clicked.connect(self.test_shortener_connection)
+        test_layout.addWidget(self.shortener_test_button)
+        test_layout.addStretch(1)
+        form.addRow("", test_layout)
+
+        layout.addWidget(shortener_group)
+        layout.addStretch(1)
         return widget
 
     def create_email_tab(self):
@@ -422,6 +455,44 @@ class SettingsDialog(QDialog):
         return widget
 
     @Slot()
+    def test_shortener_connection(self):
+        """Testet den Link-Shortener mit den aktuellen Formularwerten."""
+        base = self.shortener_base_edit.text().strip()
+        api_key = self.shortener_api_key_edit.text().strip()
+        if not base or not api_key:
+            QMessageBox.warning(
+                self,
+                "Link-Shortener",
+                "Bitte Basis-URL und API-Key eintragen.",
+            )
+            return
+
+        self.shortener_test_button.setEnabled(False)
+        try:
+            shortener = LinkShortener(self.config)
+            test_url = "https://example.com/aero-media-shortener-test"
+            result = shortener.shorten(
+                test_url,
+                override_base=base,
+                override_key=api_key,
+                override_enabled=True,
+                override_expires=self.shortener_expires_edit.text().strip() or None,
+            )
+            if result != test_url:
+                QMessageBox.information(
+                    self,
+                    "Link-Shortener",
+                    f"Test erfolgreich.\n\nKurzlink:\n{result}",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Link-Shortener",
+                    "Kürzen fehlgeschlagen. Details stehen im Log.",
+                )
+        finally:
+            self.shortener_test_button.setEnabled(True)
+
     def refresh_seven_balance(self):
         """Ruft die aktuelle Balance von Seven.io ab."""
         import requests
@@ -514,9 +585,22 @@ class SettingsDialog(QDialog):
         self.db_app_key_edit.setText(self.config.get_secret("db_app_key"))
         self.db_app_secret_edit.setText(self.config.get_secret("db_app_secret"))
 
-        # SkyLink (ausgeblendet)
-        self.skylink_url_edit.setText(self.config.get_secret("skylink_api_url"))
-        self.skylink_key_edit.setText(self.config.get_secret("skylink_api_key"))
+        # Link-Shortener
+        shortener_enabled = self.config.get_setting("link_shortener_enabled", "false")
+        self.shortener_enabled_check.setChecked(shortener_enabled.lower() == "true")
+        base_url = self.config.get_secret("shortener_base_url")
+        api_key = self.config.get_secret("shortener_api_key")
+        if not base_url:
+            legacy_url = self.config.get_secret("skylink_api_url")
+            if legacy_url:
+                base_url = LinkShortener._legacy_url_to_base(legacy_url)
+        if not api_key:
+            api_key = self.config.get_secret("skylink_api_key") or ""
+        self.shortener_base_edit.setText(base_url or "")
+        self.shortener_api_key_edit.setText(api_key or "")
+        self.shortener_expires_edit.setText(
+            self.config.get_setting("shortener_expires_at", "") or ""
+        )
 
         # Custom API
         self.custom_api_url_edit.setText(self.config.get_secret("custom_api_url"))
@@ -598,7 +682,16 @@ class SettingsDialog(QDialog):
             self.config.save_secret("db_app_key", self.db_app_key_edit.text())
             self.config.save_secret("db_app_secret", self.db_app_secret_edit.text())
 
-            # SkyLink (ausgeblendet, keine Änderungen speichern)
+            # Link-Shortener
+            shortener_enabled_str = (
+                "true" if self.shortener_enabled_check.isChecked() else "false"
+            )
+            self.config.save_setting("link_shortener_enabled", shortener_enabled_str)
+            self.config.save_secret("shortener_base_url", self.shortener_base_edit.text().strip())
+            self.config.save_secret("shortener_api_key", self.shortener_api_key_edit.text().strip())
+            self.config.save_setting(
+                "shortener_expires_at", self.shortener_expires_edit.text().strip()
+            )
 
             # Custom API
             self.config.save_secret("custom_api_url", self.custom_api_url_edit.text())
@@ -663,12 +756,10 @@ class SettingsDialog(QDialog):
         if self.radio_dropbox.isChecked():
             self.dropbox_group.setVisible(True)
             self.custom_api_group.setVisible(False)
-            self.skylink_group.setVisible(False)
             self.log.info("Cloud-Dienst gewechselt zu: Dropbox")
         elif self.radio_custom_api.isChecked():
             self.dropbox_group.setVisible(False)
             self.custom_api_group.setVisible(True)
-            self.skylink_group.setVisible(False)
             self.log.info("Cloud-Dienst gewechselt zu: Custom API")
 
     def update_dropbox_status(self):
