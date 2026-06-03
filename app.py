@@ -1256,11 +1256,14 @@ class MainWindow(QMainWindow):
         """Öffnet den Einstellungsdialog."""
         self.log.debug("Öffne Einstellungsdialog...")
 
-        dialog = SettingsDialog(self.config,
-                                self.db_client,
-                                APP_VERSION,
-                                self.latest_version_info,
-                                self)
+        dialog = SettingsDialog(
+            self.config,
+            self.db_client,
+            APP_VERSION,
+            self.latest_version_info,
+            self,
+            custom_api_client=self.custom_api_client,
+        )
 
         # Verbinde das Signal, um Update-Status zu empfangen
         self.update_check_finished_signal.connect(dialog.on_update_check_finished)

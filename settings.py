@@ -11,6 +11,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl, Slot
 from core.config import ConfigManager
 from services.base_client import BaseClient
+from services.custom_api_client import CUSTOM_DB_APP_KEY, CUSTOM_DB_APP_SECRET
 from utils.link_shortener import (
     EXPIRES_PRESET_14D,
     EXPIRES_PRESET_1M,
@@ -30,13 +31,17 @@ class SettingsDialog(QDialog):
     """
 
     def __init__(self, config_manager: ConfigManager, client: BaseClient,
-                 app_version: str, latest_version_info: str, parent=None):
+                 app_version: str, latest_version_info: str, parent=None,
+                 custom_api_client=None):
         super().__init__(parent)
         self.setWindowTitle("Einstellungen")
         self.setMinimumWidth(700)
 
         self.config = config_manager
         self.client = client
+        self.custom_api_client = custom_api_client
+        if self.custom_api_client is None and parent is not None:
+            self.custom_api_client = getattr(parent, "custom_api_client", None)
         self.log = logging.getLogger(__name__)
 
         # Versionsinformationen speichern
@@ -68,6 +73,7 @@ class SettingsDialog(QDialog):
 
         # 2. Initialen Status setzen (fragt API 1x ab)
         self.update_dropbox_status()
+        self.update_custom_dropbox_status()
 
         # 3. Initiale Sichtbarkeit der Cloud-Gruppen setzen
         self.on_cloud_service_changed()
@@ -223,8 +229,34 @@ class SettingsDialog(QDialog):
 
         self.custom_api_mode_combo = QComboBox()
         self.custom_api_mode_combo.addItem("Proxy Session Upload (bestehend)", "proxied_session")
-        self.custom_api_mode_combo.addItem("Direct Dropbox Upload + client-complete (neu)", "direct_dropbox_complete")
+        self.custom_api_mode_combo.addItem("Dropbox Upload + Manifest v1.1", "direct_dropbox_complete")
         custom_api_layout.addRow("Upload-Modus:", self.custom_api_mode_combo)
+
+        self.custom_dropbox_group = QGroupBox("Dropbox für Upload (Manifest v1.1, separates Konto)")
+        custom_db_layout = QFormLayout()
+
+        self.custom_db_app_key_edit = QLineEdit()
+        self.custom_db_app_key_edit.textChanged.connect(self.update_custom_dropbox_connect_button)
+        custom_db_layout.addRow("App Key:", self.custom_db_app_key_edit)
+
+        self.custom_db_app_secret_edit = QLineEdit()
+        self.custom_db_app_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.custom_db_app_secret_edit.textChanged.connect(self.update_custom_dropbox_connect_button)
+        custom_db_layout.addRow("App Secret:", self.custom_db_app_secret_edit)
+
+        custom_db_dev_link = QLabel(
+            '<a href="https://www.dropbox.com/developers/apps">Dropbox Developer Console öffnen</a>'
+        )
+        custom_db_dev_link.setOpenExternalLinks(True)
+        custom_db_layout.addRow("", custom_db_dev_link)
+
+        self.custom_db_connect_button = QPushButton("Mit Dropbox verbinden (Upload-Konto)")
+        self.custom_db_connect_button.clicked.connect(self.toggle_custom_dropbox_connection)
+        self.custom_db_status_label = QLabel("Status: Unbekannt")
+        custom_db_layout.addRow(self.custom_db_connect_button, self.custom_db_status_label)
+
+        self.custom_dropbox_group.setLayout(custom_db_layout)
+        custom_api_layout.addRow(self.custom_dropbox_group)
 
         # Verbindungs-Steuerung für Custom API
         self.custom_api_connect_button = QPushButton("Mit Custom API verbinden")
@@ -636,6 +668,9 @@ class SettingsDialog(QDialog):
         idx = self.custom_api_mode_combo.findData(custom_mode)
         self.custom_api_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
+        self.custom_db_app_key_edit.setText(self.config.get_secret(CUSTOM_DB_APP_KEY) or "")
+        self.custom_db_app_secret_edit.setText(self.config.get_secret(CUSTOM_DB_APP_SECRET) or "")
+
         # Cloud-Dienst Auswahl
         selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
         if selected_cloud == "custom_api":
@@ -728,6 +763,8 @@ class SettingsDialog(QDialog):
                 "custom_api_upload_mode",
                 self.custom_api_mode_combo.currentData() or "proxied_session",
             )
+            self.config.save_secret(CUSTOM_DB_APP_KEY, self.custom_db_app_key_edit.text())
+            self.config.save_secret(CUSTOM_DB_APP_SECRET, self.custom_db_app_secret_edit.text())
 
             # Cloud-Dienst Auswahl
             if self.radio_custom_api.isChecked():
@@ -784,6 +821,79 @@ class SettingsDialog(QDialog):
             self.dropbox_group.setVisible(False)
             self.custom_api_group.setVisible(True)
             self.log.info("Cloud-Dienst gewechselt zu: Custom API")
+            self.update_custom_dropbox_status()
+
+    def _resolve_custom_api_client(self):
+        if self.custom_api_client is not None:
+            return self.custom_api_client
+        if self.parent() is not None:
+            return getattr(self.parent(), "custom_api_client", None)
+        return None
+
+    def update_custom_dropbox_connect_button(self, *_args):
+        if not hasattr(self, "custom_db_connect_button"):
+            return
+        client = self._resolve_custom_api_client()
+        status = client.get_dropbox_connection_status() if client else "Nicht verbunden"
+        is_connected = status.startswith("Verbunden")
+        key_ok = bool(self.custom_db_app_key_edit.text())
+        secret_ok = bool(self.custom_db_app_secret_edit.text())
+        if is_connected:
+            self.custom_db_connect_button.setText("Dropbox-Verbindung trennen (Upload-Konto)")
+            self.custom_db_connect_button.setEnabled(True)
+            self.custom_db_app_key_edit.setEnabled(False)
+            self.custom_db_app_secret_edit.setEnabled(False)
+        else:
+            self.custom_db_connect_button.setText("Mit Dropbox verbinden (Upload-Konto)")
+            self.custom_db_app_key_edit.setEnabled(True)
+            self.custom_db_app_secret_edit.setEnabled(True)
+            self.custom_db_connect_button.setEnabled(key_ok and secret_ok)
+
+    def update_custom_dropbox_status(self):
+        if not hasattr(self, "custom_db_status_label"):
+            return
+        client = self._resolve_custom_api_client()
+        if client is None:
+            self.custom_db_status_label.setText("Status: Client nicht verfügbar")
+            self.update_custom_dropbox_connect_button()
+            return
+        status = client.get_dropbox_connection_status()
+        self.custom_db_status_label.setText(f"Status: {status}")
+        self.update_custom_dropbox_connect_button()
+
+    def toggle_custom_dropbox_connection(self):
+        client = self._resolve_custom_api_client()
+        if client is None:
+            QMessageBox.warning(self, "Fehler", "Custom-API-Client ist nicht verfügbar.")
+            return
+
+        self.config.save_secret(CUSTOM_DB_APP_KEY, self.custom_db_app_key_edit.text())
+        self.config.save_secret(CUSTOM_DB_APP_SECRET, self.custom_db_app_secret_edit.text())
+
+        status = client.get_dropbox_connection_status()
+        if status.startswith("Verbunden"):
+            client.disconnect_dropbox()
+            self.update_custom_dropbox_status()
+            return
+
+        if not self.custom_db_app_key_edit.text() or not self.custom_db_app_secret_edit.text():
+            QMessageBox.warning(
+                self,
+                "Fehlende Daten",
+                "Bitte App Key und App Secret für die Upload-Dropbox eingeben.",
+            )
+            return
+
+        self.custom_db_status_label.setText("Status: Warte auf OAuth...")
+        self.custom_db_connect_button.setEnabled(False)
+
+        success = client.connect_dropbox(auth_callback=self.get_dropbox_auth_code)
+        if success:
+            self.log.info("Custom-Dropbox-Verbindung erfolgreich hergestellt.")
+        else:
+            self.log.warning("Custom-Dropbox-Verbindung fehlgeschlagen.")
+
+        self.update_custom_dropbox_status()
 
     def update_dropbox_status(self):
         """

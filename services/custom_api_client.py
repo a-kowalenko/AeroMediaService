@@ -14,6 +14,8 @@ from services.base_client import BaseClient
 from core.config import ConfigManager
 from core.signals import signals
 from core.upload_control import UploadCancelled
+from core import APP_VERSION
+from utils.dropbox_manifest import STANDARD_CATEGORIES, build_manifest_v11
 from utils.link_shortener import LinkShortener
 from utils.upload_checkpoint import (
     clear_checkpoint,
@@ -22,6 +24,11 @@ from utils.upload_checkpoint import (
     save_checkpoint,
     should_skip_upload_file,
 )
+
+# Keyring-Keys für Dropbox im Custom-API-Modus (getrennt vom DropboxClient).
+CUSTOM_DB_APP_KEY = "custom_db_app_key"
+CUSTOM_DB_APP_SECRET = "custom_db_app_secret"
+CUSTOM_DB_REFRESH_TOKEN = "custom_db_refresh_token"
 
 # Entspricht Server PROXIED_UPLOAD_CHUNK_BYTES; Vercel-Multipart-Limit ~4.5 MiB Request-Body.
 CHUNK_BYTES = 4 * 1024 * 1024
@@ -212,7 +219,7 @@ class CustomApiClient(BaseClient):
             return False
 
     def disconnect(self):
-        """Verbindung trennen."""
+        """Verbindung zur Cloud-API trennen (Dropbox-Token bleibt im Keyring)."""
         self.log.info("Trenne Verbindung zur Custom API...")
         if self.session:
             self.session.close()
@@ -221,6 +228,112 @@ class CustomApiClient(BaseClient):
         self.connected = False
         signals.connection_status_changed.emit("Nicht verbunden")
         signals.stop_monitoring.emit()
+
+    def get_dropbox_connection_status(self) -> str:
+        """Status der separaten Dropbox-Verbindung für Manifest-v1.1-Uploads."""
+        app_key = self.config.get_secret(CUSTOM_DB_APP_KEY)
+        app_secret = self.config.get_secret(CUSTOM_DB_APP_SECRET)
+        refresh_token = self.config.get_secret(CUSTOM_DB_REFRESH_TOKEN)
+        if not app_key or not app_secret:
+            return "App Key/Secret fehlt"
+        if not refresh_token:
+            return "Nicht verbunden"
+
+        if self.dbx is not None:
+            try:
+                account = self.dbx.users_get_current_account()
+                name = account.name.display_name if account.name else ""
+                return f"Verbunden ({name})" if name else "Verbunden"
+            except Exception:
+                self.dbx = None
+
+        try:
+            dbx = dropbox.Dropbox(
+                app_key=app_key,
+                app_secret=app_secret,
+                oauth2_refresh_token=refresh_token,
+            )
+            account = dbx.users_get_current_account()
+            self.dbx = dbx
+            name = account.name.display_name if account.name else ""
+            return f"Verbunden ({name})" if name else "Verbunden"
+        except dropbox.exceptions.AuthError:
+            return "Token ungültig"
+        except Exception as e:
+            self.log.debug("Dropbox-Statusprüfung fehlgeschlagen: %s", e)
+            return "Verbindungsfehler"
+
+    def connect_dropbox(self, auth_callback=None) -> bool:
+        """OAuth/Refresh-Token für die Custom-API-Dropbox (getrennt vom DropboxClient)."""
+        app_key = self.config.get_secret(CUSTOM_DB_APP_KEY)
+        app_secret = self.config.get_secret(CUSTOM_DB_APP_SECRET)
+        refresh_token = self.config.get_secret(CUSTOM_DB_REFRESH_TOKEN)
+
+        if not app_key or not app_secret:
+            self.log.warning("Custom-Dropbox: App Key oder App Secret fehlen.")
+            return False
+
+        if refresh_token:
+            self.log.info("Custom-Dropbox: Verbindung mit Refresh-Token...")
+            try:
+                self.dbx = dropbox.Dropbox(
+                    app_key=app_key,
+                    app_secret=app_secret,
+                    oauth2_refresh_token=refresh_token,
+                )
+                account = self.dbx.users_get_current_account()
+                name = account.name.display_name if account.name else "?"
+                self.log.info("Custom-Dropbox verbunden: %s", name)
+                return True
+            except dropbox.exceptions.AuthError as e:
+                self.log.warning("Custom-Dropbox Refresh-Token ungültig: %s", e)
+                self.config.delete_secret(CUSTOM_DB_REFRESH_TOKEN)
+                self.dbx = None
+            except Exception as e:
+                self.log.error("Custom-Dropbox Verbindungsfehler: %s", e)
+                self.dbx = None
+                return False
+
+        if not auth_callback:
+            self.log.error("Custom-Dropbox: OAuth-Callback fehlt.")
+            return False
+
+        try:
+            auth_flow = dropbox.DropboxOAuth2FlowNoRedirect(
+                app_key, app_secret, use_pkce=True, token_access_type="offline"
+            )
+            authorize_url = auth_flow.start()
+            auth_code = auth_callback(authorize_url)
+            if not auth_code:
+                self.log.warning("Custom-Dropbox OAuth abgebrochen.")
+                return False
+
+            oauth_result = auth_flow.finish(auth_code)
+            self.config.save_secret(CUSTOM_DB_REFRESH_TOKEN, oauth_result.refresh_token)
+            self.dbx = dropbox.Dropbox(
+                app_key=app_key,
+                app_secret=app_secret,
+                oauth2_refresh_token=oauth_result.refresh_token,
+            )
+            account = self.dbx.users_get_current_account()
+            name = account.name.display_name if account.name else "?"
+            self.log.info("Custom-Dropbox OAuth erfolgreich: %s", name)
+            return True
+        except Exception as e:
+            self.log.error("Custom-Dropbox OAuth fehlgeschlagen: %s", e)
+            return False
+
+    def disconnect_dropbox(self) -> None:
+        """Trennt Custom-Dropbox und löscht nur custom_db_refresh_token."""
+        self.log.info("Trenne Custom-Dropbox-Verbindung...")
+        self.config.delete_secret(CUSTOM_DB_REFRESH_TOKEN)
+        if self.dbx:
+            try:
+                self.dbx.auth_token_revoke()
+            except Exception as e:
+                self.log.warning("Custom-Dropbox Revoke: %s", e)
+        self.dbx = None
+        self.log.info("Custom-Dropbox getrennt.")
 
     def get_connection_status(self):
         """Verbindungsstatus zurückgeben."""
@@ -327,6 +440,88 @@ class CustomApiClient(BaseClient):
                 _full_body_for_log(body),
             )
             raise Exception(f"{tag}: HTTP {r.status_code} — {summary}")
+
+    def _post_json_orders(
+        self,
+        json_body: dict,
+        *,
+        timeout: int = 120,
+        tag: str = "orders/create",
+    ):
+        """POST JSON an /api/orders/create mit Retry bei transienten Fehlern."""
+        url = f"{self._api_origin()}/api/orders/create"
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = self.session.post(url, json=json_body, timeout=timeout)
+            except requests.exceptions.RequestException as e:
+                if attempt >= max_attempts:
+                    self.log.error("%s: %s nach %s Versuchen", tag, e, max_attempts)
+                    raise
+                d = self._backoff_delay(attempt)
+                self.log.warning(
+                    "%s: Netzwerk-Fehler, Versuch %s/%s, warte %.1fs — %s",
+                    tag,
+                    attempt,
+                    max_attempts,
+                    d,
+                    e,
+                )
+                time.sleep(d)
+                continue
+            body = r.text or ""
+            if r.status_code in (401, 403):
+                raise ApiAuthError(
+                    f"API-Key fehlt oder hat keine 'upload'-Permission (HTTP {r.status_code}). "
+                    f"{(body or '')[:200]}"
+                )
+            if r.ok:
+                if attempt > 1:
+                    self.log.info("%s: HTTP %s nach Versuch %s", tag, r.status_code, attempt)
+                return r
+            if self._http_transient(r.status_code, body):
+                if attempt >= max_attempts:
+                    summary = _summarize_api_error_body(body)
+                    self.log.error(
+                        "%s: HTTP %s nach %s Versuchen — %s",
+                        tag,
+                        r.status_code,
+                        max_attempts,
+                        summary,
+                    )
+                    raise Exception(f"{tag}: HTTP {r.status_code} — {summary}")
+                d = self._backoff_delay(attempt)
+                self.log.warning(
+                    "%s: HTTP %s, Versuch %s/%s, warte %.1fs — %s",
+                    tag,
+                    r.status_code,
+                    attempt,
+                    max_attempts,
+                    d,
+                    _summarize_api_error_body(body)[:200],
+                )
+                time.sleep(d)
+                continue
+            summary = _summarize_api_error_body(body)
+            try:
+                err_data = json.loads(body) if body.strip() else {}
+            except json.JSONDecodeError:
+                err_data = {}
+            error_code = err_data.get("error_code", "")
+            error_msg = err_data.get("error", summary)
+            self.log.error(
+                "%s: HTTP %s error_code=%s error=%s | Body: %s",
+                tag,
+                r.status_code,
+                error_code,
+                error_msg,
+                _full_body_for_log(body),
+            )
+            raise Exception(
+                f"{tag}: HTTP {r.status_code}"
+                + (f" ({error_code})" if error_code else "")
+                + f" — {error_msg}"
+            )
 
     def _post_session_multipart_with_retry(
         self,
@@ -555,7 +750,7 @@ class CustomApiClient(BaseClient):
             or "proxied_session"
         ).strip()
         if upload_mode == "direct_dropbox_complete":
-            self.log.info("Custom API Upload-Modus: direct_dropbox_complete")
+            self.log.info("Custom API Upload-Modus: Dropbox + Manifest v1.1 (paths_only)")
             return self._upload_directory_direct_dropbox_complete(local_dir_path, kunde)
         self.log.info("Custom API Upload-Modus: proxied_session")
 
@@ -1080,13 +1275,14 @@ class CustomApiClient(BaseClient):
 
         # Hauefige Feldnamen im Wilden.
         direct_keys = [
+            "final_url",
             "customer_url",
             "customerUrl",
             "share_url",
             "shareUrl",
             "public_url",
             "publicUrl",
-            "url"
+            "url",
         ]
         for key in direct_keys:
             value = result.get(key)
@@ -1234,8 +1430,98 @@ class CustomApiClient(BaseClient):
 
         return self._last_customer_url
 
+    def _apply_order_create_response(self, data: dict) -> None:
+        """Speichert order_id und final_url aus POST /api/orders/create."""
+        if not isinstance(data, dict):
+            return
+        final_url = data.get("final_url") or self._extract_customer_url(data)
+        if final_url:
+            self._last_customer_url = str(final_url).strip()
+        oid = data.get("order_id")
+        if oid is not None:
+            self._last_order_id = str(oid)
+        self.log.info(
+            "Manifest v1.1: order_id=%s final_url=%s",
+            self._last_order_id,
+            self._last_customer_url,
+        )
+
+    def _submit_manifest_v11(
+        self,
+        manifest: dict,
+        *,
+        local_dir_path: str,
+        save_dd_ck,
+        **ck_extra,
+    ) -> None:
+        meta = manifest.get("meta") or {}
+        totals = manifest.get("totals") or {}
+        if not totals.get("files_count"):
+            raise Exception(
+                "Manifest v1.1: keine Dateien in Standard-Kategorien "
+                f"({', '.join(sorted(STANDARD_CATEGORIES))})."
+            )
+        self.log.info(
+            "Sende Manifest v1.1 (%s, %s): %s Dateien, %s Bytes",
+            meta.get("version"),
+            meta.get("link_mode"),
+            totals.get("files_count"),
+            totals.get("bytes_total"),
+        )
+        save_dd_ck(phase="manifest_pending", **ck_extra)
+        self._upload_coop_tick()
+        signals.upload_status_update.emit("Registriere Order bei Cloud...")
+
+        response = self._post_json_orders(manifest, timeout=120, tag="orders/create")
+        data = response.json() if response.content else {}
+        if isinstance(data, dict) and data.get("ok") is False:
+            error_code = data.get("error_code", "")
+            error_msg = data.get("error", "Unbekannter Fehler")
+            raise Exception(
+                f"orders/create: {error_msg}"
+                + (f" ({error_code})" if error_code else "")
+            )
+
+        self._apply_order_create_response(data if isinstance(data, dict) else {})
+        if not self._last_customer_url:
+            self.log.warning("orders/create: keine final_url in Antwort.")
+        clear_checkpoint(local_dir_path)
+
+    def _get_dropbox_folder_share_link(self, remote_path: str) -> str | None:
+        """Optionaler Root-Freigabelink für root_folder.share_link im Manifest."""
+        if not self.dbx:
+            return None
+        try:
+            self.log.info("Erstelle optionalen Root-Freigabelink für: %s", remote_path)
+            links_result = self.dbx.sharing_list_shared_links(path=remote_path)
+            links = links_result.links
+            if links:
+                return links[0].url
+
+            settings = dropbox.sharing.SharedLinkSettings(
+                requested_visibility=dropbox.sharing.RequestedVisibility.public,
+            )
+            link = self.dbx.sharing_create_shared_link_with_settings(
+                remote_path, settings=settings
+            )
+            return link.url
+        except dropbox.exceptions.ApiError as e:
+            if "shared_link_already_exists" in str(e):
+                try:
+                    links_result = self.dbx.sharing_list_shared_links(path=remote_path)
+                    if links_result.links:
+                        return links_result.links[0].url
+                except Exception as e2:
+                    self.log.warning("Root-Freigabelink Abruf fehlgeschlagen: %s", e2)
+                    return None
+            self.log.warning("Root-Freigabelink konnte nicht erstellt werden: %s", e)
+            return None
+        except Exception as e:
+            self.log.warning("Root-Freigabelink Fehler: %s", e)
+            return None
+
     def _upload_directory_direct_dropbox_complete(self, local_dir_path, kunde: Kunde = None):
-        """Neuer Modus: direct-init -> direkter Dropbox-Upload -> client-complete."""
+        """Dropbox-Upload + Manifest v1.1 (paths_only) → POST /api/orders/create."""
         files_to_upload = []
         total_size = 0
         folder_name = os.path.basename(local_dir_path)
@@ -1272,8 +1558,9 @@ class CustomApiClient(BaseClient):
             return True
 
         files_to_upload.sort(key=lambda x: x["name"])
-        manifest = [{"name": f["name"], "size": f["size"], "type": f["type"]} for f in files_to_upload]
-        manifest_fp = manifest_fingerprint(manifest)
+        manifest_fp = manifest_fingerprint(
+            [{"name": f["name"], "size": f["size"], "type": f["type"]} for f in files_to_upload]
+        )
 
         raw_ck = load_checkpoint(local_dir_path)
         resume_ck = None
@@ -1284,77 +1571,61 @@ class CustomApiClient(BaseClient):
         ):
             resume_ck = raw_ck
         elif raw_ck:
-            self.log.warning("Direct-Dropbox-Checkpoint verworfen.")
+            if raw_ck.get("phase") == "client_complete_pending":
+                self.log.warning("Veralteter client_complete-Checkpoint verworfen — bitte erneut hochladen.")
+            else:
+                self.log.warning("Direct-Dropbox-Checkpoint verworfen.")
             clear_checkpoint(local_dir_path)
 
-        session_id = None
-        order_id = None
         uploaded_files: list = []
 
-        if resume_ck and resume_ck.get("phase") == "client_complete_pending" and resume_ck.get("api_session_id"):
-            session_id = resume_ck["api_session_id"]
+        if resume_ck and resume_ck.get("phase") == "manifest_pending":
             uploaded_files = list(resume_ck.get("uploaded_files") or [])
-            self._last_session_id = session_id
-            if resume_ck.get("order_id") is not None:
-                self._last_order_id = str(resume_ck["order_id"])
-            self.log.info("Checkpoint: client-complete wird fortgesetzt (session_id=%s).", session_id)
-            self._connect_dropbox_for_direct_mode()
-            done_resp = self._post_json_upload(
-                "/client-complete",
-                {"session_id": session_id, "files": uploaded_files},
-                timeout=120,
-                tag="client-complete",
+            root_share_link = resume_ck.get("root_share_link")
+            self.log.info(
+                "Checkpoint: Manifest-POST wird fortgesetzt (%s Dateien).",
+                len(uploaded_files),
             )
-            done_data = done_resp.json() if done_resp.content else {}
-            self._last_customer_url = self._extract_customer_url(done_data)
-            if not self._last_customer_url:
-                self._last_customer_url = (
-                    done_data.get("media_url")
-                    or done_data.get("archive_url")
-                    or done_data.get("url")
-                )
-            for key in ("media_url", "customer_url", "archive_url", "order_id"):
-                val = done_data.get(key) if isinstance(done_data, dict) else None
-                if val:
-                    self.log.info("client-complete %s=%s [session=%r]", key, val, session_id)
-            if isinstance(done_data, dict) and done_data.get("order_id") is not None:
-                self._last_order_id = str(done_data["order_id"])
-            clear_checkpoint(local_dir_path)
+            manifest = build_manifest_v11(
+                base_dir=folder_name,
+                kunde=kunde,
+                uploaded_files=uploaded_files,
+                root_share_link=root_share_link,
+                uploader_version=APP_VERSION,
+            )
+
+            def save_manifest_ck(**kwargs):
+                payload = {
+                    "kind": "custom_api_direct_dropbox",
+                    "manifest_fp": manifest_fp,
+                    "uploaded_files": uploaded_files,
+                    "root_share_link": root_share_link,
+                    "phase": "manifest_pending",
+                }
+                payload.update(kwargs)
+                save_checkpoint(local_dir_path, payload)
+
+            self._submit_manifest_v11(
+                manifest,
+                local_dir_path=local_dir_path,
+                save_dd_ck=save_manifest_ck,
+            )
             signals.upload_status_update.emit("Upload abgeschlossen.")
             return True
 
-        if resume_ck and resume_ck.get("api_session_id"):
-            session_id = resume_ck["api_session_id"]
-            order_id = resume_ck.get("order_id")
+        if resume_ck:
             uploaded_files = list(resume_ck.get("uploaded_files") or [])
-            self._last_session_id = session_id
-            if order_id is not None:
-                self._last_order_id = str(order_id)
             self.log.info(
-                "Direct-Dropbox-Upload fortsetzen (session_id=%s, next_file_index=%s).",
-                session_id,
+                "Direct-Dropbox-Upload fortsetzen (next_file_index=%s).",
                 resume_ck.get("next_file_index", 0),
             )
 
-        if not session_id:
-            session_data = self._initialize_direct_session(files_to_upload, folder_name, kunde)
-            session_id = session_data["session_id"]
-            order_id = session_data.get("order_id")
-            self._last_session_id = session_id
-            if order_id is not None:
-                self._last_order_id = str(order_id)
-            self.log.info(
-                "Direct-Dropbox Session initialisiert: session_id=%s%s",
-                session_id,
-                f", order_id={order_id}" if order_id else "",
-            )
+        if resume_ck is None:
             save_checkpoint(
                 local_dir_path,
                 {
                     "kind": "custom_api_direct_dropbox",
                     "manifest_fp": manifest_fp,
-                    "api_session_id": session_id,
-                    "order_id": order_id,
                     "uploaded_files": [],
                     "next_file_index": 0,
                     "dd_active": None,
@@ -1366,7 +1637,7 @@ class CustomApiClient(BaseClient):
 
         start_idx = 0
         resume_dd = None
-        if resume_ck:
+        if resume_ck and resume_ck.get("phase") == "uploading":
             start_idx = min(int(resume_ck.get("next_file_index", 0)), len(files_to_upload))
             dd = resume_ck.get("dd_active") or {}
             if start_idx < len(files_to_upload) and dd.get("file_name") == files_to_upload[start_idx]["name"]:
@@ -1378,19 +1649,22 @@ class CustomApiClient(BaseClient):
                         "dropbox_path": dd.get("dropbox_path") or files_to_upload[start_idx]["dropbox_path"],
                     }
 
-        def names_done() -> set:
-            return {row["file_name"] for row in uploaded_files}
+        def rel_paths_done() -> set:
+            done = set()
+            for row in uploaded_files:
+                rel = row.get("rel_path") or row.get("file_name")
+                if rel:
+                    done.add(str(rel))
+            return done
 
         uploaded_counter = {
-            "bytes": sum(f["size"] for f in files_to_upload if f["name"] in names_done())
+            "bytes": sum(f["size"] for f in files_to_upload if f["name"] in rel_paths_done())
         }
 
         def save_dd_ck(**kwargs):
             payload = {
                 "kind": "custom_api_direct_dropbox",
                 "manifest_fp": manifest_fp,
-                "api_session_id": session_id,
-                "order_id": order_id,
                 "uploaded_files": uploaded_files,
                 "phase": "uploading",
             }
@@ -1425,14 +1699,13 @@ class CustomApiClient(BaseClient):
                 on_dd_progress=on_dd_progress,
             )
             row = {
-                "file_name": file_info["name"],
-                "file_size": int(md.size if getattr(md, "size", None) is not None else file_info["size"]),
-                "dropbox_id": getattr(md, "id", "") or "",
-                "dropbox_path": (
-                    getattr(md, "path_lower", None)
-                    or getattr(md, "path_display", None)
-                    or file_info["dropbox_path"]
+                "name": os.path.basename(file_info["name"]),
+                "rel_path": file_info["name"],
+                "size": int(
+                    md.size if getattr(md, "size", None) is not None else file_info["size"]
                 ),
+                "mime": file_info["type"],
+                "dropbox_id": getattr(md, "id", "") or "",
             }
             uploaded_files.append(row)
             save_dd_ck(
@@ -1441,51 +1714,48 @@ class CustomApiClient(BaseClient):
                 dd_active=None,
             )
 
-        save_dd_ck(
+        root_share_link = self._get_dropbox_folder_share_link(remote_base_path)
+        manifest = build_manifest_v11(
+            base_dir=folder_name,
+            kunde=kunde,
+            uploaded_files=uploaded_files,
+            root_share_link=root_share_link,
+            uploader_version=APP_VERSION,
+        )
+
+        def save_manifest_ck(**kwargs):
+            payload = {
+                "kind": "custom_api_direct_dropbox",
+                "manifest_fp": manifest_fp,
+                "uploaded_files": uploaded_files,
+                "root_share_link": root_share_link,
+                "phase": "manifest_pending",
+            }
+            payload.update(kwargs)
+            save_checkpoint(local_dir_path, payload)
+
+        self._submit_manifest_v11(
+            manifest,
+            local_dir_path=local_dir_path,
+            save_dd_ck=save_manifest_ck,
             uploaded_files=list(uploaded_files),
-            next_file_index=len(files_to_upload),
-            dd_active=None,
-            phase="client_complete_pending",
+            root_share_link=root_share_link,
         )
-
-        self._upload_coop_tick()
-        done_resp = self._post_json_upload(
-            "/client-complete",
-            {"session_id": session_id, "files": uploaded_files},
-            timeout=120,
-            tag="client-complete",
-        )
-        done_data = done_resp.json() if done_resp.content else {}
-        self._last_customer_url = self._extract_customer_url(done_data)
-        if not self._last_customer_url:
-            self._last_customer_url = (
-                done_data.get("media_url")
-                or done_data.get("archive_url")
-                or done_data.get("url")
-            )
-
-        for key in ("media_url", "customer_url", "archive_url", "order_id"):
-            val = done_data.get(key) if isinstance(done_data, dict) else None
-            if val:
-                self.log.info("client-complete %s=%s [session=%r]", key, val, session_id)
-        if isinstance(done_data, dict) and done_data.get("order_id") is not None:
-            self._last_order_id = str(done_data["order_id"])
-
-        clear_checkpoint(local_dir_path)
         signals.upload_status_update.emit("Upload abgeschlossen.")
         return True
 
     def _connect_dropbox_for_direct_mode(self):
-        """Initialisiert Dropbox-Client mit lokalen Credentials (wie DropboxClient)."""
+        """Initialisiert Dropbox-Client mit Custom-API-Credentials (nicht DropboxClient)."""
         if self.dbx is not None:
             return
-        app_key = self.config.get_secret("db_app_key")
-        app_secret = self.config.get_secret("db_app_secret")
-        refresh_token = self.config.get_secret("db_refresh_token")
+        app_key = self.config.get_secret(CUSTOM_DB_APP_KEY)
+        app_secret = self.config.get_secret(CUSTOM_DB_APP_SECRET)
+        refresh_token = self.config.get_secret(CUSTOM_DB_REFRESH_TOKEN)
         if not app_key or not app_secret or not refresh_token:
             raise Exception(
-                "Dropbox-Credentials fehlen für direct_dropbox_complete "
-                "(db_app_key/db_app_secret/db_refresh_token)."
+                "Custom-Dropbox-Credentials fehlen für Manifest-v1.1-Upload "
+                f"({CUSTOM_DB_APP_KEY}/{CUSTOM_DB_APP_SECRET}/{CUSTOM_DB_REFRESH_TOKEN}). "
+                "Bitte im Tab Custom API unter Dropbox (Upload) verbinden."
             )
         self.dbx = dropbox.Dropbox(
             app_key=app_key,
