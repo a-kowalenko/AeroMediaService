@@ -56,7 +56,7 @@ class SettingsDialog(QDialog):
         # Tabs erstellen
         self.tabs.addTab(self.create_general_tab(), "Allgemein")
         self.tabs.addTab(self.create_cloud_tab(), "Cloud-Dienst")
-        self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP)")
+        self.tabs.addTab(self.create_email_tab(), "E-Mail (SMTP/IMAP)")
         self.tabs.addTab(self.create_sms_tab(), "SMS-Dienst")
         self.tabs.addTab(self.create_shortener_tab(), "Link-Shortener")
         self.tabs.addTab(self.create_extras_tab(), "Extras")
@@ -330,7 +330,7 @@ class SettingsDialog(QDialog):
         return widget
 
     def create_email_tab(self):
-        """Erstellt den Tab 'E-Mail (SMTP)'."""
+        """Erstellt den Tab 'E-Mail (SMTP/IMAP)'."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
@@ -375,9 +375,54 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(sender_group)
 
+        # --- Gruppe 3: IMAP-Ablage in Gesendet ---
+        imap_group = QGroupBox("IMAP (Kopie in Gesendet)")
+        imap_layout = QFormLayout(imap_group)
+
+        self.imap_save_sent_check = QCheckBox(
+            "Versendete E-Mails im Postfach ablegen (Ordner Gesendet)"
+        )
+        self.imap_save_sent_check.setChecked(True)
+        imap_layout.addRow("Archiv:", self.imap_save_sent_check)
+
+        self.imap_host_edit = QLineEdit()
+        self.imap_host_edit.setPlaceholderText("Leer = SMTP-Host")
+        imap_layout.addRow("IMAP-Host:", self.imap_host_edit)
+
+        self.imap_port_edit = QSpinBox()
+        self.imap_port_edit.setRange(1, 65535)
+        self.imap_port_edit.setValue(993)
+        imap_layout.addRow("IMAP-Port:", self.imap_port_edit)
+
+        self.imap_sent_folder_edit = QLineEdit()
+        self.imap_sent_folder_edit.setPlaceholderText("Leer = Auto-Erkennung (\\Sent / Gesendet)")
+        imap_layout.addRow("Gesendet-Ordner:", self.imap_sent_folder_edit)
+
+        self.imap_same_credentials_check = QCheckBox(
+            "Gleiche Zugangsdaten wie SMTP (empfohlen)"
+        )
+        self.imap_same_credentials_check.setChecked(True)
+        self.imap_same_credentials_check.toggled.connect(self._toggle_imap_credentials_fields)
+        imap_layout.addRow("Zugangsdaten:", self.imap_same_credentials_check)
+
+        self.imap_user_edit = QLineEdit()
+        imap_layout.addRow("IMAP-Benutzername:", self.imap_user_edit)
+
+        self.imap_pass_edit = QLineEdit()
+        self.imap_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        imap_layout.addRow("IMAP-Passwort:", self.imap_pass_edit)
+
+        layout.addWidget(imap_group)
+        self._toggle_imap_credentials_fields(self.imap_same_credentials_check.isChecked())
+
         layout.addStretch(1)  # Schiebt alles nach oben
 
         return widget
+
+    def _toggle_imap_credentials_fields(self, use_smtp_credentials: bool):
+        """Blendet IMAP-Zugangsdaten aus, wenn SMTP-Daten wiederverwendet werden."""
+        self.imap_user_edit.setEnabled(not use_smtp_credentials)
+        self.imap_pass_edit.setEnabled(not use_smtp_credentials)
 
     def create_sms_tab(self):
         """Erstellt den Tab 'SMS (Seven.io)'."""
@@ -689,6 +734,17 @@ class SettingsDialog(QDialog):
         smtp_sandbox_mode_str = self.config.get_setting("smtp_sandbox_mode", "false")
         self.smtp_sandbox_check.setChecked(smtp_sandbox_mode_str.lower() == "true")
 
+        imap_save_sent_str = self.config.get_setting("imap_save_sent_enabled", "true")
+        self.imap_save_sent_check.setChecked(imap_save_sent_str.lower() == "true")
+        self.imap_host_edit.setText(self.config.get_setting("imap_host", ""))
+        self.imap_port_edit.setValue(int(self.config.get_setting("imap_port", 993)))
+        self.imap_sent_folder_edit.setText(self.config.get_setting("imap_sent_folder", ""))
+        imap_same_credentials_str = self.config.get_setting("imap_same_credentials", "true")
+        self.imap_same_credentials_check.setChecked(imap_same_credentials_str.lower() == "true")
+        self.imap_user_edit.setText(self.config.get_secret("imap_user") or "")
+        self.imap_pass_edit.setText(self.config.get_secret("imap_pass") or "")
+        self._toggle_imap_credentials_fields(self.imap_same_credentials_check.isChecked())
+
         # SMS
         self.sms_api_key_edit.setText(self.config.get_secret("seven_api_key"))
         self.sms_sandbox_api_key_edit.setText(self.config.get_secret("seven_sandbox_api_key"))
@@ -782,6 +838,22 @@ class SettingsDialog(QDialog):
             self.config.save_setting("smtp_fallback_recipient", self.smtp_fallback_recipient_edit.text())
             smtp_sandbox_mode_str = "true" if self.smtp_sandbox_check.isChecked() else "false"
             self.config.save_setting("smtp_sandbox_mode", smtp_sandbox_mode_str)
+
+            imap_save_sent_str = "true" if self.imap_save_sent_check.isChecked() else "false"
+            self.config.save_setting("imap_save_sent_enabled", imap_save_sent_str)
+            self.config.save_setting("imap_host", self.imap_host_edit.text().strip())
+            self.config.save_setting("imap_port", self.imap_port_edit.value())
+            self.config.save_setting("imap_sent_folder", self.imap_sent_folder_edit.text().strip())
+            imap_same_credentials_str = (
+                "true" if self.imap_same_credentials_check.isChecked() else "false"
+            )
+            self.config.save_setting("imap_same_credentials", imap_same_credentials_str)
+            if self.imap_same_credentials_check.isChecked():
+                self.config.delete_secret("imap_user")
+                self.config.delete_secret("imap_pass")
+            else:
+                self.config.save_secret("imap_user", self.imap_user_edit.text())
+                self.config.save_secret("imap_pass", self.imap_pass_edit.text())
 
             # SMS
             self.config.save_secret("seven_api_key", self.sms_api_key_edit.text())
