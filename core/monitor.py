@@ -77,13 +77,57 @@ def parse_marker_payload(marker_content):
     return parse_api_marker_data(_load_marker_data(marker_content))
 
 
+def _parse_marker_bool(data, key, default=False):
+    """Liest boolesche Marker-Felder robust (bool, str, int)."""
+    if key not in data:
+        return default
+    value = data[key]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "ja")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _media_flags_from_marker(data):
+    return {
+        "handcam_foto": _parse_marker_bool(data, "handcam_foto"),
+        "handcam_video": _parse_marker_bool(data, "handcam_video"),
+        "outside_foto": _parse_marker_bool(data, "outside_foto"),
+        "outside_video": _parse_marker_bool(data, "outside_video"),
+        "ist_bezahlt_handcam_foto": _parse_marker_bool(data, "ist_bezahlt_handcam_foto"),
+        "ist_bezahlt_handcam_video": _parse_marker_bool(data, "ist_bezahlt_handcam_video"),
+        "ist_bezahlt_outside_foto": _parse_marker_bool(data, "ist_bezahlt_outside_foto"),
+        "ist_bezahlt_outside_video": _parse_marker_bool(data, "ist_bezahlt_outside_video"),
+    }
+
+
+def _media_flags_from_customer(customer):
+    return {
+        field: _parse_marker_bool(customer, field)
+        for field in (
+            "handcam_foto",
+            "handcam_video",
+            "outside_foto",
+            "outside_video",
+            "ist_bezahlt_handcam_foto",
+            "ist_bezahlt_handcam_video",
+            "ist_bezahlt_outside_foto",
+            "ist_bezahlt_outside_video",
+        )
+    }
+
+
 def build_kunde_from_marker(data):
-    """Mappt Direkt-Marker (Dropbox) auf Kunde-Modell."""
+    """Mappt Direkt-Marker (vorname/nachname/email) auf Kunde-Modell."""
     for field in ("vorname", "nachname", "email"):
         if not str(data.get(field, "")).strip():
             raise ValueError(f"Pflichtfeld '{field}' fehlt oder ist leer.")
 
     phone = str(data.get("telefon", "")).strip() or None
+    marker_type = _normalize_marker_type(data.get("type")) or None
     return Kunde(
         first_name=str(data["vorname"]).strip(),
         last_name=str(data["nachname"]).strip(),
@@ -91,14 +135,15 @@ def build_kunde_from_marker(data):
         phone=phone,
         customer_number=None,
         booking_number=None,
-        type=None,
+        type=marker_type,
+        **_media_flags_from_marker(data),
     )
 
 
 def resolve_kunde_from_marker(config_manager, marker_content):
     """
     Löst Marker-Inhalt zu einem Kunde-Objekt auf.
-    API-Lookup (type + IDs) oder Direktformat (vorname/nachname/email) bei Dropbox.
+    API-Lookup (type + IDs) oder Direktformat (vorname/nachname/email).
     """
     data = _load_marker_data(marker_content)
 
@@ -108,16 +153,12 @@ def resolve_kunde_from_marker(config_manager, marker_content):
         return build_kunde_from_customer(customer)
 
     if _has_direct_contact_fields(data):
-        if config_manager.get_setting("selected_cloud_service", "dropbox") != "dropbox":
-            raise ValueError(
-                "Direktes Kundenformat (vorname/nachname/email) ist nur bei Dropbox gültig."
-            )
         return build_kunde_from_marker(data)
 
     raise ValueError(
         "Ungültiges Marker-Format. Erwartet entweder "
         "'kunden_id_hash' + 'booking_id_hash', 'kunden_id' + 'booking_id' "
-        "oder bei Dropbox 'vorname' + 'nachname' + 'email'."
+        "oder 'vorname' + 'nachname' + 'email'."
     )
 
 
@@ -165,7 +206,8 @@ def build_kunde_from_customer(customer):
         first_name=str(customer.get("vorname", "")),
         last_name=str(customer.get("nachname", "")),
         phone=str(customer.get("telefon", "")),
-        type=str(customer.get("typ", ""))
+        type=str(customer.get("typ", "")),
+        **_media_flags_from_customer(customer),
     )
 
 

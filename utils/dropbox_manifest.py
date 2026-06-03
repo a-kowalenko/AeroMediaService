@@ -105,6 +105,14 @@ def build_manifest_v11(
         "last_name": str(getattr(kunde, "last_name", None) or ""),
         "email": str(getattr(kunde, "email", None) or ""),
         "phone": str(getattr(kunde, "phone", None) or ""),
+        "handcam_foto": bool(getattr(kunde, "handcam_foto", False)),
+        "handcam_video": bool(getattr(kunde, "handcam_video", False)),
+        "outside_foto": bool(getattr(kunde, "outside_foto", False)),
+        "outside_video": bool(getattr(kunde, "outside_video", False)),
+        "ist_bezahlt_handcam_foto": bool(getattr(kunde, "ist_bezahlt_handcam_foto", False)),
+        "ist_bezahlt_handcam_video": bool(getattr(kunde, "ist_bezahlt_handcam_video", False)),
+        "ist_bezahlt_outside_foto": bool(getattr(kunde, "ist_bezahlt_outside_foto", False)),
+        "ist_bezahlt_outside_video": bool(getattr(kunde, "ist_bezahlt_outside_video", False)),
     }
 
     root_folder: dict = {"path": f"/{base_dir}"}
