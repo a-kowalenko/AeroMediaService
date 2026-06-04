@@ -46,6 +46,29 @@ def _has_direct_contact_fields(data):
     return "vorname" in data and "nachname" in data and "email" in data
 
 
+PURE_CONTACT_MARKER_KEYS = frozenset({"vorname", "nachname", "email", "telefon"})
+
+
+def is_pure_contact_marker(data):
+    """True wenn der Marker nur vorname, nachname, email und optional telefon enthält."""
+    if not _has_direct_contact_fields(data):
+        return False
+    if not set(data.keys()).issubset(PURE_CONTACT_MARKER_KEYS):
+        return False
+    for field in ("vorname", "nachname", "email"):
+        if not str(data.get(field, "")).strip():
+            return False
+    return True
+
+
+def should_use_dropbox_client_for_marker(config_manager, marker_content):
+    """Bei aktivem Custom API: reine Kontakt-Marker über DropboxClient hochladen."""
+    if config_manager.get_setting("selected_cloud_service", "dropbox") != "custom_api":
+        return False
+    data = _load_marker_data(marker_content)
+    return is_pure_contact_marker(data)
+
+
 def parse_api_marker_data(data):
     """Validiert API-Marker-Daten und liefert Query-Parameter plus Lookup-Modus."""
     marker_type = _normalize_marker_type(data.get("type"))
@@ -245,6 +268,12 @@ def attempt_queue_upload_folder(
             marker_raw = marker_file.read().strip()
         log.debug("Marker-Daten für '%s': %s", dir_name, marker_raw)
         kunde = resolve_kunde_from_marker(config_manager, marker_raw)
+        use_dropbox_client = should_use_dropbox_client_for_marker(config_manager, marker_raw)
+        if use_dropbox_client:
+            log.info(
+                "Reiner Kontakt-Marker für '%s' — Upload über DropboxClient (Custom API aktiv).",
+                dir_name,
+            )
         log.info("Kundendaten erfolgreich geladen für '%s': %s", dir_name, kunde)
         signals.upload_history_update.emit({
             "dir_name": dir_name,
@@ -267,7 +296,11 @@ def attempt_queue_upload_folder(
 
         upload_registry.enqueue(
             upload_queue,
-            {"dir_path": full_dir_path, "kunde": kunde},
+            {
+                "dir_path": full_dir_path,
+                "kunde": kunde,
+                "use_dropbox_client": use_dropbox_client,
+            },
             log,
             already_registered=True,
         )
@@ -320,6 +353,7 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
             with open(processing_path, "r", encoding="utf-8") as marker_file:
                 marker_raw = marker_file.read().strip()
             kunde = resolve_kunde_from_marker(config_manager, marker_raw)
+            use_dropbox_client = should_use_dropbox_client_for_marker(config_manager, marker_raw)
             log.info("Recovery: unterbrochener Auftrag '%s', Kundendaten geladen.", dir_name)
             signals.upload_history_update.emit({
                 "dir_name": dir_name,
@@ -334,7 +368,11 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
             })
             if upload_registry.enqueue(
                 upload_queue,
-                {"dir_path": full_dir_path, "kunde": kunde},
+                {
+                    "dir_path": full_dir_path,
+                    "kunde": kunde,
+                    "use_dropbox_client": use_dropbox_client,
+                },
                 log,
             ):
                 recovered += 1

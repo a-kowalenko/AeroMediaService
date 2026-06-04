@@ -1064,6 +1064,9 @@ class SettingsDialog(QDialog):
                                     self.parent().uploader_thread.client = self.parent().custom_api_client
                                     self.log.info("UploaderThread wurde aktualisiert")
 
+                                if hasattr(self.parent(), '_auto_connect_dropbox_for_pure_contact_markers'):
+                                    self.parent()._auto_connect_dropbox_for_pure_contact_markers()
+
                                 # Aktualisiere das Status-Light im MainWindow
                                 if hasattr(self.parent(), 'update_status_light'):
                                     self.parent().update_status_light()
@@ -1098,13 +1101,16 @@ class SettingsDialog(QDialog):
                                 self.parent().uploader_thread.client = self.parent().custom_api_client
                                 self.log.info("UploaderThread wurde aktualisiert")
 
+                            if hasattr(self.parent(), '_auto_connect_dropbox_for_pure_contact_markers'):
+                                self.parent()._auto_connect_dropbox_for_pure_contact_markers()
+
                             # Aktualisiere das Status-Light im MainWindow
                             if hasattr(self.parent(), 'update_status_light'):
                                 self.parent().update_status_light()
                                 self.log.info("Status-Light wurde aktualisiert")
 
-                    QMessageBox.information(self, "Verbindung erfolgreich",
-                                          "Die Verbindung zur Custom API wurde erfolgreich getestet!")
+                        QMessageBox.information(self, "Verbindung erfolgreich",
+                                              "Die Verbindung zur Custom API wurde erfolgreich getestet!")
             else:
                 self.custom_api_status_label.setText(f"Status: Fehler HTTP {response.status_code}")
                 QMessageBox.warning(self, "Verbindungsfehler",

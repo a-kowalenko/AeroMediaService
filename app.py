@@ -189,12 +189,15 @@ class MainWindow(QMainWindow):
         # --- Worker-Threads ---
         # (Threads benötigen Config, Queue und Clients)
         self.monitor_thread = None  # Wird bei Bedarf gestartet
-        self.uploader_thread = UploaderThread(self.config,
-                                              self.upload_queue,
-                                              self.active_cloud_client,
-                                              self.email_client,
-                                              self.sms_client,
-                                              self.upload_registry)
+        self.uploader_thread = UploaderThread(
+            self.config,
+            self.upload_queue,
+            self.active_cloud_client,
+            self.email_client,
+            self.sms_client,
+            self.upload_registry,
+            dropbox_client=self.db_client,
+        )
 
         # --- Update-Worker ---
         self.update_thread = None
@@ -504,6 +507,23 @@ class MainWindow(QMainWindow):
         else:
             return self.db_client
 
+    def _auto_connect_dropbox_for_pure_contact_markers(self):
+        """Dropbox parallel verbinden, falls reine Kontakt-Marker über DropboxClient laufen."""
+        if not self.config.get_secret("db_refresh_token"):
+            self.log.info(
+                "Kein Dropbox Refresh-Token — reine Kontakt-Marker können nicht über Dropbox hochgeladen werden."
+            )
+            return
+        if self.db_client.dbx is not None:
+            return
+        if self.db_client.connect():
+            self.log.info("Dropbox parallel verbunden (für reine Kontakt-Marker).")
+        else:
+            self.log.warning(
+                "Dropbox-Verbindung für reine Kontakt-Marker fehlgeschlagen — "
+                "diese Uploads werden scheitern, bis Dropbox verbunden ist."
+            )
+
     def auto_connect_and_start(self):
         """
         Versucht beim Start, automatisch eine Verbindung herzustellen,
@@ -532,6 +552,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Stelle automatische Verbindung her (Custom API)...")
                 if self.custom_api_client.connect():
                     self.log.info("Automatische Custom API-Verbindung erfolgreich.")
+                    self._auto_connect_dropbox_for_pure_contact_markers()
                     self.start_monitoring()  # Startet automatisch das Monitoring
                 else:
                     self.log.warning("Automatische Custom API-Verbindung fehlgeschlagen.")
@@ -1239,6 +1260,9 @@ class MainWindow(QMainWindow):
             self.active_cloud_client = new_active_client
             # UploaderThread muss mit neuem Client aktualisiert werden
             self.uploader_thread.client = self.active_cloud_client
+
+        if self.config.get_setting("selected_cloud_service", "dropbox") == "custom_api":
+            self._auto_connect_dropbox_for_pure_contact_markers()
 
         # Die Threads lesen die Konfiguration bei Bedarf neu.
         # Wir müssen den Monitor-Thread aufwecken, falls er auf das Intervall wartet,

@@ -25,18 +25,29 @@ class UploaderThread(QThread):
 
     def __init__(self, config_manager: ConfigManager, upload_queue: queue.Queue, client: BaseClient,
                  email_client: EmailClient, sms_client: SmsClient,
-                 upload_registry: UploadQueueRegistry | None = None):
+                 upload_registry: UploadQueueRegistry | None = None,
+                 dropbox_client: BaseClient | None = None):
         super().__init__()
         self.config = config_manager
         self.upload_queue = upload_queue
         self.upload_registry = upload_registry
         self.client = client
+        self.dropbox_client = dropbox_client
         self.email_client = email_client
         self.sms_client = sms_client
         self.log = logging.getLogger('uploader')  # Spezieller Logger
 
         self._is_running = False
         self.upload_control = UploadControl()
+
+    def _resolve_upload_client(self, use_dropbox: bool) -> BaseClient:
+        if use_dropbox:
+            if self.dropbox_client is None:
+                raise RuntimeError(
+                    "Reiner Kontakt-Marker erfordert DropboxClient, aber keiner ist konfiguriert."
+                )
+            return self.dropbox_client
+        return self.client
 
     def request_upload_pause(self):
         self.upload_control.request_pause()
@@ -79,11 +90,19 @@ class UploaderThread(QThread):
                 local_dir_path = current_queue_item['dir_path']
                 kunde: Kunde = current_queue_item['kunde']
                 dir_name = os.path.basename(local_dir_path)  # dir_name hier setzen
+                use_dropbox = bool(current_queue_item.get("use_dropbox_client"))
+                upload_client = self._resolve_upload_client(use_dropbox)
 
                 if self.upload_registry and local_dir_path:
                     self.upload_registry.mark_active(local_dir_path)
 
-                self.log.info(f"Beginne Verarbeitung von: {dir_name}")
+                if use_dropbox:
+                    self.log.info(
+                        "Beginne Verarbeitung von: %s (DropboxClient — reiner Kontakt-Marker)",
+                        dir_name,
+                    )
+                else:
+                    self.log.info(f"Beginne Verarbeitung von: {dir_name}")
                 signals.upload_job_active.emit(True)
                 try:
                     self.upload_control.reset_for_new_job()
@@ -109,7 +128,7 @@ class UploaderThread(QThread):
                     job_delays_sec = (5, 15)
                     for job_try in range(1, 4):
                         try:
-                            upload_success = self.client.upload_directory(
+                            upload_success = upload_client.upload_directory(
                                 local_dir_path, remote_path, kunde, self.upload_control
                             )
                         except UploadCancelled:
@@ -142,7 +161,7 @@ class UploaderThread(QThread):
                     share_link = None
                     for attempt in range(1, 4):
                         self.upload_control.check_cancelled()
-                        share_link = self.client.get_shareable_link(remote_path)
+                        share_link = upload_client.get_shareable_link(remote_path)
                         if share_link:
                             break
                         if attempt < 3:

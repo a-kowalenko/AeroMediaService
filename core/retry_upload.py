@@ -7,7 +7,7 @@ import shutil
 from typing import Any, Optional
 
 from core.archive import find_archived_folder
-from core.monitor import resolve_kunde_from_marker
+from core.monitor import resolve_kunde_from_marker, should_use_dropbox_client_for_marker
 from core.upload_markers import MARKER_PROCESSING, marker_paths
 from core.upload_queue_registry import UploadQueueRegistry
 from models.kunde import Kunde
@@ -141,9 +141,20 @@ def retry_upload_from_history(
     if marker_raw:
         _write_processing_marker(target_path, marker_raw, logger)
 
+    use_dropbox_client = False
+    if marker_raw:
+        try:
+            use_dropbox_client = should_use_dropbox_client_for_marker(config_manager, marker_raw)
+        except ValueError:
+            pass
+
     if not upload_registry.enqueue(
         upload_queue,
-        {"dir_path": target_path, "kunde": kunde},
+        {
+            "dir_path": target_path,
+            "kunde": kunde,
+            "use_dropbox_client": use_dropbox_client,
+        },
         logger,
     ):
         raise ValueError(f"„{dir_name}“ konnte nicht in die Warteschlange eingereiht werden.")
