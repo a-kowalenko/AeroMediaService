@@ -1,6 +1,19 @@
 from dataclasses import dataclass
 from typing import Optional
 
+_INVALID_PHONE_VALUES = frozenset({"none", "null", "nan"})
+
+
+def normalize_phone(value) -> Optional[str]:
+    """Gibt eine bereinigte Telefonnummer zurück oder None bei fehlendem/ungültigem Wert."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in _INVALID_PHONE_VALUES:
+        return None
+    return s
+
+
 @dataclass
 class Kunde:
     customer_number: Optional[str] = None

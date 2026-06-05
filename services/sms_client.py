@@ -2,7 +2,7 @@ import logging
 import aiohttp  # Erforderlich für asynchrone HTTP-Anfragen
 
 from core.config import ConfigManager
-from models.kunde import Kunde
+from models.kunde import Kunde, normalize_phone
 
 
 class SmsClient:
@@ -159,7 +159,7 @@ class SmsClient:
         Gibt ein Tupel (Erfolg_boolean, sms_id_string_oder_None) zurück.
         """
 
-        phone_number = kunde.phone
+        phone_number = normalize_phone(kunde.phone)
         if not phone_number:
             self.log.warning(
                 f"Keine Telefonnummer für Erfolgs-SMS (Gast: {kunde.first_name} {kunde.last_name}) angegeben. Versand wird übersprungen.")

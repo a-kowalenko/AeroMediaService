@@ -10,7 +10,7 @@ from core.archive import find_archived_folder
 from core.monitor import resolve_kunde_from_marker, should_use_dropbox_client_for_marker
 from core.upload_markers import MARKER_PROCESSING, marker_paths
 from core.upload_queue_registry import UploadQueueRegistry
-from models.kunde import Kunde
+from models.kunde import Kunde, normalize_phone
 
 RETRYABLE_STATUSES = frozenset({"Fehler", "Abgebrochen"})
 
@@ -20,7 +20,7 @@ def _kunde_from_history_fields(entry: dict[str, Any]) -> Optional[Kunde]:
     first = (entry.get("first_name") or "").strip()
     last = (entry.get("last_name") or "").strip()
     email = (entry.get("email") or "").strip()
-    phone = (entry.get("phone") or "").strip() or None
+    phone = normalize_phone(entry.get("phone"))
 
     if not (first and last and email):
         return None

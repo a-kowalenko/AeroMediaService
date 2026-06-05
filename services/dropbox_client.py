@@ -311,9 +311,7 @@ class DropboxClient(BaseClient):
                 signals.upload_status_update.emit(status_msg)
                 self.log.debug(status_msg)
 
-                file_size_in_mb = file_size / 1024 ** 2
-
-                signals.upload_progress_file.emit(0, 0, file_size_in_mb)
+                signals.upload_progress_file.emit(0, 0, file_size)
 
                 with open(local_path, 'rb') as f:
                     if file_size <= CHUNK_SIZE:
@@ -329,7 +327,8 @@ class DropboxClient(BaseClient):
                             f"files_upload:{os.path.basename(local_path)}",
                             _do_small_upload,
                         )
-                        signals.upload_progress_file.emit(100, file_size_in_mb, file_size_in_mb)
+                        bytes_uploaded += file_size
+                        signals.upload_progress_file.emit(100, file_size, file_size)
                         total_progress = int((bytes_uploaded / total_size) * 100)
                         signals.upload_progress_total.emit(total_progress, bytes_uploaded, total_size)
                     else:
@@ -357,7 +356,7 @@ class DropboxClient(BaseClient):
                             rel_path=rel_norm,
                             on_progress_save=on_db_progress,
                         )
-                    bytes_uploaded += file_size
+                        bytes_uploaded += file_size
 
                 save_native_ck(
                     next_file_index=i + 1,
@@ -428,7 +427,7 @@ class DropboxClient(BaseClient):
         self._upload_coop_tick()
         bytes_sent = f.tell()
         file_progress = int((bytes_sent / file_size) * 100)
-        signals.upload_progress_file.emit(file_progress, bytes_sent, total_job_size)
+        signals.upload_progress_file.emit(file_progress, bytes_sent, file_size)
 
         current_total_bytes = base_bytes_uploaded + bytes_sent
         total_progress = int((current_total_bytes / total_job_size) * 100)

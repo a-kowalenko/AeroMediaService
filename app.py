@@ -1414,18 +1414,22 @@ class MainWindow(QMainWindow):
         self.upload_pause_toggle_btn.setEnabled(False)
         self.upload_cancel_btn.setEnabled(False)
 
-    @Slot(int, int, int)
+    @Slot(int, object, object)
     def update_file_progress(self, percent, current_bytes, total_bytes):
         """Aktualisiert den Fortschritt der einzelnen Datei (Bar + Text)."""
+        current_bytes = int(current_bytes or 0)
+        total_bytes = int(total_bytes or 0)
         self.file_progress_bar.setValue(percent)
         text = "0% (0.0 MB / 0.0 MB)"
         if total_bytes > 0 or current_bytes > 0:  # Verhindert "0.0 MB / 0.0 MB" bei Start
             text = f"{percent}% ({self.format_bytes(current_bytes)} / {self.format_bytes(total_bytes)})"
         self.file_progress_label.setText(text)
 
-    @Slot(int, int, int)
+    @Slot(int, object, object)
     def update_total_progress(self, percent, current_bytes, total_bytes):
         """Aktualisiert den Gesamtfortschritt (Bar + Text)."""
+        current_bytes = int(current_bytes or 0)
+        total_bytes = int(total_bytes or 0)
         self.total_progress_bar.setValue(percent)
         text = "0% (0.0 MB / 0.0 MB)"
         if total_bytes > 0 or current_bytes > 0:  # Verhindert "0.0 MB / 0.0 MB" bei Start

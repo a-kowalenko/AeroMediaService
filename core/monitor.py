@@ -4,7 +4,7 @@ import os
 import requests
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
-from models.kunde import Kunde
+from models.kunde import Kunde, normalize_phone
 from core.archive import handle_customer_lookup_failure, is_customer_lookup_failure
 from core.signals import signals
 from core.upload_markers import discard_stale_fertig_marker, marker_paths, read_marker_raw
@@ -149,7 +149,7 @@ def build_kunde_from_marker(data):
         if not str(data.get(field, "")).strip():
             raise ValueError(f"Pflichtfeld '{field}' fehlt oder ist leer.")
 
-    phone = str(data.get("telefon", "")).strip() or None
+    phone = normalize_phone(data.get("telefon"))
     marker_type = _normalize_marker_type(data.get("type")) or None
     return Kunde(
         first_name=str(data["vorname"]).strip(),
@@ -228,7 +228,7 @@ def build_kunde_from_customer(customer):
         email=str(customer.get("email", "")),
         first_name=str(customer.get("vorname", "")),
         last_name=str(customer.get("nachname", "")),
-        phone=str(customer.get("telefon", "")),
+        phone=normalize_phone(customer.get("telefon")),
         type=str(customer.get("typ", "")),
         **_media_flags_from_customer(customer),
     )

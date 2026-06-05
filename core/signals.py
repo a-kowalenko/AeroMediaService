@@ -14,8 +14,9 @@ class GlobalSignals(QObject):
     upload_history_update = Signal(dict)
 
     # Signale zur Aktualisierung der Fortschrittsanzeigen
-    upload_progress_file = Signal(int, int, int)  # Fortschritt der aktuellen Datei (Prozent, aktuelle Bytes, Gesamtbytes)
-    upload_progress_total = Signal(int, int, int)  # Gesamtfortschritt des Verzeichnisses (Prozent, aktuelle Bytes, Gesamtbytes)
+    # Byte-Werte als object (Python int), damit Werte > 2 GB nicht als 32-bit-int überlaufen.
+    upload_progress_file = Signal(int, object, object)  # Prozent, aktuelle Bytes, Gesamtbytes
+    upload_progress_total = Signal(int, object, object)  # Prozent, aktuelle Bytes, Gesamtbytes
 
     # Signal zur Anzeige einer Status-Nachricht (z.B. "Lade hoch...")
     upload_status_update = Signal(str)
