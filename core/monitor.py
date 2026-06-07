@@ -7,7 +7,12 @@ from PySide6.QtCore import QThread, QWaitCondition, QMutex
 from models.kunde import Kunde, normalize_phone
 from core.archive import handle_customer_lookup_failure, is_customer_lookup_failure
 from core.signals import signals
-from core.upload_markers import discard_stale_fertig_marker, marker_paths, read_marker_raw
+from core.upload_markers import (
+    discard_stale_fertig_marker,
+    marker_paths,
+    read_marker_file,
+    read_marker_raw,
+)
 from core.upload_queue_registry import UploadQueueRegistry
 from core.folder_stability import FolderStabilityTracker
 
@@ -264,8 +269,7 @@ def attempt_queue_upload_folder(
 
     marker_raw = None
     try:
-        with open(fertig_path, "r", encoding="utf-8") as marker_file:
-            marker_raw = marker_file.read().strip()
+        marker_raw = read_marker_file(fertig_path, log)
         log.debug("Marker-Daten für '%s': %s", dir_name, marker_raw)
         kunde = resolve_kunde_from_marker(config_manager, marker_raw)
         use_dropbox_client = should_use_dropbox_client_for_marker(config_manager, marker_raw)
@@ -350,8 +354,7 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
             continue
         discard_stale_fertig_marker(full_dir_path, log)
         try:
-            with open(processing_path, "r", encoding="utf-8") as marker_file:
-                marker_raw = marker_file.read().strip()
+            marker_raw = read_marker_file(processing_path, log)
             kunde = resolve_kunde_from_marker(config_manager, marker_raw)
             use_dropbox_client = should_use_dropbox_client_for_marker(config_manager, marker_raw)
             log.info("Recovery: unterbrochener Auftrag '%s', Kundendaten geladen.", dir_name)

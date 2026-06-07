@@ -17,6 +17,13 @@ class HistoryManager:
                 return []
         return []
 
+    def get_file_mtime(self) -> float | None:
+        """Liefert den Änderungszeitpunkt der Historiendatei oder None."""
+        try:
+            return os.path.getmtime(self.file_path)
+        except OSError:
+            return None
+
     def reload_from_file(self):
         """Ersetzt die in-memory-Historie durch den aktuellen Dateiinhalt (ohne zu speichern)."""
         self.history = self.load_history()

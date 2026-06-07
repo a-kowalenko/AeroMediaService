@@ -16,15 +16,29 @@ def marker_paths(folder_path: str) -> tuple[str, str]:
     )
 
 
-def read_marker_raw(folder_path: str) -> Optional[str]:
+def read_marker_file(path: str, logger: Optional[logging.Logger] = None) -> str:
+    """Liest eine Marker-Datei; UTF-8 zuerst, bei Decode-Fehler CP1252."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as marker_file:
+            return marker_file.read().strip()
+    except UnicodeDecodeError:
+        pass
+
+    with open(path, "r", encoding="cp1252") as marker_file:
+        content = marker_file.read().strip()
+    if logger:
+        logger.warning("Marker %s nicht als UTF-8 lesbar, mit CP1252 gelesen.", path)
+    return content
+
+
+def read_marker_raw(folder_path: str, logger: Optional[logging.Logger] = None) -> Optional[str]:
     """Liest Marker-Inhalt aus _in_verarbeitung.txt oder _fertig.txt."""
     fertig_path, processing_path = marker_paths(folder_path)
     for path in (processing_path, fertig_path):
         if not os.path.isfile(path):
             continue
         try:
-            with open(path, "r", encoding="utf-8") as marker_file:
-                return marker_file.read().strip()
+            return read_marker_file(path, logger)
         except OSError:
             continue
     return None

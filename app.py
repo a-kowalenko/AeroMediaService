@@ -84,7 +84,7 @@ class StatusLight(QWidget):
 
 
 class HistoryRefreshOverlay(QWidget):
-    """Dezente halbtransparente Schicht mit zentriertem Lade-Indikator über der Historien-Tabelle."""
+    """Dezente halbtransparente Schicht mit zentriertem Lade-Indikator über dem Historien-Panel."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,14 +138,14 @@ class HistoryRefreshOverlay(QWidget):
         painter.drawArc(ring, self._angle * 16, 280 * 16)
 
 
-class _HistoryTableHost(QWidget):
-    """Stackt die Tabelle und das Lade-Overlay gleich groß übereinander."""
+class _HistoryPanelHost(QWidget):
+    """Stackt ein Panel-Widget und das Lade-Overlay gleich groß übereinander."""
 
-    def __init__(self, table: QTableWidget):
+    def __init__(self, content: QWidget):
         super().__init__()
-        self._table = table
+        self._content = content
         self._overlay = HistoryRefreshOverlay(self)
-        self._table.setParent(self)
+        self._content.setParent(self)
         self._overlay.hide()
 
     @property
@@ -155,8 +155,32 @@ class _HistoryTableHost(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         r = self.rect()
-        self._table.setGeometry(r)
+        self._content.setGeometry(r)
         self._overlay.setGeometry(r)
+
+
+class HistoryFileLoadWorker(QObject):
+    """Lädt upload_history.json im Hintergrund."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        import json
+        import os
+
+        try:
+            if not os.path.exists(self.file_path):
+                self.finished.emit([])
+                return
+            with open(self.file_path, "r", encoding="utf-8") as handle:
+                self.finished.emit(json.load(handle))
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class ResendNotificationsDialog(QDialog):
@@ -379,6 +403,10 @@ class MainWindow(QMainWindow):
         self._contact_dirty = False
         self._resend_worker_thread = None
         self._share_link_migration_thread = None
+        self._history_file_load_thread = None
+        self._history_loaded_mtime = self.history_manager.get_file_mtime()
+        self._history_ui_initialized = False
+        self._status_icon_cache: dict[str, QIcon] = {}
 
         # Member-Variable für den letzten Update-Status
         self.latest_version_info = "Noch nicht geprüft."
@@ -593,9 +621,7 @@ class MainWindow(QMainWindow):
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.itemSelectionChanged.connect(self.on_history_selection_changed)
         self.history_table.itemDoubleClicked.connect(self.on_history_cell_clicked)
-        self._history_table_host = _HistoryTableHost(self.history_table)
-        self._history_refresh_overlay = self._history_table_host.overlay
-        self.history_splitter.addWidget(self._history_table_host)
+        self.history_splitter.addWidget(self.history_table)
 
         self.history_details_splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -662,7 +688,9 @@ class MainWindow(QMainWindow):
         self.history_splitter.setStretchFactor(0, 3)
         self.history_splitter.setStretchFactor(1, 2)
 
-        history_layout.addWidget(self.history_splitter)
+        self._history_panel_host = _HistoryPanelHost(self.history_splitter)
+        self._history_refresh_overlay = self._history_panel_host.overlay
+        history_layout.addWidget(self._history_panel_host)
 
         # Pagination
         pag_layout = QHBoxLayout()
@@ -681,7 +709,6 @@ class MainWindow(QMainWindow):
         history_layout.addLayout(pag_layout)
 
         self.tabs.addTab(self.history_tab, "Upload-Historie")
-        self.refresh_history_table()
 
         # 4. Statusleiste (unten)
         self.status_bar = QStatusBar()
@@ -826,6 +853,7 @@ class MainWindow(QMainWindow):
         if not updated_dir:
             selected_id = self.get_selected_history_id()
             self.history_manager.add_or_update(data)
+            self._sync_history_loaded_mtime()
             self.refresh_history_table(maintain_page=True)
             self._refresh_history_detail_if_needed(data, selected_id)
             return
@@ -846,6 +874,7 @@ class MainWindow(QMainWindow):
         selected_id = self.get_selected_history_id()
         for merged in batch.values():
             self.history_manager.add_or_update(merged)
+        self._sync_history_loaded_mtime()
         self.refresh_history_table(maintain_page=True)
         if selected_id:
             for merged in batch.values():
@@ -908,20 +937,93 @@ class MainWindow(QMainWindow):
         if self._history_refresh_overlay_refs == 0:
             self._history_refresh_overlay.hide_loading()
 
-    def reload_history_from_disk_and_refresh(self):
-        """Liest upload_history.json neu ein, zeichnet die Tabelle neu, startet SMS-Status-Prüfung."""
-        self._begin_history_refresh_overlay()
-        sms_started = False
+    def _sync_history_loaded_mtime(self):
+        self._history_loaded_mtime = self.history_manager.get_file_mtime()
+
+    def _history_file_load_busy(self) -> bool:
+        thread = getattr(self, "_history_file_load_thread", None)
+        if thread is None:
+            return False
         try:
-            self.history_manager.reload_from_file()
-            self.refresh_history_table(maintain_page=True)
-            sms_started = self.check_sms_status()
-        except Exception:
-            self.log.exception("Historie-Refresh fehlgeschlagen")
-            self._end_history_refresh_overlay()
+            return thread.isRunning()
+        except RuntimeError:
+            self._history_file_load_thread = None
+            return False
+
+    def _history_refresh_busy(self) -> bool:
+        return self._history_file_load_busy() or self._sms_status_worker_busy()
+
+    def _history_file_changed_on_disk(self) -> bool:
+        current_mtime = self.history_manager.get_file_mtime()
+        return current_mtime != self._history_loaded_mtime
+
+    def _ensure_history_ui_rendered(self):
+        """Zeigt die in-memory-Historie an, ohne von Platte neu zu laden."""
+        if self._history_ui_initialized:
             return
-        if not sms_started:
-            QTimer.singleShot(320, self._end_history_refresh_overlay)
+        QTimer.singleShot(0, self._render_history_ui_once)
+
+    @Slot()
+    def _render_history_ui_once(self):
+        if self._history_ui_initialized:
+            return
+        self.refresh_history_table(maintain_page=True)
+        self._history_ui_initialized = True
+
+    def reload_history_from_disk_and_refresh(self, *, force=False, check_sms=True):
+        """Lädt Historie bei Bedarf asynchron von Platte und prüft optional SMS-Status."""
+        if self._history_file_load_busy():
+            return
+
+        file_changed = force or self._history_file_changed_on_disk()
+        if not file_changed:
+            self._ensure_history_ui_rendered()
+            return
+
+        self._begin_history_refresh_overlay()
+        self.status_label.setText("Historie wird geladen…")
+
+        self._history_file_load_thread = QThread()
+        worker = HistoryFileLoadWorker(self.history_manager.file_path)
+        worker.moveToThread(self._history_file_load_thread)
+        self._history_file_load_thread.started.connect(worker.run)
+        worker.finished.connect(self._on_history_file_loaded)
+        worker.failed.connect(self._on_history_file_load_failed)
+        worker.finished.connect(self._history_file_load_thread.quit)
+        worker.failed.connect(self._history_file_load_thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        self._history_file_load_thread.finished.connect(self._history_file_load_thread.deleteLater)
+        self._history_file_load_thread.start()
+
+        self._history_file_load_check_sms = check_sms
+
+    @Slot(object)
+    def _on_history_file_loaded(self, data):
+        self.history_manager.history = data if isinstance(data, list) else []
+        self._sync_history_loaded_mtime()
+        self.refresh_history_table(maintain_page=True)
+        self._history_ui_initialized = True
+        self._history_file_load_thread = None
+
+        check_sms = getattr(self, "_history_file_load_check_sms", True)
+        if check_sms:
+            self.status_label.setText("SMS-Status wird geprüft…")
+            sms_started = self.check_sms_status()
+            if not sms_started:
+                QTimer.singleShot(320, self._end_history_refresh_overlay)
+                self.status_label.setText("Historie geladen.")
+        else:
+            QTimer.singleShot(120, self._end_history_refresh_overlay)
+            self.status_label.setText("Historie geladen.")
+
+    @Slot(str)
+    def _on_history_file_load_failed(self, message):
+        self.log.error("Historie-Datei konnte nicht geladen werden: %s", message)
+        self._history_file_load_thread = None
+        self._end_history_refresh_overlay()
+        self.status_label.setText("Historie laden fehlgeschlagen.")
+        QMessageBox.warning(self, "Upload-Historie", f"Historie konnte nicht geladen werden:\n{message}")
 
     def _update_history_refresh_countdown_label(self):
         if hasattr(self, "history_refresh_countdown_label"):
@@ -933,14 +1035,14 @@ class MainWindow(QMainWindow):
     def _on_history_refresh_timer_tick(self):
         self._history_refresh_seconds_left -= 1
         if self._history_refresh_seconds_left <= 0:
-            self.reload_history_from_disk_and_refresh()
+            self.reload_history_from_disk_and_refresh(force=False, check_sms=True)
             self._history_refresh_seconds_left = self._history_refresh_interval_sec
         self._update_history_refresh_countdown_label()
 
     @Slot()
     def on_history_manual_refresh_clicked(self):
         self._history_refresh_seconds_left = self._history_refresh_interval_sec
-        self.reload_history_from_disk_and_refresh()
+        self.reload_history_from_disk_and_refresh(force=True, check_sms=True)
         self._update_history_refresh_countdown_label()
 
     def refresh_history_table(self, maintain_page=False):
@@ -1122,7 +1224,7 @@ class MainWindow(QMainWindow):
         return "Unbekannt"
 
     def get_status_icon(self, status_text, context_key=""):
-        """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text."""
+        """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text (mit Cache)."""
         color = "gray"
         lower_status = status_text.lower()
         lower_context = (context_key or "").lower()
@@ -1150,6 +1252,11 @@ class MainWindow(QMainWindow):
         elif "übersprungen" in lower_status:
             color = "gray"
 
+        cache_key = f"{color}|{lower_context}"
+        cached = self._status_icon_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         pixmap = QPixmap(16, 16)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
@@ -1158,14 +1265,22 @@ class MainWindow(QMainWindow):
         painter.setPen(Qt.GlobalColor.transparent)
         painter.drawEllipse(2, 2, 12, 12)
         painter.end()
-        return QIcon(pixmap)
+        icon = QIcon(pixmap)
+        self._status_icon_cache[cache_key] = icon
+        return icon
 
     @Slot(int)
     def on_tab_changed(self, index):
         """Wird aufgerufen, wenn der Tab gewechselt wird."""
         if hasattr(self, 'history_tab') and hasattr(self, 'tabs') and self.tabs.widget(index) == self.history_tab:
-            # Historie von Platte + Tabelle + SMS-Status wie beim periodischen Refresh
-            self.reload_history_from_disk_and_refresh()
+            QTimer.singleShot(0, self._on_history_tab_activated)
+
+    @Slot()
+    def _on_history_tab_activated(self):
+        """Verzögertes Laden: Tab wird zuerst gezeichnet, dann Historie aktualisiert."""
+        if self._history_refresh_busy():
+            return
+        self.reload_history_from_disk_and_refresh(force=False, check_sms=False)
 
     @Slot()
     def on_history_selection_changed(self):
@@ -1339,6 +1454,7 @@ class MainWindow(QMainWindow):
 
         payload = build_contact_update_payload(entry, email, phone)
         self.history_manager.add_or_update(payload)
+        self._sync_history_loaded_mtime()
         if phone:
             self.contact_phone_input.setText(phone)
         self._contact_dirty = False
@@ -1463,6 +1579,7 @@ class MainWindow(QMainWindow):
         payload = build_contact_update_payload(entry, email, phone)
         payload["share_link"] = share_link
         self.history_manager.add_or_update(payload)
+        self._sync_history_loaded_mtime()
         entry.update(payload)
         self._contact_dirty = False
         self.contact_save_btn.setEnabled(False)
@@ -1472,6 +1589,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_resend_notifications_finished(self, result):
         self.history_manager.add_or_update(result.history_updates)
+        self._sync_history_loaded_mtime()
         signals.upload_history_update.emit(dict(result.history_updates))
         self.check_sms_status()
         self.refresh_history_table(maintain_page=True)
@@ -1531,6 +1649,7 @@ class MainWindow(QMainWindow):
     def _on_share_link_migration_finished(self, count):
         if count:
             self.log.info("%s Download-Link(s) für Alteinträge nachgeladen.", count)
+            self._sync_history_loaded_mtime()
             self.refresh_history_table(maintain_page=True)
             entry_id = self.get_selected_history_id()
             refreshed = self.get_history_entry_by_id(entry_id)
@@ -1668,6 +1787,7 @@ class MainWindow(QMainWindow):
                     if item_id:
                         ids_to_delete.append(item_id)
             self.history_manager.delete_items(ids_to_delete)
+            self._sync_history_loaded_mtime()
             self.refresh_history_table(maintain_page=True)
 
     @Slot()
@@ -1676,6 +1796,7 @@ class MainWindow(QMainWindow):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.history_manager.clear_all()
+            self._sync_history_loaded_mtime()
             self.refresh_history_table()
 
     def check_sms_status(self):
@@ -1706,8 +1827,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def on_sms_status_checked(self):
         """Wird aufgerufen, wenn die SMS-Status-Prüfung abgeschlossen ist."""
+        self._sync_history_loaded_mtime()
         self.refresh_history_table(maintain_page=True)
         self._end_history_refresh_overlay()
+        self.status_label.setText("Historie aktualisiert.")
 
     @Slot(bool)
     def toggle_monitoring(self, checked):
