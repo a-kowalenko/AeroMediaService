@@ -40,6 +40,12 @@ _STREAM_PROGRESS_EMIT_INTERVAL_S = 0.05
 # Schrittgröße, falls der HTTP-Stack read(-1) auf dem Chunk-Body aufruft (sonst kein Zwischenstand).
 _STREAM_READALL_SLICE = 256 * 1024
 
+# POST /api/orders/create — Client-Timeout (Fallback; Cloud antwortet typisch sofort mit HTTP 202).
+ORDERS_CREATE_TIMEOUT = 120
+# Optionales Polling auf GET /api/orders/{order_id}/manifest-status nach HTTP 202.
+MANIFEST_STATUS_POLL_MAX_S = 300
+MANIFEST_STATUS_POLL_INTERVAL_S = 3
+
 
 class _ChunkReadProgressBytesIO(io.BytesIO):
     """BytesIO, das read()/readinto() meldet — Fortschritt innerhalb eines Multipart-Chunks."""
@@ -106,6 +112,14 @@ def _multipart_fields_with_chunk_stream_monitor(fields: dict, on_chunk_stream_pr
 
 class ApiAuthError(Exception):
     """401/403: ungueltiger Key oder fehlende 'upload'-Permission — kein Retry."""
+
+
+class OrderCreateInterrupted(Exception):
+    """orders/create: Timeout/Abbruch — Order existiert ggf. bereits (idempotent über root_folder.path)."""
+
+    def __init__(self, order_id: str | None = None):
+        self.order_id = order_id
+        super().__init__(order_id or "orders/create unterbrochen")
 
 
 def _body_suggests_invocation_timeout(text: str) -> bool:
@@ -445,16 +459,37 @@ class CustomApiClient(BaseClient):
         self,
         json_body: dict,
         *,
-        timeout: int = 120,
+        timeout: int = ORDERS_CREATE_TIMEOUT,
         tag: str = "orders/create",
+        known_order_id: str | None = None,
     ):
-        """POST JSON an /api/orders/create mit Retry bei transienten Fehlern."""
+        """POST JSON an /api/orders/create mit Retry bei transienten Fehlern.
+
+        Bei Timeout kein POST-Retry (Order kann bereits existieren, idempotent über root_folder.path).
+        Mit known_order_id ebenfalls kein POST-Retry bei transienten Fehlern.
+        """
         url = f"{self._api_origin()}/api/orders/create"
         max_attempts = 6
         for attempt in range(1, max_attempts + 1):
             try:
                 r = self.session.post(url, json=json_body, timeout=timeout)
+            except requests.exceptions.Timeout as e:
+                oid = known_order_id
+                self.log.warning(
+                    "%s: Timeout nach %ss — kein POST-Retry (Order ggf. bereits angelegt).",
+                    tag,
+                    timeout,
+                )
+                raise OrderCreateInterrupted(oid) from e
             except requests.exceptions.RequestException as e:
+                if known_order_id:
+                    self.log.warning(
+                        "%s: Netzwerk-Fehler, Order %s existiert — kein POST-Retry: %s",
+                        tag,
+                        known_order_id,
+                        e,
+                    )
+                    raise OrderCreateInterrupted(known_order_id) from e
                 if attempt >= max_attempts:
                     self.log.error("%s: %s nach %s Versuchen", tag, e, max_attempts)
                     raise
@@ -475,11 +510,20 @@ class CustomApiClient(BaseClient):
                     f"API-Key fehlt oder hat keine 'upload'-Permission (HTTP {r.status_code}). "
                     f"{(body or '')[:200]}"
                 )
-            if r.ok:
+            # HTTP 202 = Erfolg (async Manifest-Verknüpfung), nicht als Fehler behandeln.
+            if r.status_code in (200, 201, 202) or r.ok:
                 if attempt > 1:
                     self.log.info("%s: HTTP %s nach Versuch %s", tag, r.status_code, attempt)
                 return r
             if self._http_transient(r.status_code, body):
+                if known_order_id:
+                    self.log.warning(
+                        "%s: HTTP %s, Order %s existiert — kein POST-Retry.",
+                        tag,
+                        r.status_code,
+                        known_order_id,
+                    )
+                    raise OrderCreateInterrupted(known_order_id)
                 if attempt >= max_attempts:
                     summary = _summarize_api_error_body(body)
                     self.log.error(
@@ -1448,10 +1492,74 @@ class CustomApiClient(BaseClient):
         if oid is not None:
             self._last_order_id = str(oid)
         self.log.info(
-            "Manifest v1.1: order_id=%s final_url=%s",
+            "Manifest v1.1: order_id=%s final_url=%s status=%s",
             self._last_order_id,
             self._last_customer_url,
+            data.get("status"),
         )
+
+    def _wait_for_manifest_status(
+        self,
+        order_id: str,
+        *,
+        max_wait_time: int = MANIFEST_STATUS_POLL_MAX_S,
+        poll_interval: int = MANIFEST_STATUS_POLL_INTERVAL_S,
+    ) -> dict | None:
+        """Pollt GET /api/orders/{order_id}/manifest-status bis status === completed."""
+        if not order_id or not self.session:
+            return None
+
+        url = f"{self._api_origin()}/api/orders/{order_id}/manifest-status"
+        started_at = time.monotonic()
+        self.log.info("Warte auf Manifest-Verknüpfung (order_id=%s)...", order_id)
+
+        while (time.monotonic() - started_at) < max_wait_time:
+            self._upload_coop_tick()
+            try:
+                response = self.session.get(url, timeout=15)
+                if not response.ok:
+                    self.log.debug(
+                        "manifest-status: HTTP %s (order_id=%s)",
+                        response.status_code,
+                        order_id,
+                    )
+                    time.sleep(poll_interval)
+                    continue
+
+                data = response.json()
+                if not isinstance(data, dict):
+                    time.sleep(poll_interval)
+                    continue
+
+                status = data.get("status")
+                if status == "completed":
+                    self.log.info(
+                        "Manifest-Verknüpfung abgeschlossen (order_id=%s).",
+                        order_id,
+                    )
+                    self._apply_order_create_response(data)
+                    return data
+
+                if status == "failed":
+                    error_msg = data.get("error") or data.get("message") or data
+                    raise Exception(f"manifest-status: failed — {error_msg}")
+
+                signals.upload_status_update.emit(
+                    f"Verknüpfe Dateien in Cloud... ({status or 'processing'})"
+                )
+            except Exception as e:
+                if "manifest-status: failed" in str(e):
+                    raise
+                self.log.debug("manifest-status Poll: %s", e)
+
+            time.sleep(poll_interval)
+
+        self.log.warning(
+            "manifest-status: Timeout nach %ss (order_id=%s) — final_url bleibt gültig.",
+            max_wait_time,
+            order_id,
+        )
+        return None
 
     def _submit_manifest_v11(
         self,
@@ -1459,6 +1567,8 @@ class CustomApiClient(BaseClient):
         *,
         local_dir_path: str,
         save_dd_ck,
+        known_order_id: str | None = None,
+        known_final_url: str | None = None,
         **ck_extra,
     ) -> None:
         meta = manifest.get("meta") or {}
@@ -1477,9 +1587,46 @@ class CustomApiClient(BaseClient):
         )
         save_dd_ck(phase="manifest_pending", **ck_extra)
         self._upload_coop_tick()
+
+        if known_order_id:
+            self._last_order_id = str(known_order_id)
+            if known_final_url:
+                self._last_customer_url = str(known_final_url).strip()
+            self.log.info(
+                "Checkpoint: Order %s bereits angelegt — kein POST-Retry, warte auf Manifest.",
+                known_order_id,
+            )
+            signals.upload_status_update.emit("Verknüpfe Dateien in Cloud...")
+            self._wait_for_manifest_status(known_order_id)
+            clear_checkpoint(local_dir_path)
+            return
+
         signals.upload_status_update.emit("Registriere Order bei Cloud...")
 
-        response = self._post_json_orders(manifest, timeout=120, tag="orders/create")
+        try:
+            response = self._post_json_orders(
+                manifest,
+                timeout=ORDERS_CREATE_TIMEOUT,
+                tag="orders/create",
+                known_order_id=known_order_id,
+            )
+        except OrderCreateInterrupted as e:
+            if e.order_id:
+                self._last_order_id = str(e.order_id)
+                save_dd_ck(
+                    phase="manifest_pending",
+                    order_id=self._last_order_id,
+                    final_url=self._last_customer_url,
+                    **ck_extra,
+                )
+                self._wait_for_manifest_status(e.order_id)
+                clear_checkpoint(local_dir_path)
+                return
+            raise Exception(
+                "orders/create: Timeout — Checkpoint vorhanden, bitte Upload fortsetzen "
+                "(Manifest ist idempotent über root_folder.path)."
+            ) from e
+
         data = response.json() if response.content else {}
         if isinstance(data, dict) and data.get("ok") is False:
             error_code = data.get("error_code", "")
@@ -1492,6 +1639,25 @@ class CustomApiClient(BaseClient):
         self._apply_order_create_response(data if isinstance(data, dict) else {})
         if not self._last_customer_url:
             self.log.warning("orders/create: keine final_url in Antwort.")
+
+        save_dd_ck(
+            phase="manifest_pending",
+            order_id=self._last_order_id,
+            final_url=self._last_customer_url,
+            **ck_extra,
+        )
+
+        http_status = response.status_code
+        status = data.get("status") if isinstance(data, dict) else None
+        if http_status == 202 or status == "processing":
+            self.log.info(
+                "orders/create: HTTP %s, status=%s — Datei-Verknüpfung läuft im Hintergrund.",
+                http_status,
+                status,
+            )
+            if self._last_order_id:
+                self._wait_for_manifest_status(self._last_order_id)
+
         clear_checkpoint(local_dir_path)
 
     def _get_dropbox_folder_share_link(self, remote_path: str) -> str | None:
@@ -1589,9 +1755,12 @@ class CustomApiClient(BaseClient):
         if resume_ck and resume_ck.get("phase") == "manifest_pending":
             uploaded_files = list(resume_ck.get("uploaded_files") or [])
             root_share_link = resume_ck.get("root_share_link")
+            resume_order_id = resume_ck.get("order_id")
+            resume_final_url = resume_ck.get("final_url")
             self.log.info(
-                "Checkpoint: Manifest-POST wird fortgesetzt (%s Dateien).",
+                "Checkpoint: Manifest-POST wird fortgesetzt (%s Dateien%s).",
                 len(uploaded_files),
+                f", order_id={resume_order_id}" if resume_order_id else "",
             )
             manifest = build_manifest_v11(
                 base_dir=folder_name,
@@ -1616,6 +1785,8 @@ class CustomApiClient(BaseClient):
                 manifest,
                 local_dir_path=local_dir_path,
                 save_dd_ck=save_manifest_ck,
+                known_order_id=str(resume_order_id) if resume_order_id else None,
+                known_final_url=str(resume_final_url) if resume_final_url else None,
             )
             signals.upload_status_update.emit("Upload abgeschlossen.")
             return True

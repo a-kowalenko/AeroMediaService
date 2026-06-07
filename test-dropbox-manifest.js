@@ -170,7 +170,8 @@ async function sendManifest(label) {
 
   const data = await response.json();
 
-  if (!response.ok) {
+  // HTTP 202 = Erfolg (async Manifest-Verknuepfung), nicht als Fehler behandeln.
+  if (!response.ok && response.status !== 202) {
     console.log('Error!');
     console.log('Status:', response.status);
     console.log('Error:', data);
@@ -178,6 +179,7 @@ async function sendManifest(label) {
   }
 
   console.log('Success!');
+  console.log('Status:', response.status, data.status || '');
   console.log('Order ID:', data.order_id);
   console.log('Customer URL:', data.final_url);
   return data.order_id;
