@@ -8,10 +8,10 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter,
-    QDialog, QDialogButtonBox, QCheckBox
+    QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QGroupBox,
 )
 
-from PySide6.QtCore import QCoreApplication, QProcess, QThread, QTimer, QRectF, Slot, Qt, Signal
+from PySide6.QtCore import QCoreApplication, QProcess, QThread, QTimer, QRectF, Slot, Qt, Signal, QObject
 
 # Importiere alle Komponenten des Projekts
 from core import APP_VERSION
@@ -22,6 +22,22 @@ from core.monitor import MonitorThread, recover_stalled_upload_folders
 from core.uploader import UploaderThread
 from core.upload_queue_registry import UploadQueueRegistry
 from core.retry_upload import retry_upload_from_history, RETRYABLE_STATUSES
+from core.resend_notifications import (
+    can_resend_notifications,
+    resolve_share_link,
+    lookup_share_link_from_cloud,
+    validate_contact_for_channels,
+    normalize_contact,
+    channels_already_delivered,
+    get_sandbox_warnings,
+    build_contact_update_payload,
+    resend_notifications,
+    format_resend_result_message,
+    format_resend_history_summary,
+    migrate_share_links_for_history,
+)
+from models.kunde import normalize_phone
+from utils.validation import is_valid_email, is_valid_share_link
 from services.dropbox_client import DropboxClient
 from services.custom_api_client import CustomApiClient
 from services.email_client import EmailClient
@@ -143,6 +159,151 @@ class _HistoryTableHost(QWidget):
         self._overlay.setGeometry(r)
 
 
+class ResendNotificationsDialog(QDialog):
+    """Dialog zum erneuten Versenden von E-Mail und/oder SMS."""
+
+    def __init__(self, entry, email, phone, share_link, cloud_client, config_manager, parent=None):
+        super().__init__(parent)
+        self.entry = dict(entry)
+        self.cloud_client = cloud_client
+        self.config_manager = config_manager
+
+        self.setWindowTitle("Benachrichtigung erneut senden")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+
+        dir_name = (entry.get("dir_name") or "").strip()
+        first = (entry.get("first_name") or "").strip()
+        last = (entry.get("last_name") or "").strip()
+        customer = f"{first} {last}".strip() or "—"
+
+        layout.addWidget(QLabel(f"<b>Auftrag:</b> {dir_name}"))
+        layout.addWidget(QLabel(f"<b>Kunde:</b> {customer}"))
+
+        for warning in get_sandbox_warnings(config_manager):
+            warn_label = QLabel(f"⚠ {warning}")
+            warn_label.setStyleSheet("color: #b45309; font-weight: 500;")
+            warn_label.setWordWrap(True)
+            layout.addWidget(warn_label)
+
+        layout.addWidget(QLabel("<b>Download-Link</b>"))
+        link_row = QHBoxLayout()
+        self.link_input = QLineEdit()
+        self.link_input.setPlaceholderText("https://…")
+        self.link_input.setText((share_link or "").strip())
+        link_row.addWidget(self.link_input)
+
+        self.load_link_btn = QPushButton("Aus Cloud laden")
+        self.load_link_btn.setToolTip("Link über die verbundene Cloud ermitteln")
+        self.load_link_btn.clicked.connect(self._on_load_link_clicked)
+        link_row.addWidget(self.load_link_btn)
+        layout.addLayout(link_row)
+
+        self._update_load_link_button_state()
+        self.email_checkbox = QCheckBox("E-Mail senden")
+        self.sms_checkbox = QCheckBox("SMS senden")
+        self.email_checkbox.setChecked(bool((email or "").strip()))
+        self.sms_checkbox.setChecked(bool(normalize_phone(phone)))
+        layout.addWidget(self.email_checkbox)
+        layout.addWidget(self.sms_checkbox)
+
+        sms_hint = QLabel("SMS: Jeder Versand verursacht Kosten bei Seven.io.")
+        sms_hint.setStyleSheet("color: gray;")
+        sms_hint.setWordWrap(True)
+        layout.addWidget(sms_hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Jetzt senden")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_load_link_button_state(self):
+        connected = (
+            self.cloud_client is not None
+            and self.cloud_client.get_connection_status() == "Verbunden"
+        )
+        self.load_link_btn.setEnabled(connected)
+
+    def _on_load_link_clicked(self):
+        try:
+            link = lookup_share_link_from_cloud(self.entry, self.cloud_client)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Link laden", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Link laden", f"Link konnte nicht geladen werden:\n{exc}")
+            return
+        self.link_input.setText(link)
+
+    def get_send_email(self) -> bool:
+        return self.email_checkbox.isChecked()
+
+    def get_send_sms(self) -> bool:
+        return self.sms_checkbox.isChecked()
+
+    def get_share_link(self) -> str:
+        return self.link_input.text().strip()
+
+
+class ResendNotificationsWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, entry, email, phone, share_link, send_email, send_sms, email_client, sms_client, config_manager):
+        super().__init__()
+        self.entry = entry
+        self.email = email
+        self.phone = phone
+        self.share_link = share_link
+        self.send_email = send_email
+        self.send_sms = send_sms
+        self.email_client = email_client
+        self.sms_client = sms_client
+        self.config_manager = config_manager
+
+    def run(self):
+        try:
+            result = resend_notifications(
+                self.entry,
+                self.email,
+                self.phone,
+                self.share_link,
+                self.send_email,
+                self.send_sms,
+                self.email_client,
+                self.sms_client,
+                self.config_manager,
+            )
+            self.finished.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ShareLinkMigrationWorker(QObject):
+    finished = Signal(int)
+
+    def __init__(self, history_manager, cloud_client):
+        super().__init__()
+        self.history_manager = history_manager
+        self.cloud_client = cloud_client
+
+    def run(self):
+        try:
+            count = migrate_share_links_for_history(
+                self.history_manager.history,
+                self.cloud_client,
+            )
+            if count:
+                self.history_manager.save_history()
+            self.finished.emit(count)
+        except Exception:
+            self.finished.emit(0)
+
+
 class MainWindow(QMainWindow):
     """
     Das Hauptfenster der Anwendung.
@@ -214,6 +375,10 @@ class MainWindow(QMainWindow):
         self.current_history_page = 0
         self.history_items_per_page = 25
         self._history_refresh_overlay_refs = 0
+        self._contact_populating = False
+        self._contact_dirty = False
+        self._resend_worker_thread = None
+        self._share_link_migration_thread = None
 
         # Member-Variable für den letzten Update-Status
         self.latest_version_info = "Noch nicht geprüft."
@@ -398,6 +563,14 @@ class MainWindow(QMainWindow):
         self.retry_upload_btn.clicked.connect(self.on_retry_upload_clicked)
         hist_top_layout.addWidget(self.retry_upload_btn)
 
+        self.resend_notifications_btn = QPushButton("Benachrichtigung erneut senden…")
+        self.resend_notifications_btn.setEnabled(False)
+        self.resend_notifications_btn.setToolTip(
+            "E-Mail und/oder SMS für einen erfolgreichen Upload erneut versenden"
+        )
+        self.resend_notifications_btn.clicked.connect(self.on_resend_notifications_clicked)
+        hist_top_layout.addWidget(self.resend_notifications_btn)
+
         self.delete_selected_btn = QPushButton("Ausgewählte löschen")
         self.delete_selected_btn.clicked.connect(self.delete_selected_history)
         hist_top_layout.addWidget(self.delete_selected_btn)
@@ -408,10 +581,9 @@ class MainWindow(QMainWindow):
 
         history_layout.addLayout(hist_top_layout)
 
-        # Splitter für Main und Detail Grid
+        # Splitter: oben Historie, unten Eigenschaften + Kontakt nebeneinander
         self.history_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Tabelle (Main Grid)
         self.history_table = QTableWidget()
         self.history_table.setColumnCount(4)
         self.history_table.setHorizontalHeaderLabels(["Datum", "Name", "Status", "Fehler"])
@@ -425,7 +597,8 @@ class MainWindow(QMainWindow):
         self._history_refresh_overlay = self._history_table_host.overlay
         self.history_splitter.addWidget(self._history_table_host)
 
-        # Detail Grid
+        self.history_details_splitter = QSplitter(Qt.Orientation.Horizontal)
+
         self.detail_table = QTableWidget()
         self.detail_table.setColumnCount(2)
         self.detail_table.setHorizontalHeaderLabels(["Eigenschaft", "Wert"])
@@ -433,7 +606,61 @@ class MainWindow(QMainWindow):
         self.detail_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.detail_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.history_splitter.addWidget(self.detail_table)
+        self.history_details_splitter.addWidget(self.detail_table)
+
+        self.history_contact_group = QGroupBox("Kontakt")
+        self.history_contact_group.setStyleSheet(
+            "QGroupBox { font-weight: 600; margin-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
+        )
+        contact_outer = QVBoxLayout(self.history_contact_group)
+
+        contact_form = QFormLayout()
+        contact_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.contact_email_input = QLineEdit()
+        self.contact_email_input.setPlaceholderText("name@beispiel.de")
+        self.contact_email_input.textChanged.connect(self._on_contact_fields_changed)
+        email_field_box = QVBoxLayout()
+        email_field_box.setSpacing(2)
+        email_field_box.addWidget(self.contact_email_input)
+        self.contact_email_status_label = QLabel("—")
+        self.contact_email_status_label.setStyleSheet("color: gray; font-size: 11px;")
+        email_field_box.addWidget(self.contact_email_status_label)
+        email_widget = QWidget()
+        email_widget.setLayout(email_field_box)
+        contact_form.addRow("E-Mail", email_widget)
+
+        self.contact_phone_input = QLineEdit()
+        self.contact_phone_input.setPlaceholderText("+49 …")
+        self.contact_phone_input.textChanged.connect(self._on_contact_fields_changed)
+        phone_field_box = QVBoxLayout()
+        phone_field_box.setSpacing(2)
+        phone_field_box.addWidget(self.contact_phone_input)
+        self.contact_phone_status_label = QLabel("—")
+        self.contact_phone_status_label.setStyleSheet("color: gray; font-size: 11px;")
+        phone_field_box.addWidget(self.contact_phone_status_label)
+        phone_widget = QWidget()
+        phone_widget.setLayout(phone_field_box)
+        contact_form.addRow("Telefon", phone_widget)
+
+        contact_outer.addLayout(contact_form)
+
+        contact_btn_row = QHBoxLayout()
+        self.contact_save_btn = QPushButton("Änderungen speichern")
+        self.contact_save_btn.setEnabled(False)
+        self.contact_save_btn.clicked.connect(self.on_contact_save_clicked)
+        contact_btn_row.addWidget(self.contact_save_btn)
+        contact_btn_row.addStretch()
+        contact_outer.addLayout(contact_btn_row)
+
+        self.history_details_splitter.addWidget(self.history_contact_group)
+        self.history_details_splitter.setStretchFactor(0, 3)
+        self.history_details_splitter.setStretchFactor(1, 2)
+
+        self.history_splitter.addWidget(self.history_details_splitter)
+        self.history_splitter.setStretchFactor(0, 3)
+        self.history_splitter.setStretchFactor(1, 2)
 
         history_layout.addWidget(self.history_splitter)
 
@@ -564,6 +791,7 @@ class MainWindow(QMainWindow):
         initialize_updater(self, APP_VERSION, self.config, show_no_update_message=False)
 
         self.update_status_light()
+        QTimer.singleShot(2500, self._start_share_link_migration)
 
     # --- Slot-Funktionen (Reaktionen auf Events) ---
 
@@ -635,6 +863,8 @@ class MainWindow(QMainWindow):
             item_data = self.get_history_entry_by_id(selected_id)
             if item_data:
                 self.populate_detail_table(item_data)
+                self._populate_contact_card(item_data)
+                self._update_resend_notifications_button_state(item_data)
 
     def _selected_entry_matches_dir(self, selected_id, dir_name):
         """Hilfsfunktion: Prüft, ob die selektierte ID zu einem Verzeichnisnamen gehört."""
@@ -943,24 +1173,32 @@ class MainWindow(QMainWindow):
         selected_items = self.history_table.selectedItems()
         if not selected_items:
             self.detail_table.setRowCount(0)
+            self._populate_contact_card(None)
             self._update_retry_upload_button_state()
+            self._update_resend_notifications_button_state()
             return
 
         row = selected_items[0].row()
         date_item = self.history_table.item(row, 0)
         if not date_item:
             self.detail_table.setRowCount(0)
+            self._populate_contact_card(None)
             self._update_retry_upload_button_state()
+            self._update_resend_notifications_button_state()
             return
 
         item_data = date_item.data(Qt.ItemDataRole.UserRole + 1)
         if not item_data:
             self.detail_table.setRowCount(0)
+            self._populate_contact_card(None)
             self._update_retry_upload_button_state()
+            self._update_resend_notifications_button_state()
             return
 
         self.populate_detail_table(item_data)
+        self._populate_contact_card(item_data)
         self._update_retry_upload_button_state(item_data)
+        self._update_resend_notifications_button_state(item_data)
 
     def _update_retry_upload_button_state(self, item_data=None):
         if item_data is None:
@@ -1037,6 +1275,270 @@ class MainWindow(QMainWindow):
         self.refresh_history_table(maintain_page=True)
         self._update_retry_upload_button_state()
 
+    def _populate_contact_card(self, item_data):
+        """Befüllt die Kontakt-Karte aus einem Historieneintrag."""
+        self._contact_populating = True
+        try:
+            if not item_data:
+                self.contact_email_input.clear()
+                self.contact_phone_input.clear()
+                self.contact_email_status_label.setText("—")
+                self.contact_phone_status_label.setText("—")
+                self.history_contact_group.setEnabled(False)
+                self._contact_dirty = False
+                self.contact_save_btn.setEnabled(False)
+                return
+
+            self.history_contact_group.setEnabled(True)
+            self.contact_email_input.setText((item_data.get("email") or "").strip())
+            self.contact_phone_input.setText((item_data.get("phone") or "").strip())
+
+            email_status = (item_data.get("email_status") or "").strip() or "—"
+            sms_status = (item_data.get("sms_status") or "").strip() or "—"
+            self.contact_email_status_label.setText(f"Status: {email_status}")
+            self.contact_phone_status_label.setText(f"Status: {sms_status}")
+            self._contact_dirty = False
+            self.contact_save_btn.setEnabled(False)
+        finally:
+            self._contact_populating = False
+
+    def _on_contact_fields_changed(self):
+        if self._contact_populating:
+            return
+        self._contact_dirty = True
+        self.contact_save_btn.setEnabled(True)
+
+    def _get_contact_values_from_ui(self) -> tuple[str, str | None]:
+        email = self.contact_email_input.text().strip()
+        phone = normalize_phone(self.contact_phone_input.text())
+        return email, phone
+
+    def _validate_contact_values(self, email: str, phone: str | None, require_email: bool, require_phone: bool):
+        if require_email:
+            if not email:
+                raise ValueError("E-Mail-Adresse fehlt.")
+            if not is_valid_email(email):
+                raise ValueError("E-Mail-Adresse ist ungültig.")
+        elif email and not is_valid_email(email):
+            raise ValueError("E-Mail-Adresse ist ungültig.")
+        if require_phone and not phone:
+            raise ValueError("Telefonnummer fehlt.")
+
+    def on_contact_save_clicked(self):
+        entry_id = self.get_selected_history_id()
+        entry = self.get_history_entry_by_id(entry_id)
+        if not entry:
+            return
+
+        email, phone = self._get_contact_values_from_ui()
+        try:
+            self._validate_contact_values(email, phone, require_email=False, require_phone=False)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Kontakt speichern", str(exc))
+            return
+
+        payload = build_contact_update_payload(entry, email, phone)
+        self.history_manager.add_or_update(payload)
+        if phone:
+            self.contact_phone_input.setText(phone)
+        self._contact_dirty = False
+        self.contact_save_btn.setEnabled(False)
+
+        refreshed = self.get_history_entry_by_id(entry_id)
+        if refreshed:
+            self.populate_detail_table(refreshed)
+            self._populate_contact_card(refreshed)
+        self.refresh_history_table(maintain_page=True)
+        self.status_label.setText("Kontaktdaten gespeichert.")
+
+    def _update_resend_notifications_button_state(self, item_data=None):
+        if item_data is None:
+            entry_id = self.get_selected_history_id()
+            item_data = self.get_history_entry_by_id(entry_id) if entry_id else None
+        can_resend = bool(item_data and can_resend_notifications(item_data))
+        self.resend_notifications_btn.setEnabled(can_resend)
+
+    def _resend_worker_busy(self) -> bool:
+        thread = getattr(self, "_resend_worker_thread", None)
+        if thread is None:
+            return False
+        try:
+            return thread.isRunning()
+        except RuntimeError:
+            self._resend_worker_thread = None
+            return False
+
+    @Slot()
+    def on_resend_notifications_clicked(self):
+        entry_id = self.get_selected_history_id()
+        entry = self.get_history_entry_by_id(entry_id)
+        if not entry:
+            return
+        if not can_resend_notifications(entry):
+            QMessageBox.warning(
+                self,
+                "Benachrichtigung erneut senden",
+                "Nur erfolgreiche Uploads unterstützen einen erneuten Versand.",
+            )
+            return
+        if self._resend_worker_busy():
+            QMessageBox.information(self, "Benachrichtigung erneut senden", "Ein Versand läuft bereits.")
+            return
+
+        email, phone = self._get_contact_values_from_ui()
+        initial_link = (entry.get("share_link") or "").strip()
+        cloud_client = self.get_active_cloud_client()
+
+        dialog = ResendNotificationsDialog(
+            entry,
+            email,
+            phone,
+            initial_link,
+            cloud_client,
+            self.config,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        send_email = dialog.get_send_email()
+        send_sms = dialog.get_send_sms()
+        share_link = dialog.get_share_link()
+
+        try:
+            email, phone = normalize_contact(email, phone)
+            validate_contact_for_channels(email, phone, send_email, send_sms)
+            if not is_valid_share_link(share_link):
+                raise ValueError("Bitte einen gültigen Download-Link eingeben.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Benachrichtigung erneut senden", str(exc))
+            return
+
+        delivered = channels_already_delivered(entry, send_email, send_sms)
+        if delivered:
+            parts = []
+            if "email" in delivered:
+                parts.append("E-Mail wurde bereits als gesendet markiert")
+            if "sms" in delivered:
+                parts.append("SMS wurde bereits als zugestellt markiert")
+            reply = QMessageBox.question(
+                self,
+                "Benachrichtigung erneut senden",
+                f"{'. '.join(parts)}.\n\nTrotzdem erneut senden?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self._persist_contact_before_resend(entry, email, phone, share_link)
+        entry = self.get_history_entry_by_id(entry_id) or entry
+
+        self.resend_notifications_btn.setEnabled(False)
+        self.status_label.setText("Benachrichtigung wird gesendet…")
+
+        self._resend_worker_thread = QThread()
+        worker = ResendNotificationsWorker(
+            dict(entry),
+            email,
+            phone,
+            share_link,
+            send_email,
+            send_sms,
+            self.email_client,
+            self.sms_client,
+            self.config,
+        )
+        worker.moveToThread(self._resend_worker_thread)
+        self._resend_worker_thread.started.connect(worker.run)
+        worker.finished.connect(self._on_resend_notifications_finished)
+        worker.failed.connect(self._on_resend_notifications_failed)
+        worker.finished.connect(self._resend_worker_thread.quit)
+        worker.failed.connect(self._resend_worker_thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        self._resend_worker_thread.finished.connect(self._resend_worker_thread.deleteLater)
+        self._resend_worker_thread.start()
+
+    def _persist_contact_before_resend(self, entry, email, phone, share_link):
+        payload = build_contact_update_payload(entry, email, phone)
+        payload["share_link"] = share_link
+        self.history_manager.add_or_update(payload)
+        entry.update(payload)
+        self._contact_dirty = False
+        self.contact_save_btn.setEnabled(False)
+        if phone:
+            self.contact_phone_input.setText(phone)
+
+    @Slot(object)
+    def _on_resend_notifications_finished(self, result):
+        self.history_manager.add_or_update(result.history_updates)
+        signals.upload_history_update.emit(dict(result.history_updates))
+        self.check_sms_status()
+        self.refresh_history_table(maintain_page=True)
+
+        entry_id = self.get_selected_history_id()
+        refreshed = self.get_history_entry_by_id(entry_id)
+        if refreshed:
+            self.populate_detail_table(refreshed)
+            self._populate_contact_card(refreshed)
+        self._update_resend_notifications_button_state(refreshed)
+
+        self.status_label.setText("Benachrichtigung gesendet.")
+        QMessageBox.information(
+            self,
+            "Benachrichtigung erneut senden",
+            format_resend_result_message(result),
+        )
+
+    @Slot(str)
+    def _on_resend_notifications_failed(self, message):
+        self.status_label.setText("Benachrichtigung fehlgeschlagen.")
+        entry_id = self.get_selected_history_id()
+        self._update_resend_notifications_button_state(self.get_history_entry_by_id(entry_id))
+        QMessageBox.warning(self, "Benachrichtigung erneut senden", message)
+
+    def _start_share_link_migration(self):
+        if self._share_link_migration_thread is not None:
+            try:
+                if self._share_link_migration_thread.isRunning():
+                    return
+            except RuntimeError:
+                self._share_link_migration_thread = None
+
+        cloud_client = self.get_active_cloud_client()
+        if cloud_client.get_connection_status() != "Verbunden":
+            return
+
+        needs_migration = any(
+            (item.get("status") or "").strip() == "Erfolgreich"
+            and not (item.get("share_link") or "").strip()
+            for item in self.history_manager.history
+        )
+        if not needs_migration:
+            return
+
+        self._share_link_migration_thread = QThread()
+        worker = ShareLinkMigrationWorker(self.history_manager, cloud_client)
+        worker.moveToThread(self._share_link_migration_thread)
+        self._share_link_migration_thread.started.connect(worker.run)
+        worker.finished.connect(self._on_share_link_migration_finished)
+        worker.finished.connect(self._share_link_migration_thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        self._share_link_migration_thread.finished.connect(self._share_link_migration_thread.deleteLater)
+        self._share_link_migration_thread.start()
+
+    @Slot(int)
+    def _on_share_link_migration_finished(self, count):
+        if count:
+            self.log.info("%s Download-Link(s) für Alteinträge nachgeladen.", count)
+            self.refresh_history_table(maintain_page=True)
+            entry_id = self.get_selected_history_id()
+            refreshed = self.get_history_entry_by_id(entry_id)
+            if refreshed:
+                self.populate_detail_table(refreshed)
+                self._populate_contact_card(refreshed)
+            self.status_label.setText(f"{count} Download-Link(s) für Alteinträge nachgeladen.")
+
     def populate_detail_table(self, item_data):
         """Befüllt das Detail Grid aus einem Historien-Eintrag."""
         self.detail_table.setRowCount(0)
@@ -1044,21 +1546,29 @@ class MainWindow(QMainWindow):
         details = []
         details.append(("Verzeichnis", item_data.get("dir_name", "")))
         details.append(("Upload-Status", item_data.get("status", "")))
-
-        email_val = item_data.get("email", "")
-        email_status = item_data.get("email_status", "")
-        email_text = f"{email_val} ({email_status})" if email_val else email_status
-        details.append(("Email mit Status", email_text))
-
-        phone_val = item_data.get("phone", "")
-        sms_status = item_data.get("sms_status", "")
-        phone_text = f"{phone_val} ({sms_status})" if phone_val else sms_status
-        details.append(("Telefonnummer mit SMS-Status", phone_text))
+        details.append(("Download-Link", item_data.get("share_link", "") or "—"))
+        details.append(("Wiederversände", format_resend_history_summary(item_data)))
 
         sms_price = item_data.get("sms_price", "")
         price_text = f"{sms_price}€" if sms_price else ""
         details.append(("SMS Kosten", price_text))
         details.append(("Fehlertext", self.build_combined_error_text(item_data)))
+
+        resend_log = item_data.get("resend_log") or []
+        for idx, log_entry in enumerate(resend_log[:5]):
+            at_raw = (log_entry.get("at") or "").strip()
+            at_display = at_raw.replace("T", " ")[:16] if at_raw else "—"
+            channels = ", ".join(log_entry.get("channels") or [])
+            email_log = (log_entry.get("email") or "").strip()
+            email_st = log_entry.get("email_status") or "—"
+            sms_st = log_entry.get("sms_status") or "—"
+            if channels == "email":
+                summary = f"{at_display} — E-Mail an {email_log} → {email_st}"
+            elif channels == "sms":
+                summary = f"{at_display} — SMS → {sms_st}"
+            else:
+                summary = f"{at_display} — {channels} → E-Mail: {email_st}, SMS: {sms_st}"
+            details.append((f"Resend {idx + 1}", summary))
 
         self.detail_table.setRowCount(len(details))
         for i, (key, value) in enumerate(details):
@@ -1572,7 +2082,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Update-Fehler", message)
 
 
-from PySide6.QtCore import QObject
 import asyncio
 from datetime import datetime, timezone
 

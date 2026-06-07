@@ -297,13 +297,13 @@ class EmailClient:
                     pass
 
     def send_upload_success_email(self, directory_name, share_link, email, vorname):
-        """Sendet eine Erfolgs-E-Mail mit dem Freigabelink."""
+        """Sendet eine Erfolgs-E-Mail mit dem Freigabelink. Gibt True bei Erfolg zurück."""
         recipient = email
         if not recipient:
             recipient = self.config.get_setting("smtp_fallback_recipient")
         if not recipient:
             self.log.warning("Kein Fallback-Empfänger für Erfolgs-Mail konfiguriert.")
-            return
+            return False
 
         subject = f"Upload erfolgreich: {directory_name}"
         body = f"""
@@ -342,7 +342,7 @@ class EmailClient:
                 </body>
                 </html>
                 """
-        self.send_email(recipient, subject, body)
+        return self.send_email(recipient, subject, body)
 
     def send_upload_failure_email(self, directory_name, error):
         """Sendet eine Fehler-E-Mail."""

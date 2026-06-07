@@ -183,38 +183,49 @@ class UploaderThread(QThread):
                     # 3. Erfolgs-E-Mail senden
                     email_status = "Übersprungen"
                     sms_status = "Übersprungen"
-                    if share_link and kunde and kunde.email:
-                        try:
-                            self.email_client.send_upload_success_email(dir_name, share_link, kunde.email, kunde.first_name)
-                            email_status = "Gesendet"
-                        except Exception as email_e:
-                            email_status = f"Fehler: {email_e}"
-                            self.log.error(f"E-Mail-Versand fehlgeschlagen: {email_e}")
+                    sms_id_val = None
+                    if share_link and kunde:
+                        if kunde.email:
+                            try:
+                                if self.email_client.send_upload_success_email(
+                                    dir_name, share_link, kunde.email, kunde.first_name
+                                ):
+                                    email_status = "Gesendet"
+                                else:
+                                    email_status = "Fehler: Versand fehlgeschlagen"
+                            except Exception as email_e:
+                                email_status = f"Fehler: {email_e}"
+                                self.log.error(f"E-Mail-Versand fehlgeschlagen: {email_e}")
 
-                        sms_id_val = None
-                        try:
-                            sms_success, sms_id = asyncio.run(self.sms_client.send_upload_success_sms(share_link, kunde))
-                            if sms_success:
-                                sms_status = "Gesendet"
-                                sms_id_val = sms_id
-                            else:
-                                if kunde.phone:
+                        if kunde.phone:
+                            try:
+                                sms_success, sms_id = asyncio.run(
+                                    self.sms_client.send_upload_success_sms(share_link, kunde)
+                                )
+                                if sms_success:
+                                    sms_status = "Gesendet"
+                                    sms_id_val = sms_id
+                                else:
                                     err_text = getattr(self.sms_client, "last_error", "") or "Fehler beim Senden"
                                     sms_status = f"Fehler: {err_text}"
-                        except Exception as sms_e:
-                            sms_status = f"Fehler: {sms_e}"
-                            self.log.error(f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}")
+                            except Exception as sms_e:
+                                sms_status = f"Fehler: {sms_e}"
+                                self.log.error(
+                                    f"SMS-Versand für {kunde.first_name} {kunde.last_name} fehlgeschlagen: {sms_e}"
+                                )
                     elif not kunde:
                         self.log.warning(f"Keine Kundendaten für {dir_name} gefunden. Benachrichtigungen übersprungen.")
-                        sms_id_val = None
 
                     # History: Success
                     history_data = {
                         "dir_name": dir_name,
                         "status": "Erfolgreich",
                         "email_status": email_status,
-                        "sms_status": sms_status
+                        "sms_status": sms_status,
+                        "remote_path": remote_path,
                     }
+                    if share_link:
+                        history_data["share_link"] = share_link
 
                     if 'sms_id_val' in locals() and sms_id_val:
                         history_data["sms_id"] = sms_id_val

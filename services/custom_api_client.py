@@ -1334,21 +1334,17 @@ class CustomApiClient(BaseClient):
 
         return None
 
-    def _fetch_customer_url_from_aero_customer(self):
-        """Fallback auf aero-media-customer, falls Upload-Status keinen Link liefert."""
-        if not self._last_kunde:
-            return None
-
+    def lookup_customer_url(self, customer_number, booking_number, customer_type):
+        """Sucht einen Customer-Link über aero-media-customer (z. B. für Historie-Resend)."""
         base_url = self.config.get_secret("aero_customer_base_url")
         token = self.config.get_secret("aero_customer_api_token")
         if not base_url or not token:
             return None
 
-        kunde = self._last_kunde
         query_params = {
-            "customer_id": str(getattr(kunde, "customer_number", "") or "").strip(),
-            "booking_id": str(getattr(kunde, "booking_number", "") or "").strip(),
-            "type": str(getattr(kunde, "type", "") or "").strip()
+            "customer_id": str(customer_number or "").strip(),
+            "booking_id": str(booking_number or "").strip(),
+            "type": str(customer_type or "").strip(),
         }
         if not query_params["customer_id"] or not query_params["booking_id"] or not query_params["type"]:
             return None
@@ -1383,6 +1379,17 @@ class CustomApiClient(BaseClient):
                 self.log.warning(f"aero-media-customer Lookup Fehler: {e}")
 
         return None
+
+    def _fetch_customer_url_from_aero_customer(self):
+        """Fallback auf aero-media-customer, falls Upload-Status keinen Link liefert."""
+        if not self._last_kunde:
+            return None
+        kunde = self._last_kunde
+        return self.lookup_customer_url(
+            getattr(kunde, "customer_number", None),
+            getattr(kunde, "booking_number", None),
+            getattr(kunde, "type", None),
+        )
 
     def get_shareable_link(self, remote_path):
         """Gibt den Customer-Link zurück (bereits von Session zurückgegeben)."""
