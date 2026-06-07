@@ -35,6 +35,7 @@ from core.resend_notifications import (
     format_resend_result_message,
     format_resend_history_summary,
     migrate_share_links_for_history,
+    resend_had_failures,
 )
 from models.kunde import normalize_phone
 from utils.validation import is_valid_email, is_valid_share_link
@@ -402,6 +403,8 @@ class MainWindow(QMainWindow):
         self._contact_populating = False
         self._contact_dirty = False
         self._resend_worker_thread = None
+        self._resend_worker = None
+        self._resend_btn_default_text = "Benachrichtigung erneut senden…"
         self._share_link_migration_thread = None
         self._history_file_load_thread = None
         self._history_loaded_mtime = self.history_manager.get_file_mtime()
@@ -1408,10 +1411,10 @@ class MainWindow(QMainWindow):
             self.contact_email_input.setText((item_data.get("email") or "").strip())
             self.contact_phone_input.setText((item_data.get("phone") or "").strip())
 
-            email_status = (item_data.get("email_status") or "").strip() or "—"
-            sms_status = (item_data.get("sms_status") or "").strip() or "—"
-            self.contact_email_status_label.setText(f"Status: {email_status}")
-            self.contact_phone_status_label.setText(f"Status: {sms_status}")
+            self._apply_contact_status_labels(
+                item_data.get("email_status", ""),
+                item_data.get("sms_status", ""),
+            )
             self._contact_dirty = False
             self.contact_save_btn.setEnabled(False)
         finally:
@@ -1482,7 +1485,49 @@ class MainWindow(QMainWindow):
             return thread.isRunning()
         except RuntimeError:
             self._resend_worker_thread = None
+            self._resend_worker = None
             return False
+
+    @Slot()
+    def _on_resend_worker_thread_destroyed(self):
+        try:
+            dead = self.sender()
+        except RuntimeError:
+            dead = None
+        if dead is not None and dead is getattr(self, "_resend_worker_thread", None):
+            self._resend_worker_thread = None
+            self._resend_worker = None
+
+    def _contact_status_label_style(self, status: str) -> str:
+        s = (status or "").strip().lower()
+        if "fehler" in s or "fehlgeschlagen" in s or "abgelehnt" in s:
+            return "color: #dc2626; font-size: 11px; font-weight: 500;"
+        if "gesendet" in s or "zugestellt" in s or "erfolgreich" in s:
+            return "color: #16a34a; font-size: 11px; font-weight: 500;"
+        return "color: gray; font-size: 11px;"
+
+    def _apply_contact_status_labels(self, email_status: str, sms_status: str):
+        email_text = (email_status or "").strip() or "—"
+        sms_text = (sms_status or "").strip() or "—"
+        self.contact_email_status_label.setText(f"Status: {email_text}")
+        self.contact_email_status_label.setStyleSheet(self._contact_status_label_style(email_text))
+        self.contact_phone_status_label.setText(f"Status: {sms_text}")
+        self.contact_phone_status_label.setStyleSheet(self._contact_status_label_style(sms_text))
+
+    def _set_resend_ui_busy(self, busy: bool):
+        if busy:
+            self._begin_history_refresh_overlay()
+            self.resend_notifications_btn.setText("Wird gesendet…")
+            self.resend_notifications_btn.setEnabled(False)
+            self.history_contact_group.setEnabled(False)
+            self.contact_save_btn.setEnabled(False)
+            self.status_label.setText("Benachrichtigung wird gesendet…")
+            return
+
+        self._end_history_refresh_overlay()
+        self.resend_notifications_btn.setText(self._resend_btn_default_text)
+        self.history_contact_group.setEnabled(True)
+        self._update_resend_notifications_button_state()
 
     @Slot()
     def on_resend_notifications_clicked(self):
@@ -1549,11 +1594,10 @@ class MainWindow(QMainWindow):
         self._persist_contact_before_resend(entry, email, phone, share_link)
         entry = self.get_history_entry_by_id(entry_id) or entry
 
-        self.resend_notifications_btn.setEnabled(False)
-        self.status_label.setText("Benachrichtigung wird gesendet…")
+        self._set_resend_ui_busy(True)
 
         self._resend_worker_thread = QThread()
-        worker = ResendNotificationsWorker(
+        self._resend_worker = ResendNotificationsWorker(
             dict(entry),
             email,
             phone,
@@ -1564,14 +1608,15 @@ class MainWindow(QMainWindow):
             self.sms_client,
             self.config,
         )
-        worker.moveToThread(self._resend_worker_thread)
-        self._resend_worker_thread.started.connect(worker.run)
-        worker.finished.connect(self._on_resend_notifications_finished)
-        worker.failed.connect(self._on_resend_notifications_failed)
-        worker.finished.connect(self._resend_worker_thread.quit)
-        worker.failed.connect(self._resend_worker_thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
+        self._resend_worker.moveToThread(self._resend_worker_thread)
+        self._resend_worker_thread.destroyed.connect(self._on_resend_worker_thread_destroyed)
+        self._resend_worker_thread.started.connect(self._resend_worker.run)
+        self._resend_worker.finished.connect(self._on_resend_notifications_finished)
+        self._resend_worker.failed.connect(self._on_resend_notifications_failed)
+        self._resend_worker.finished.connect(self._resend_worker_thread.quit)
+        self._resend_worker.failed.connect(self._resend_worker_thread.quit)
+        self._resend_worker.finished.connect(self._resend_worker.deleteLater)
+        self._resend_worker.failed.connect(self._resend_worker.deleteLater)
         self._resend_worker_thread.finished.connect(self._resend_worker_thread.deleteLater)
         self._resend_worker_thread.start()
 
@@ -1588,32 +1633,43 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_resend_notifications_finished(self, result):
-        self.history_manager.add_or_update(result.history_updates)
-        self._sync_history_loaded_mtime()
-        signals.upload_history_update.emit(dict(result.history_updates))
-        self.check_sms_status()
-        self.refresh_history_table(maintain_page=True)
+        try:
+            self.history_manager.add_or_update(result.history_updates)
+            self._sync_history_loaded_mtime()
+            signals.upload_history_update.emit(dict(result.history_updates))
+            self.check_sms_status()
+            self.refresh_history_table(maintain_page=True)
 
-        entry_id = self.get_selected_history_id()
-        refreshed = self.get_history_entry_by_id(entry_id)
-        if refreshed:
-            self.populate_detail_table(refreshed)
-            self._populate_contact_card(refreshed)
-        self._update_resend_notifications_button_state(refreshed)
+            entry_id = self.get_selected_history_id()
+            refreshed = self.get_history_entry_by_id(entry_id)
+            if refreshed:
+                self.populate_detail_table(refreshed)
+                self._populate_contact_card(refreshed)
+                self._apply_contact_status_labels(
+                    refreshed.get("email_status", ""),
+                    refreshed.get("sms_status", ""),
+                )
 
-        self.status_label.setText("Benachrichtigung gesendet.")
-        QMessageBox.information(
-            self,
-            "Benachrichtigung erneut senden",
-            format_resend_result_message(result),
-        )
+            message = format_resend_result_message(result)
+            self.log.info("Resend abgeschlossen: %s", message.replace("\n", " | "))
+
+            if resend_had_failures(result):
+                self.status_label.setText("Benachrichtigung teilweise fehlgeschlagen.")
+                QMessageBox.warning(self, "Benachrichtigung erneut senden", message)
+            else:
+                self.status_label.setText("Benachrichtigung erfolgreich versendet.")
+                QMessageBox.information(self, "Benachrichtigung erneut senden", message)
+        finally:
+            self._set_resend_ui_busy(False)
 
     @Slot(str)
     def _on_resend_notifications_failed(self, message):
-        self.status_label.setText("Benachrichtigung fehlgeschlagen.")
-        entry_id = self.get_selected_history_id()
-        self._update_resend_notifications_button_state(self.get_history_entry_by_id(entry_id))
-        QMessageBox.warning(self, "Benachrichtigung erneut senden", message)
+        try:
+            self.log.error("Resend fehlgeschlagen: %s", message)
+            self.status_label.setText("Benachrichtigung fehlgeschlagen.")
+            QMessageBox.warning(self, "Benachrichtigung erneut senden", message)
+        finally:
+            self._set_resend_ui_busy(False)
 
     def _start_share_link_migration(self):
         if self._share_link_migration_thread is not None:

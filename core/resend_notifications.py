@@ -230,11 +230,25 @@ def build_resend_history_updates(
 
 def format_resend_result_message(result: ResendResult) -> str:
     lines: list[str] = []
+    email_to = (result.history_updates.get("email") or "").strip()
+    phone_to = (result.history_updates.get("phone") or "").strip()
+
     if result.email_result is not None:
-        lines.append(f"E-Mail: {result.email_result.status}")
+        prefix = "✓" if result.email_result.success else "✗"
+        target = f" an {email_to}" if email_to else ""
+        lines.append(f"{prefix} E-Mail{target}: {result.email_result.status}")
     if result.sms_result is not None:
-        lines.append(f"SMS: {result.sms_result.status}")
+        prefix = "✓" if result.sms_result.success else "✗"
+        target = f" an {phone_to}" if phone_to else ""
+        lines.append(f"{prefix} SMS{target}: {result.sms_result.status}")
     return "\n".join(lines) if lines else "Kein Versand durchgeführt."
+
+
+def resend_had_failures(result: ResendResult) -> bool:
+    for channel_result in (result.email_result, result.sms_result):
+        if channel_result is not None and not channel_result.success:
+            return True
+    return False
 
 
 def format_resend_history_summary(entry: dict[str, Any]) -> str:
