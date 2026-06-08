@@ -7,6 +7,7 @@ import dropbox
 from requests.adapters import HTTPAdapter
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 from models.kunde import Kunde
@@ -32,8 +33,13 @@ CUSTOM_DB_REFRESH_TOKEN = "custom_db_refresh_token"
 
 # Entspricht Server PROXIED_UPLOAD_CHUNK_BYTES; Vercel-Multipart-Limit ~4.5 MiB Request-Body.
 CHUNK_BYTES = 4 * 1024 * 1024
-# Direkter Dropbox-Upload soll wie der DropboxClient mit 8 MiB arbeiten.
-DROPBOX_CHUNK_BYTES = 8 * 1024 * 1024
+# Direkter Dropbox-Upload: Dropbox empfiehlt Vielfache von 4 MiB (Performance Guide).
+DROPBOX_CHUNK_BYTES = 32 * 1024 * 1024
+# Parallele append_v2 über verschiedene Dateien (finish_batch am Ende).
+DROPBOX_BATCH_MAX_FILES = 1000
+DROPBOX_BATCH_PARALLEL_WORKERS = 4
+# Checkpoint während laufendem Datei-Upload (fsync) drosseln.
+DROPBOX_CK_MIN_INTERVAL_S = 10.0
 
 # Mindestabstand zwischen Fortschritts-Signalen während ein Chunk-POST noch läuft (Qt/UI).
 _STREAM_PROGRESS_EMIT_INTERVAL_S = 0.05
@@ -45,6 +51,38 @@ ORDERS_CREATE_TIMEOUT = 120
 # Optionales Polling auf GET /api/orders/{order_id}/manifest-status nach HTTP 202.
 MANIFEST_STATUS_POLL_MAX_S = 300
 MANIFEST_STATUS_POLL_INTERVAL_S = 3
+
+
+class _ThrottledCheckpointSaver:
+    """Schreibt Upload-Checkpoints höchstens alle N Sekunden oder N Bytes."""
+
+    __slots__ = ("_save_fn", "_min_interval_s", "_min_bytes", "_last_save_t", "_last_offset", "_pending")
+
+    def __init__(self, save_fn, *, min_interval_s: float, min_bytes: int):
+        self._save_fn = save_fn
+        self._min_interval_s = min_interval_s
+        self._min_bytes = min_bytes
+        self._last_save_t = 0.0
+        self._last_offset = 0
+        self._pending = None
+
+    def update(self, *, current_offset: int = 0, force: bool = False, **kwargs) -> None:
+        self._pending = kwargs
+        now = time.monotonic()
+        if (
+            force
+            or now - self._last_save_t >= self._min_interval_s
+            or abs(current_offset - self._last_offset) >= self._min_bytes
+        ):
+            self._save_fn(**kwargs)
+            self._last_save_t = now
+            self._last_offset = current_offset
+            self._pending = None
+
+    def flush(self) -> None:
+        if self._pending is not None:
+            self._save_fn(**self._pending)
+            self._pending = None
 
 
 class _ChunkReadProgressBytesIO(io.BytesIO):
@@ -172,6 +210,7 @@ class CustomApiClient(BaseClient):
         self.session = None  # requests.Session für Connection-Pooling
         self.progress_lock = Lock()  # Lock für Thread-sichere Progress-Updates
         self.dbx: dropbox.Dropbox | None = None
+        self._dropbox_api_lock = Lock()
         self._upload_control = None
 
     def _upload_coop_tick(self):
@@ -379,6 +418,88 @@ class CustomApiClient(BaseClient):
     def _backoff_delay(self, attempt: int) -> float:
         """attempt 1-basiert: 2–30 s + Jitter."""
         return min(30.0, 2.0 ** (attempt - 1)) + random.uniform(0.0, 1.5)
+
+    def _should_retry_dropbox_error(self, exc: Exception) -> bool:
+        """True bei typischen transienten Fehlern (Rate-Limit, Netz, 5xx)."""
+        if isinstance(
+            exc,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        ):
+            return True
+        http_err_cls = getattr(dropbox.exceptions, "HttpError", None)
+        if http_err_cls is not None and isinstance(exc, http_err_cls):
+            return True
+        if isinstance(exc, dropbox.exceptions.ApiError):
+            err = getattr(exc, "error", None)
+            if err is not None:
+                for name in ("is_rate_limit", "is_internal_error"):
+                    pred = getattr(err, name, None)
+                    if callable(pred):
+                        try:
+                            if pred():
+                                return True
+                        except Exception:
+                            pass
+            lowered = str(exc).lower()
+            if any(
+                s in lowered
+                for s in (
+                    "too_many_requests",
+                    "too_many_write_operations",
+                    "rate_limit",
+                    "internal_server",
+                    "503",
+                    "502",
+                    "504",
+                )
+            ):
+                return True
+        return False
+
+    def _dropbox_retry_delay(self, exc: Exception, attempt: int) -> float:
+        """Backoff inkl. Dropbox Retry-After (HTTP 429)."""
+        http_err_cls = getattr(dropbox.exceptions, "HttpError", None)
+        if http_err_cls is not None and isinstance(exc, http_err_cls):
+            headers = getattr(exc, "headers", None) or {}
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    return max(0.0, float(retry_after))
+                except (TypeError, ValueError):
+                    pass
+        return min(60.0, 2.0 ** attempt)
+
+    def _with_dropbox_retry(self, tag: str, operation, *, max_attempts: int = 5, use_api_lock: bool = False):
+        """Dropbox-API-Operation mit begrenzten Wiederholungen."""
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if use_api_lock:
+                    with self._dropbox_api_lock:
+                        return operation()
+                return operation()
+            except dropbox.exceptions.AuthError:
+                raise
+            except Exception as e:
+                last_exc = e
+                if attempt >= max_attempts or not self._should_retry_dropbox_error(e):
+                    raise
+                delay = self._dropbox_retry_delay(e, attempt)
+                self.log.warning(
+                    "%s: Versuch %s/%s fehlgeschlagen, warte %.1fs — %s",
+                    tag,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+        raise last_exc
 
     def _post_json_upload(
         self,
@@ -1849,15 +1970,20 @@ class CustomApiClient(BaseClient):
             payload.update(kwargs)
             save_checkpoint(local_dir_path, payload)
 
-        outer_resume_dd = resume_dd
-        for i in range(start_idx, len(files_to_upload)):
+        idx = start_idx
+        if resume_dd and idx < len(files_to_upload):
             self._upload_coop_tick()
-            file_info = files_to_upload[i]
-            ro = outer_resume_dd if i == start_idx else None
+            file_info = files_to_upload[idx]
+            ck_saver = _ThrottledCheckpointSaver(
+                save_dd_ck,
+                min_interval_s=DROPBOX_CK_MIN_INTERVAL_S,
+                min_bytes=DROPBOX_CHUNK_BYTES,
+            )
 
-            def on_dd_progress(active: dict | None, _i=i):
+            def on_dd_progress(active: dict | None, _i=idx):
                 if active:
-                    save_dd_ck(
+                    ck_saver.update(
+                        current_offset=int(active["offset"]),
                         next_file_index=_i,
                         dd_active={
                             "session_id": active["session_id"],
@@ -1867,30 +1993,88 @@ class CustomApiClient(BaseClient):
                         },
                     )
                 else:
+                    ck_saver.flush()
                     save_dd_ck(next_file_index=_i, dd_active=None)
 
             md = self._upload_file_direct_to_dropbox(
                 file_info,
                 total_size,
                 uploaded_counter,
-                resume_dd=ro,
+                resume_dd=resume_dd,
                 on_dd_progress=on_dd_progress,
             )
-            row = {
-                "name": os.path.basename(file_info["name"]),
-                "rel_path": file_info["name"],
-                "size": int(
-                    md.size if getattr(md, "size", None) is not None else file_info["size"]
-                ),
-                "mime": file_info["type"],
-                "dropbox_id": getattr(md, "id", "") or "",
-            }
-            uploaded_files.append(row)
+            uploaded_files.append(self._dropbox_upload_row(file_info, md))
             save_dd_ck(
                 uploaded_files=list(uploaded_files),
-                next_file_index=i + 1,
+                next_file_index=idx + 1,
                 dd_active=None,
             )
+            idx += 1
+
+        while idx < len(files_to_upload):
+            self._upload_coop_tick()
+            batch_end = min(idx + DROPBOX_BATCH_MAX_FILES, len(files_to_upload))
+            batch = files_to_upload[idx:batch_end]
+            if len(batch) == 1:
+                file_info = batch[0]
+                ck_saver = _ThrottledCheckpointSaver(
+                    save_dd_ck,
+                    min_interval_s=DROPBOX_CK_MIN_INTERVAL_S,
+                    min_bytes=DROPBOX_CHUNK_BYTES,
+                )
+
+                def on_single_progress(active: dict | None, _i=idx):
+                    if active:
+                        ck_saver.update(
+                            current_offset=int(active["offset"]),
+                            next_file_index=_i,
+                            dd_active={
+                                "session_id": active["session_id"],
+                                "offset": active["offset"],
+                                "file_name": active["file_name"],
+                                "dropbox_path": active["dropbox_path"],
+                            },
+                        )
+                    else:
+                        ck_saver.flush()
+                        save_dd_ck(next_file_index=_i, dd_active=None)
+
+                md = self._upload_file_direct_to_dropbox(
+                    file_info,
+                    total_size,
+                    uploaded_counter,
+                    on_dd_progress=on_single_progress,
+                )
+                uploaded_files.append(self._dropbox_upload_row(file_info, md))
+                save_dd_ck(
+                    uploaded_files=list(uploaded_files),
+                    next_file_index=idx + 1,
+                    dd_active=None,
+                )
+                idx += 1
+            else:
+                self.log.info(
+                    "Direct-Dropbox Batch-Upload: %s Dateien (Index %s–%s).",
+                    len(batch),
+                    idx,
+                    batch_end - 1,
+                )
+                signals.upload_status_update.emit(
+                    f"Lade {len(batch)} Dateien parallel hoch..."
+                )
+                batch_rows = self._upload_batch_to_dropbox(
+                    batch,
+                    total_size,
+                    uploaded_counter,
+                    batch_start_index=idx,
+                )
+                uploaded_files.extend(batch_rows)
+                save_dd_ck(
+                    uploaded_files=list(uploaded_files),
+                    next_file_index=batch_end,
+                    dd_active=None,
+                )
+                idx = batch_end
 
         root_share_link = self._get_dropbox_folder_share_link(remote_base_path)
         manifest = build_manifest_v11(
@@ -1942,6 +2126,236 @@ class CustomApiClient(BaseClient):
         )
         self.dbx.users_get_current_account()
 
+    @staticmethod
+    def _dropbox_upload_row(file_info: dict, metadata) -> dict:
+        return {
+            "name": os.path.basename(file_info["name"]),
+            "rel_path": file_info["name"],
+            "size": int(
+                metadata.size
+                if getattr(metadata, "size", None) is not None
+                else file_info["size"]
+            ),
+            "mime": file_info["type"],
+            "dropbox_id": getattr(metadata, "id", "") or "",
+        }
+
+    def _emit_dropbox_upload_progress(
+        self,
+        file_info: dict,
+        bytes_sent_partial: int,
+        total_job_size: int,
+        uploaded_counter: dict,
+        *,
+        batch_inflight: dict | None = None,
+        batch_index: int | None = None,
+    ) -> None:
+        file_size = file_info["size"]
+        sent = max(0, int(bytes_sent_partial))
+        pct = min(100, int((sent / file_size) * 100)) if file_size > 0 else 100
+        with self.progress_lock:
+            base = uploaded_counter["bytes"]
+        if batch_inflight is not None and batch_index is not None:
+            batch_inflight[batch_index] = sent
+            combined = base + sum(batch_inflight.values())
+        else:
+            combined = base + sent
+        total_pct = min(100, int((combined / total_job_size) * 100)) if total_job_size > 0 else 100
+        denom = file_size if file_size > 0 else 1
+        signals.upload_progress_file.emit(pct, sent, denom)
+        signals.upload_progress_total.emit(total_pct, combined, total_job_size)
+
+    def _finish_dropbox_file_upload(
+        self,
+        file_info: dict,
+        total_job_size: int,
+        uploaded_counter: dict,
+    ) -> None:
+        file_size = file_info["size"]
+        with self.progress_lock:
+            uploaded_counter["bytes"] += file_size
+            current_total_bytes = uploaded_counter["bytes"]
+        fd = file_size if file_size > 0 else 1
+        signals.upload_progress_file.emit(100, file_size, fd)
+        total_progress = (
+            int((current_total_bytes / total_job_size) * 100) if total_job_size > 0 else 100
+        )
+        signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
+
+    def _upload_session_append_file(
+        self,
+        file_info: dict,
+        session_id: str,
+        *,
+        resume_offset: int = 0,
+        emit_progress=None,
+    ) -> dropbox.files.UploadSessionCursor:
+        """Lädt Dateiinhalt in eine bestehende Upload-Session (letztes Append mit close=True)."""
+        file_name = file_info["name"]
+        file_size = file_info["size"]
+        local_path = file_info["local_path"]
+        off = max(0, int(resume_offset))
+        if off > file_size:
+            raise RuntimeError(f"{file_name}: Resume-Offset {off} > Dateigröße {file_size}")
+
+        cursor = dropbox.files.UploadSessionCursor(session_id=str(session_id), offset=off)
+
+        with open(local_path, "rb") as f:
+            if off:
+                f.seek(off)
+
+            if file_size == 0:
+                self._with_dropbox_retry(
+                    f"append_empty:{file_name}",
+                    lambda: self.dbx.files_upload_session_append_v2(b"", cursor, close=True),
+                    use_api_lock=True,
+                )
+                if emit_progress:
+                    emit_progress(0)
+                return cursor
+
+            remaining = file_size - off
+            if remaining <= DROPBOX_CHUNK_BYTES:
+                data = f.read()
+                self._with_dropbox_retry(
+                    f"append_single:{file_name}",
+                    lambda d=data: self.dbx.files_upload_session_append_v2(d, cursor, close=True),
+                    use_api_lock=True,
+                )
+                cursor.offset = file_size
+                if emit_progress:
+                    emit_progress(file_size)
+                return cursor
+
+            if off == 0:
+                first = f.read(DROPBOX_CHUNK_BYTES)
+                self._with_dropbox_retry(
+                    f"append:{file_name}",
+                    lambda ch=first: self.dbx.files_upload_session_append_v2(ch, cursor),
+                    use_api_lock=True,
+                )
+                cursor.offset = f.tell()
+                if emit_progress:
+                    emit_progress(cursor.offset)
+
+            while (file_size - f.tell()) > DROPBOX_CHUNK_BYTES:
+                self._upload_coop_tick()
+                chunk = f.read(DROPBOX_CHUNK_BYTES)
+                self._with_dropbox_retry(
+                    f"append:{file_name}",
+                    lambda ch=chunk: self.dbx.files_upload_session_append_v2(ch, cursor),
+                    use_api_lock=True,
+                )
+                cursor.offset = f.tell()
+                if emit_progress:
+                    emit_progress(cursor.offset)
+
+            final_chunk = f.read()
+            self._with_dropbox_retry(
+                f"append_final:{file_name}",
+                lambda ch=final_chunk: self.dbx.files_upload_session_append_v2(ch, cursor, close=True),
+                use_api_lock=True,
+            )
+            cursor.offset = file_size
+            if emit_progress:
+                emit_progress(file_size)
+        return cursor
+
+    def _upload_batch_to_dropbox(
+        self,
+        files_batch: list[dict],
+        total_job_size: int,
+        uploaded_counter: dict,
+        *,
+        batch_start_index: int,
+    ) -> list[dict]:
+        """Dropbox Performance Guide: start_batch → parallele append_v2 → finish_batch_v2."""
+        n = len(files_batch)
+        if n == 0:
+            return []
+        if n == 1:
+            md = self._upload_file_direct_to_dropbox(
+                files_batch[0], total_job_size, uploaded_counter
+            )
+            return [self._dropbox_upload_row(files_batch[0], md)]
+
+        start_result = self._with_dropbox_retry(
+            "start_batch",
+            lambda: self.dbx.files_upload_session_start_batch(n),
+        )
+        session_ids = list(start_result.session_ids)
+        if len(session_ids) != n:
+            raise RuntimeError(
+                f"start_batch: erwartet {n} session_ids, erhalten {len(session_ids)}"
+            )
+
+        cursors: list[dropbox.files.UploadSessionCursor | None] = [None] * n
+        batch_inflight: dict[int, int] = {i: 0 for i in range(n)}
+        workers = min(DROPBOX_BATCH_PARALLEL_WORKERS, n)
+
+        def _worker(batch_idx: int) -> None:
+            file_info = files_batch[batch_idx]
+            self._upload_coop_tick()
+
+            def _prog(sent: int, _idx=batch_idx, _fi=file_info):
+                self._emit_dropbox_upload_progress(
+                    _fi,
+                    sent,
+                    total_job_size,
+                    uploaded_counter,
+                    batch_inflight=batch_inflight,
+                    batch_index=_idx,
+                )
+
+            cursors[batch_idx] = self._upload_session_append_file(
+                file_info,
+                session_ids[batch_idx],
+                emit_progress=_prog,
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_worker, i) for i in range(n)]
+            for fut in as_completed(futures):
+                fut.result()
+
+        entries = []
+        for i, file_info in enumerate(files_batch):
+            cursor = cursors[i]
+            if cursor is None:
+                raise RuntimeError(f"Batch-Upload unvollständig für {file_info['name']}")
+            entries.append(
+                dropbox.files.UploadSessionFinishArg(
+                    cursor=cursor,
+                    commit=dropbox.files.CommitInfo(
+                        path=file_info["dropbox_path"],
+                        mode=dropbox.files.WriteMode.overwrite,
+                    ),
+                )
+            )
+
+        batch_result = self._with_dropbox_retry(
+            "finish_batch_v2",
+            lambda: self.dbx.files_upload_session_finish_batch_v2(entries),
+        )
+
+        rows = []
+        for i, entry in enumerate(batch_result.entries):
+            file_info = files_batch[i]
+            if entry.is_success():
+                rows.append(self._dropbox_upload_row(file_info, entry.get_success()))
+                self._finish_dropbox_file_upload(file_info, total_job_size, uploaded_counter)
+            else:
+                failure = entry.get_failure()
+                raise Exception(
+                    f"finish_batch_v2 fehlgeschlagen für {file_info['name']}: {failure}"
+                )
+        self.log.info(
+            "Direct-Dropbox Batch abgeschlossen: %s Dateien (Index ab %s).",
+            len(rows),
+            batch_start_index,
+        )
+        return rows
+
     def _upload_file_direct_to_dropbox(
         self,
         file_info: dict,
@@ -1957,15 +2371,9 @@ class CustomApiClient(BaseClient):
         dropbox_path = file_info["dropbox_path"]
 
         def emit_progress(bytes_sent_partial: int):
-            sent = max(0, int(bytes_sent_partial))
-            pct = min(100, int((sent / file_size) * 100)) if file_size > 0 else 100
-            with self.progress_lock:
-                base = uploaded_counter["bytes"]
-            combined = base + sent
-            total_pct = min(100, int((combined / total_job_size) * 100)) if total_job_size > 0 else 100
-            denom = file_size if file_size > 0 else 1
-            signals.upload_progress_file.emit(pct, sent, denom)
-            signals.upload_progress_total.emit(total_pct, combined, total_job_size)
+            self._emit_dropbox_upload_progress(
+                file_info, bytes_sent_partial, total_job_size, uploaded_counter
+            )
 
         self.log.info(
             "[direct_dropbox session=%r file=%r] Upload nach %s (%s bytes)%s",
@@ -1990,10 +2398,16 @@ class CustomApiClient(BaseClient):
         with open(local_path, "rb") as f:
             if file_size <= DROPBOX_CHUNK_BYTES:
                 self._upload_coop_tick()
-                md = self.dbx.files_upload(
-                    f.read(),
-                    dropbox_path,
-                    mode=dropbox.files.WriteMode.overwrite,
+                data = f.read()
+
+                def _small_upload(blob=data, path=dropbox_path):
+                    return self.dbx.files_upload(
+                        blob, path, mode=dropbox.files.WriteMode.overwrite
+                    )
+
+                md = self._with_dropbox_retry(
+                    f"files_upload:{file_name}",
+                    _small_upload,
                 )
                 emit_progress(file_size)
                 if on_dd_progress:
@@ -2007,7 +2421,9 @@ class CustomApiClient(BaseClient):
                 ):
                     off = int(resume_dd["offset"])
                     if off > file_size:
-                        raise RuntimeError(f"{file_name}: Resume-Offset {off} > Dateigröße {file_size}")
+                        raise RuntimeError(
+                            f"{file_name}: Resume-Offset {off} > Dateigröße {file_size}"
+                        )
                     f.seek(off)
                     cursor = dropbox.files.UploadSessionCursor(
                         session_id=str(resume_dd["session_id"]),
@@ -2023,7 +2439,15 @@ class CustomApiClient(BaseClient):
                         on_dd_progress(_active_state(cursor))
                 else:
                     self._upload_coop_tick()
-                    start = self.dbx.files_upload_session_start(f.read(DROPBOX_CHUNK_BYTES))
+                    first = f.read(DROPBOX_CHUNK_BYTES)
+
+                    def _session_start(chunk=first):
+                        return self.dbx.files_upload_session_start(chunk)
+
+                    start = self._with_dropbox_retry(
+                        f"session_start:{file_name}",
+                        _session_start,
+                    )
                     cursor = dropbox.files.UploadSessionCursor(
                         session_id=start.session_id, offset=f.tell()
                     )
@@ -2034,7 +2458,11 @@ class CustomApiClient(BaseClient):
                 while (file_size - f.tell()) > DROPBOX_CHUNK_BYTES:
                     self._upload_coop_tick()
                     chunk = f.read(DROPBOX_CHUNK_BYTES)
-                    self.dbx.files_upload_session_append_v2(chunk, cursor)
+
+                    def _append(ch=chunk, cur=cursor):
+                        return self.dbx.files_upload_session_append_v2(ch, cur)
+
+                    self._with_dropbox_retry(f"append:{file_name}", _append)
                     cursor.offset = f.tell()
                     emit_progress(cursor.offset)
                     if on_dd_progress:
@@ -2046,17 +2474,16 @@ class CustomApiClient(BaseClient):
                     path=dropbox_path,
                     mode=dropbox.files.WriteMode.overwrite,
                 )
-                md = self.dbx.files_upload_session_finish(final_chunk, cursor, commit)
+
+                def _finish(last=final_chunk, cur=cursor, cm=commit):
+                    return self.dbx.files_upload_session_finish(last, cur, cm)
+
+                md = self._with_dropbox_retry(f"session_finish:{file_name}", _finish)
                 emit_progress(file_size)
                 if on_dd_progress:
                     on_dd_progress(None)
 
-        with self.progress_lock:
-            uploaded_counter["bytes"] += file_size
-            current_total_bytes = uploaded_counter["bytes"]
-        signals.upload_progress_file.emit(100, file_size, file_size if file_size > 0 else 1)
-        total_progress = int((current_total_bytes / total_job_size) * 100) if total_job_size > 0 else 100
-        signals.upload_progress_total.emit(total_progress, current_total_bytes, total_job_size)
+        self._finish_dropbox_file_upload(file_info, total_job_size, uploaded_counter)
         return md
 
     def _get_mime_type(self, file_path):
