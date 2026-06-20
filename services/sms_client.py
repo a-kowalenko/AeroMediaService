@@ -177,7 +177,7 @@ class SmsClient:
         # Rufe die zentrale Versandmethode auf
         return await self.send_sms(phone_number, text)
 
-    async def get_sms_journal(self, limit=100):
+    async def get_sms_journal(self, limit=200):
         """
         Ruft das Logbuch (Outbound Journal) von Seven.io ab.
         """

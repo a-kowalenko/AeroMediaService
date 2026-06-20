@@ -205,6 +205,11 @@ class UploaderThread(QThread):
                                 if sms_success:
                                     sms_status = "Gesendet"
                                     sms_id_val = sms_id
+                                    if not sms_id_val:
+                                        self.log.warning(
+                                            "SMS für %s versendet, aber keine sms_id von Seven.io erhalten.",
+                                            dir_name,
+                                        )
                                 else:
                                     err_text = getattr(self.sms_client, "last_error", "") or "Fehler beim Senden"
                                     sms_status = f"Fehler: {err_text}"

@@ -22,6 +22,8 @@ from core.monitor import MonitorThread, recover_stalled_upload_folders
 from core.uploader import UploaderThread
 from core.upload_queue_registry import UploadQueueRegistry
 from core.retry_upload import retry_upload_from_history, RETRYABLE_STATUSES
+from core.history_status import build_overall_status, history_entry_needs_sms_journal_check
+from core.sms_history_sync import update_history_from_journal
 from core.resend_notifications import (
     can_resend_notifications,
     resolve_share_link,
@@ -396,6 +398,10 @@ class MainWindow(QMainWindow):
         self._history_debounce_timer.setSingleShot(True)
         self._history_debounce_timer.setInterval(400)
         self._history_debounce_timer.timeout.connect(self._flush_debounced_history_updates)
+        self._sms_check_schedule_timer = QTimer(self)
+        self._sms_check_schedule_timer.setSingleShot(True)
+        self._sms_check_schedule_timer.setInterval(1500)
+        self._sms_check_schedule_timer.timeout.connect(self._run_scheduled_sms_status_check)
 
         self.current_history_page = 0
         self.history_items_per_page = 25
@@ -859,6 +865,7 @@ class MainWindow(QMainWindow):
             self._sync_history_loaded_mtime()
             self.refresh_history_table(maintain_page=True)
             self._refresh_history_detail_if_needed(data, selected_id)
+            self._schedule_sms_status_check_if_needed()
             return
 
         existing = self._history_pending_by_dir.get(updated_dir)
@@ -882,6 +889,17 @@ class MainWindow(QMainWindow):
         if selected_id:
             for merged in batch.values():
                 self._refresh_history_detail_if_needed(merged, selected_id)
+        self._schedule_sms_status_check_if_needed()
+
+    def _schedule_sms_status_check_if_needed(self):
+        if not any(history_entry_needs_sms_journal_check(item) for item in self.history_manager.history):
+            return
+        self._sms_check_schedule_timer.start()
+
+    @Slot()
+    def _run_scheduled_sms_status_check(self):
+        if any(history_entry_needs_sms_journal_check(item) for item in self.history_manager.history):
+            self.check_sms_status()
 
     def _refresh_history_detail_if_needed(self, data, selected_id):
         """Detail-Grid aktualisieren, wenn der selektierte Eintrag zu diesem Update passt."""
@@ -1168,63 +1186,7 @@ class MainWindow(QMainWindow):
 
     def build_overall_status(self, item_data):
         """Erstellt den Gesamtstatus für das Main Grid."""
-        upload_status = (item_data.get("status") or "").strip()
-        email_status = (item_data.get("email_status") or "").strip()
-        sms_status = (item_data.get("sms_status") or "").strip()
-        email_value = (item_data.get("email") or "").strip()
-        phone_value = (item_data.get("phone") or "").strip()
-
-        def is_problem(status_value):
-            s = (status_value or "").strip().lower()
-            if not s:
-                return False
-            return ("fehler" in s) or ("fehlgeschlagen" in s) or ("abgelehnt" in s)
-
-        def is_in_progress(status_value):
-            s = (status_value or "").strip().lower()
-            if not s:
-                return False
-            return ("gestartet" in s) or ("übertragen" in s) or ("gepuffert" in s) or ("akzeptiert" in s)
-
-        def is_best_upload(status_value):
-            s = (status_value or "").strip().lower()
-            return "erfolgreich" in s
-
-        def is_best_email(status_value):
-            s = (status_value or "").strip().lower()
-            # E-Mail kennt i.d.R. keinen "zugestellt"-Rückkanal.
-            return ("gesendet" in s) or ("zugestellt" in s) or ("erfolgreich" in s)
-
-        def is_best_sms(status_value):
-            s = (status_value or "").strip().lower()
-            # Für SMS gilt erst "zugestellt" als bester Endzustand.
-            return ("zugestellt" in s) or ("erfolgreich" in s)
-
-        upload_problem = is_problem(upload_status)
-        email_problem = bool(email_value) and is_problem(email_status)
-        sms_problem = bool(phone_value) and is_problem(sms_status)
-        has_problem = upload_problem or email_problem or sms_problem
-        if has_problem:
-            return "Problem"
-
-        sms_sent_waiting_delivery = bool(phone_value) and ("gesendet" in sms_status.lower()) and not is_best_sms(sms_status)
-        if sms_sent_waiting_delivery:
-            return "In Bearbeitung"
-
-        if any(is_in_progress(s) for s in (upload_status, email_status, sms_status)):
-            return "In Bearbeitung"
-
-        upload_is_best = is_best_upload(upload_status)
-        email_is_best = (not email_value) or is_best_email(email_status)
-        sms_is_best = (not phone_value) or is_best_sms(sms_status)
-        if upload_is_best and email_is_best and sms_is_best:
-            return "Erfolgreich"
-
-        # Abgeschlossen, aber nicht auf Bestwert in allen Unter-Status.
-        if upload_status or email_status or sms_status:
-            return "Teilweise"
-
-        return "Unbekannt"
+        return build_overall_status(item_data)
 
     def get_status_icon(self, status_text, context_key=""):
         """Erzeugt ein farbiges Kreis-Icon basierend auf dem Status-Text (mit Cache)."""
@@ -1242,6 +1204,10 @@ class MainWindow(QMainWindow):
             color = "red"
         elif "in bearbeitung" in lower_status:
             color = "blue"
+        elif "komplett" in lower_status:
+            color = "#16A34A"
+        elif "versendet" in lower_status:
+            color = "#86EFAC"
         elif "erfolgreich" in lower_status:
             color = "green"
         elif "zugestellt" in lower_status:
@@ -1283,7 +1249,7 @@ class MainWindow(QMainWindow):
         """Verzögertes Laden: Tab wird zuerst gezeichnet, dann Historie aktualisiert."""
         if self._history_refresh_busy():
             return
-        self.reload_history_from_disk_and_refresh(force=False, check_sms=False)
+        self.reload_history_from_disk_and_refresh(force=False, check_sms=True)
 
     @Slot()
     def on_history_selection_changed(self):
@@ -2262,7 +2228,7 @@ class MainWindow(QMainWindow):
 
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 
 class SmsStatusWorker(QObject):
     """Worker-Klasse für die asynchrone Abfrage des SMS-Status."""
@@ -2277,12 +2243,11 @@ class SmsStatusWorker(QObject):
     def run(self):
         """Führt die API-Abfrage aus und aktualisiert die Historie."""
         try:
-            journal_data = asyncio.run(self.sms_client.get_sms_journal(limit=100))
+            journal_data = asyncio.run(self.sms_client.get_sms_journal(limit=200))
             entries = []
             if isinstance(journal_data, list):
                 entries = journal_data
             elif isinstance(journal_data, dict):
-                # API kann je nach Endpoint/Version unterschiedliche Wrapper liefern.
                 for key in ("messages", "items", "data", "entries"):
                     candidate = journal_data.get(key)
                     if isinstance(candidate, list):
@@ -2290,87 +2255,12 @@ class SmsStatusWorker(QObject):
                         break
 
             if entries:
-                self._update_history_with_journal(entries)
+                updated_items = update_history_from_journal(self.history_manager.history, entries)
+                if updated_items:
+                    self.history_manager.save_history()
+                    for item in updated_items:
+                        self.item_updated.emit(dict(item))
         except Exception as e:
             logging.getLogger(__name__).error(f"Fehler bei der SMS-Status-Prüfung im Worker: {e}")
         finally:
             self.finished.emit()
-
-    def _translate_status(self, status):
-        lower_status = (status or "").lower()
-        if "delivered" in lower_status:
-            return "Zugestellt"
-        elif "notdelivered" in lower_status or "failed" in lower_status:
-            return "Fehlgeschlagen"
-        elif "buffered" in lower_status:
-            return "Gepuffert"
-        elif "transmitted" in lower_status:
-            return "Übertragen"
-        elif "accepted" in lower_status:
-            return "Akzeptiert"
-        elif "rejected" in lower_status:
-            return "Abgelehnt"
-        return status
-
-    def _update_history_with_journal(self, journal_data):
-        history = self.history_manager.history
-        updated = False
-
-        # Erstelle Lookups für effizienteres Matching
-        journal_by_id = {str(msg.get("id")): msg for msg in journal_data if msg.get("id")}
-        
-        from datetime import datetime
-        import time
-
-        def parse_iso(ts_str):
-            try:
-                # Einfacher Parser, ignoriert Zeitzonen für Differenzberechnung
-                clean_str = ts_str.replace('Z', '').split('+')[0].split('.')[0]
-                return time.mktime(time.strptime(clean_str, "%Y-%m-%dT%H:%M:%S"))
-            except Exception:
-                # Versuch alternatives Format z.B. "2024-02-13 05:50:58"
-                try:
-                    clean_str = ts_str.split('.')[0]
-                    return time.mktime(time.strptime(clean_str, "%Y-%m-%d %H:%M:%S"))
-                except Exception:
-                    return 0
-
-        for item in history:
-            # Nur aktualisieren, wenn nicht schon zugestellt/fehlgeschlagen
-            if item.get("sms_status") in ["Zugestellt", "Fehlgeschlagen"]:
-                pass
-                # Update still allows price to change or ID to be filled if missing
-            matched_msg = None
-            sms_id = str(item.get("sms_id") or "").strip()
-            if sms_id.lower() in {"none", "null", "nan"}:
-                sms_id = ""
-            
-            if sms_id and str(sms_id) in journal_by_id:
-                matched_msg = journal_by_id[str(sms_id)]
-
-            if matched_msg:
-                status_raw = matched_msg.get("dlr") or matched_msg.get("state", "")
-                translated_status = self._translate_status(status_raw)
-                price = matched_msg.get("price")
-                
-                changed = False
-                if translated_status and translated_status != item.get("sms_status"):
-                    item["sms_status"] = translated_status
-                    changed = True
-                
-                if price and price != item.get("sms_price"):
-                    item["sms_price"] = price
-                    changed = True
-                    
-                if not item.get("sms_id") and matched_msg.get("id"):
-                    item["sms_id"] = str(matched_msg.get("id"))
-                    changed = True
-                    
-                if changed:
-                    item["last_updated"] = datetime.now().isoformat()
-                    updated = True
-                    # Live-Update in die UI senden (thread-sicher via Qt-Signal).
-                    self.item_updated.emit(dict(item))
-
-        if updated:
-            self.history_manager.save_history()
