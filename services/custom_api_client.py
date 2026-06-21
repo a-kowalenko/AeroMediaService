@@ -358,7 +358,7 @@ class CustomApiClient(BaseClient):
         signals.connection_status_changed.emit("Nicht verbunden")
         signals.stop_monitoring.emit()
 
-    def get_dropbox_connection_status(self) -> str:
+    def get_dropbox_connection_status(self, *, verify=False) -> str:
         """Status der separaten Dropbox-Verbindung für Manifest-v1.1-Uploads."""
         app_key = self.config.get_secret(CUSTOM_DB_APP_KEY)
         app_secret = self.config.get_secret(CUSTOM_DB_APP_SECRET)
@@ -368,6 +368,9 @@ class CustomApiClient(BaseClient):
         if not refresh_token:
             return "Nicht verbunden"
 
+        if self.dbx is not None and not verify:
+            return "Verbunden"
+
         if self.dbx is not None:
             try:
                 account = self.dbx.users_get_current_account()
@@ -375,6 +378,9 @@ class CustomApiClient(BaseClient):
                 return f"Verbunden ({name})" if name else "Verbunden"
             except Exception:
                 self.dbx = None
+
+        if not verify:
+            return "Verbunden (nicht geprüft)"
 
         try:
             dbx = dropbox.Dropbox(

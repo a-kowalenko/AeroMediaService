@@ -47,6 +47,7 @@ from services.email_client import EmailClient
 from services.sms_client import SmsClient
 from settings import SettingsDialog
 from utils.constants import ICON_PATH
+from utils.loading_overlay import LoadingOverlay
 from utils.updater import initialize_updater, AskUpdateDialog, UpdateProgressDialog
 from utils.history_manager import HistoryManager
 
@@ -86,59 +87,12 @@ class StatusLight(QWidget):
         self.update()  # Löst ein paintEvent aus
 
 
-class HistoryRefreshOverlay(QWidget):
+class HistoryRefreshOverlay(LoadingOverlay):
     """Dezente halbtransparente Schicht mit zentriertem Lade-Indikator über dem Historien-Panel."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._angle = 0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._advance_angle)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-    def _advance_angle(self):
-        self._angle = (self._angle + 11) % 360
-        self.update()
-
-    def show_loading(self):
-        self._angle = 0
-        self._timer.start(40)
-        self.show()
-        self.raise_()
-
-    def hide_loading(self):
-        self._timer.stop()
-        self.hide()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        scrim = QColor(self.palette().color(QPalette.ColorRole.Window))
-        scrim.setAlpha(120)
-        painter.fillRect(self.rect(), scrim)
-
-        cx = self.width() / 2.0
-        cy = self.height() / 2.0
-        card = QRectF(cx - 40, cy - 40, 80, 80)
-        base = QColor(self.palette().color(QPalette.ColorRole.Base))
-        base.setAlpha(242)
-        painter.setBrush(base)
-        painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 1))
-        painter.drawRoundedRect(card, 14, 14)
-
-        ring = QRectF(cx - 22, cy - 22, 44, 44)
-        track = QPen(self.palette().color(QPalette.ColorRole.Mid))
-        track.setWidth(5)
-        track.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(track)
-        painter.drawArc(ring, 0, 360 * 16)
-
-        accent = QPen(self.palette().color(QPalette.ColorRole.Highlight))
-        accent.setWidth(5)
-        accent.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(accent)
-        painter.drawArc(ring, self._angle * 16, 280 * 16)
 
 
 class _HistoryPanelHost(QWidget):
@@ -184,6 +138,73 @@ class HistoryFileLoadWorker(QObject):
                 self.finished.emit(json.load(handle))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class StartupConnectWorker(QObject):
+    """Stellt beim Start die Cloud-Verbindung im Hintergrund her."""
+
+    finished = Signal(bool, str)
+
+    def __init__(self, config, db_client, custom_api_client):
+        super().__init__()
+        self.config = config
+        self.db_client = db_client
+        self.custom_api_client = custom_api_client
+        self.log = logging.getLogger(__name__)
+
+    @Slot()
+    def run(self):
+        try:
+            selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
+            if selected_cloud == "dropbox":
+                if not self.config.get_secret("db_refresh_token"):
+                    self.log.info("Keine gespeicherten Dropbox-Tokens, kein Auto-Start.")
+                    self.finished.emit(False, "")
+                    return
+                self.log.info("Stelle automatische Verbindung her (Dropbox)...")
+                if self.db_client.connect():
+                    self.log.info("Automatische Dropbox-Verbindung erfolgreich.")
+                    self.finished.emit(True, "Bereit.")
+                else:
+                    self.log.warning("Automatische Dropbox-Verbindung fehlgeschlagen.")
+                    self.finished.emit(False, "Automatische Verbindung fehlgeschlagen.")
+            elif selected_cloud == "custom_api":
+                if (
+                    not self.config.get_secret("custom_api_url")
+                    or not self.config.get_secret("custom_api_bearer_token")
+                ):
+                    self.log.info("Keine Custom API Konfiguration, kein Auto-Start.")
+                    self.finished.emit(False, "")
+                    return
+                self.log.info("Stelle automatische Verbindung her (Custom API)...")
+                if self.custom_api_client.connect():
+                    self.log.info("Automatische Custom API-Verbindung erfolgreich.")
+                    self._connect_dropbox_for_contact_markers()
+                    self.finished.emit(True, "Bereit.")
+                else:
+                    self.log.warning("Automatische Custom API-Verbindung fehlgeschlagen.")
+                    self.finished.emit(False, "Automatische Verbindung fehlgeschlagen.")
+            else:
+                self.finished.emit(False, "")
+        except Exception as exc:
+            self.log.error("Fehler bei automatischer Verbindung: %s", exc)
+            self.finished.emit(False, f"Verbindungsfehler: {exc}")
+
+    def _connect_dropbox_for_contact_markers(self):
+        if not self.config.get_secret("db_refresh_token"):
+            self.log.info(
+                "Kein Dropbox Refresh-Token — reine Kontakt-Marker können nicht über Dropbox hochgeladen werden."
+            )
+            return
+        if self.db_client.dbx is not None:
+            return
+        if self.db_client.connect():
+            self.log.info("Dropbox parallel verbunden (für reine Kontakt-Marker).")
+        else:
+            self.log.warning(
+                "Dropbox-Verbindung für reine Kontakt-Marker fehlgeschlagen — "
+                "diese Uploads werden scheitern, bis Dropbox verbunden ist."
+            )
 
 
 class ResendNotificationsDialog(QDialog):
@@ -390,6 +411,8 @@ class MainWindow(QMainWindow):
         # --- Update-Worker ---
         self.update_thread = None
         self.update_worker = None
+        self._startup_thread = None
+        self._startup_worker = None
 
         self.history_manager = HistoryManager()
         self._upload_recovery_done = False
@@ -434,9 +457,6 @@ class MainWindow(QMainWindow):
         # --- Threads starten ---
         self.uploader_thread.start()
 
-        # --- Automatische Verbindung und Start ---
-        self.auto_connect_and_start()
-
     def init_ui(self):
         """Erstellt die Benutzeroberfläche."""
 
@@ -444,6 +464,8 @@ class MainWindow(QMainWindow):
         main_widget = QWidget()
         main_layout = QVBoxLayout(main_widget)
         self.setCentralWidget(main_widget)
+        self._startup_overlay = LoadingOverlay(main_widget, message="Verbindung wird hergestellt…")
+        self._startup_overlay.hide()
 
         # Tab Widget
         self.tabs = QTabWidget()
@@ -770,6 +792,74 @@ class MainWindow(QMainWindow):
         else:
             return self.db_client
 
+    def _sync_startup_overlay_geometry(self):
+        central = self.centralWidget()
+        if central and hasattr(self, "_startup_overlay"):
+            self._startup_overlay.setGeometry(central.rect())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_startup_overlay_geometry()
+
+    @Slot()
+    def deferred_startup(self):
+        """Verzögerter Start: Cloud-Verbindung und Update-Prüfung nach dem ersten UI-Frame."""
+        self.log.info("Prüfe auf Auto-Verbindung...")
+        if self._should_auto_connect():
+            self.status_label.setText("Verbindung wird hergestellt…")
+            self._sync_startup_overlay_geometry()
+            self._startup_overlay.show_loading()
+            self._start_startup_connect_worker()
+        else:
+            self.status_label.setText("Bereit.")
+            self.update_status_light()
+            QTimer.singleShot(2500, self._start_share_link_migration)
+        self.log.info("Starte automatische Update-Prüfung im Hintergrund...")
+        initialize_updater(self, APP_VERSION, self.config, show_no_update_message=False)
+
+    def _should_auto_connect(self) -> bool:
+        selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
+        if selected_cloud == "dropbox":
+            return bool(self.config.get_secret("db_refresh_token"))
+        if selected_cloud == "custom_api":
+            return bool(
+                self.config.get_secret("custom_api_url")
+                and self.config.get_secret("custom_api_bearer_token")
+            )
+        return False
+
+    def _start_startup_connect_worker(self):
+        if self._startup_thread and self._startup_thread.isRunning():
+            return
+
+        self._startup_thread = QThread()
+        self._startup_worker = StartupConnectWorker(
+            self.config, self.db_client, self.custom_api_client
+        )
+        self._startup_worker.moveToThread(self._startup_thread)
+        self._startup_thread.started.connect(self._startup_worker.run)
+        self._startup_worker.finished.connect(self._on_startup_connect_finished)
+        self._startup_worker.finished.connect(self._startup_thread.quit)
+        self._startup_thread.finished.connect(self._startup_worker.deleteLater)
+        self._startup_thread.finished.connect(self._startup_thread.deleteLater)
+        self._startup_thread.finished.connect(lambda: setattr(self, "_startup_thread", None))
+        self._startup_thread.finished.connect(lambda: setattr(self, "_startup_worker", None))
+        self._startup_thread.start()
+
+    @Slot(bool, str)
+    def _on_startup_connect_finished(self, success, message):
+        self._startup_overlay.hide_loading()
+        self.active_cloud_client = self.get_active_cloud_client()
+        if success:
+            self.start_monitoring(skip_status_check=True)
+            self.status_label.setText(message or "Bereit.")
+        elif message:
+            self.status_label.setText(message)
+        else:
+            self.status_label.setText("Bereit.")
+        self.update_status_light()
+        QTimer.singleShot(2500, self._start_share_link_migration)
+
     def _auto_connect_dropbox_for_pure_contact_markers(self):
         """Dropbox parallel verbinden, falls reine Kontakt-Marker über DropboxClient laufen."""
         if not self.config.get_secret("db_refresh_token"):
@@ -786,48 +876,6 @@ class MainWindow(QMainWindow):
                 "Dropbox-Verbindung für reine Kontakt-Marker fehlgeschlagen — "
                 "diese Uploads werden scheitern, bis Dropbox verbunden ist."
             )
-
-    def auto_connect_and_start(self):
-        """
-        Versucht beim Start, automatisch eine Verbindung herzustellen,
-        das Monitoring zu starten und auf Updates zu prüfen.
-        """
-        self.log.info("Prüfe auf Auto-Verbindung...")
-
-        # Aktuellen Cloud-Client ermitteln
-        self.active_cloud_client = self.get_active_cloud_client()
-        selected_cloud = self.config.get_setting("selected_cloud_service", "dropbox")
-
-        # Auto-Verbindung je nach Service
-        if selected_cloud == "dropbox":
-            if self.config.get_secret("db_refresh_token"):
-                self.status_label.setText("Stelle automatische Verbindung her (Dropbox)...")
-                if self.db_client.connect():
-                    self.log.info("Automatische Dropbox-Verbindung erfolgreich.")
-                    self.start_monitoring()  # Startet automatisch das Monitoring
-                else:
-                    self.log.warning("Automatische Dropbox-Verbindung fehlgeschlagen.")
-                    self.status_label.setText("Automatische Verbindung fehlgeschlagen.")
-            else:
-                self.log.info("Keine gespeicherten Dropbox-Tokens, kein Auto-Start.")
-        elif selected_cloud == "custom_api":
-            if self.config.get_secret("custom_api_url") and self.config.get_secret("custom_api_bearer_token"):
-                self.status_label.setText("Stelle automatische Verbindung her (Custom API)...")
-                if self.custom_api_client.connect():
-                    self.log.info("Automatische Custom API-Verbindung erfolgreich.")
-                    self._auto_connect_dropbox_for_pure_contact_markers()
-                    self.start_monitoring()  # Startet automatisch das Monitoring
-                else:
-                    self.log.warning("Automatische Custom API-Verbindung fehlgeschlagen.")
-                    self.status_label.setText("Automatische Verbindung fehlgeschlagen.")
-            else:
-                self.log.info("Keine Custom API Konfiguration, kein Auto-Start.")
-
-        self.log.info("Starte automatische Update-Prüfung im Hintergrund...")
-        initialize_updater(self, APP_VERSION, self.config, show_no_update_message=False)
-
-        self.update_status_light()
-        QTimer.singleShot(2500, self._start_share_link_migration)
 
     # --- Slot-Funktionen (Reaktionen auf Events) ---
 
@@ -2093,7 +2141,7 @@ class MainWindow(QMainWindow):
 
     # --- Thread-Management ---
 
-    def start_monitoring(self):
+    def start_monitoring(self, *, skip_status_check=False):
         """Startet den Monitor-Thread, falls er nicht bereits läuft."""
         if self.monitor_thread and self.monitor_thread.isRunning():
             self.log.warning("Monitor-Thread läuft bereits.")
@@ -2106,7 +2154,7 @@ class MainWindow(QMainWindow):
 
         # Verwende den aktuell aktiven Cloud-Client
         active_client = self.get_active_cloud_client()
-        if active_client.get_connection_status() != "Verbunden":
+        if not skip_status_check and active_client.get_connection_status() != "Verbunden":
             self.log.error("Monitoring nicht gestartet: Keine Cloud-Verbindung.")
             self.update_monitoring_status(False)
             return

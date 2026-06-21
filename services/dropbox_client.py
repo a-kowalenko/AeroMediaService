@@ -32,6 +32,7 @@ class DropboxClient(BaseClient):
         self.log = logging.getLogger(__name__)
         self.link_shortener = LinkShortener(config_manager)
         self._upload_control = None
+        self._connection_verified = False
 
     def _upload_coop_tick(self):
         ctl = getattr(self, "_upload_control", None)
@@ -63,6 +64,7 @@ class DropboxClient(BaseClient):
                     oauth2_refresh_token=refresh_token
                 )
                 self.dbx.users_get_current_account()  # Testet die Verbindung
+                self._connection_verified = True
                 self.log.info("Erfolgreich mit Dropbox verbunden (via Refresh-Token).")
                 signals.connection_status_changed.emit("Verbunden")
                 return True
@@ -74,6 +76,7 @@ class DropboxClient(BaseClient):
                 self.log.error(f"Verbindungsfehler mit Refresh-Token: {e}")
                 signals.connection_status_changed.emit(f"Verbindungsfehler: {e}")
                 self.dbx = None
+                self._connection_verified = False
                 return False
 
         # 2. OAuth-Flow starten, wenn kein (gültiger) Token vorhanden ist
@@ -113,11 +116,13 @@ class DropboxClient(BaseClient):
                 app_secret=app_secret,
                 oauth2_refresh_token=oauth_result.refresh_token
             )
+            self._connection_verified = True
             signals.connection_status_changed.emit("Verbunden")
             return True
 
         except Exception as e:
             self.log.error(f"Fehler während des OAuth-Flows: {e}")
+            self._connection_verified = False
             signals.connection_status_changed.emit(f"OAuth-Fehler: {e}")
             return False
 
@@ -131,6 +136,7 @@ class DropboxClient(BaseClient):
             except Exception as e:
                 self.log.warning(f"Fehler beim Revoken des Tokens (Token evtl. schon ungültig): {e}")
         self.dbx = None
+        self._connection_verified = False
         signals.connection_status_changed.emit("Nicht verbunden")
         self.log.info("Verbindung getrennt.")
 
@@ -195,14 +201,18 @@ class DropboxClient(BaseClient):
                 time.sleep(delay)
         raise last_exc
 
-    def get_connection_status(self):
-        """Prüft die Verbindung und gibt den Status zurück."""
+    def get_connection_status(self, *, verify=False):
+        """Gibt den Verbindungsstatus zurück; Live-Prüfung nur bei verify=True oder ohne Cache."""
         if not self.dbx:
             return "Nicht verbunden"
+        if not verify and self._connection_verified:
+            return "Verbunden"
         try:
             self.dbx.users_get_current_account()
+            self._connection_verified = True
             return "Verbunden"
         except Exception as e:
+            self._connection_verified = False
             self.log.error(f"Verbindungsprüfung fehlgeschlagen: {e}")
             return "Verbindungsfehler"
 

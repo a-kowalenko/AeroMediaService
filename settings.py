@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QTextEdit
 )
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl, Slot
+from PySide6.QtCore import QUrl, Slot, QThread, QTimer, QObject, Signal
 from core.config import ConfigManager
 from services.base_client import BaseClient
 from services.custom_api_client import CUSTOM_DB_APP_KEY, CUSTOM_DB_APP_SECRET
@@ -21,7 +21,90 @@ from utils.link_shortener import (
     EXPIRES_PRESET_PERMANENT,
     LinkShortener,
 )
+from utils.loading_overlay import LoadingOverlay
 from utils.updater import UpdateProgressDialog, initialize_version_list_loader
+
+
+class SettingsStatusWorker(QObject):
+    """Lädt Cloud-Status und SMS-Guthaben im Hintergrund für den Einstellungsdialog."""
+
+    dropbox_ready = Signal(str, bool)
+    custom_dropbox_ready = Signal(str)
+    sms_balance_ready = Signal(str)
+    finished = Signal()
+
+    def __init__(self, db_client, custom_api_client, sms_api_key):
+        super().__init__()
+        self.db_client = db_client
+        self.custom_api_client = custom_api_client
+        self.sms_api_key = sms_api_key
+
+    @Slot()
+    def run(self):
+        try:
+            status = self.db_client.get_connection_status(verify=True)
+            self.dropbox_ready.emit(status, status == "Verbunden")
+        except Exception:
+            self.dropbox_ready.emit("Verbindungsfehler", False)
+
+        if self.custom_api_client is not None:
+            try:
+                custom_status = self.custom_api_client.get_dropbox_connection_status(verify=True)
+                self.custom_dropbox_ready.emit(custom_status)
+            except Exception:
+                self.custom_dropbox_ready.emit("Verbindungsfehler")
+
+        if self.sms_api_key:
+            url = "https://gateway.seven.io/api/balance"
+            headers = {"X-Api-Key": self.sms_api_key, "Accept": "application/json"}
+            try:
+                response = requests.get(url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    amount = data.get("amount")
+                    currency = data.get("currency", "€")
+                    if currency == "EUR":
+                        currency = "€"
+                    self.sms_balance_ready.emit(f"{amount} {currency}")
+                else:
+                    self.sms_balance_ready.emit(f"Fehler ({response.status_code})")
+            except requests.exceptions.RequestException:
+                self.sms_balance_ready.emit("Netzwerkfehler")
+        else:
+            self.sms_balance_ready.emit("")
+
+        self.finished.emit()
+
+
+class SmsBalanceWorker(QObject):
+    """Lädt das Seven.io-Guthaben im Hintergrund."""
+
+    result = Signal(str)
+    finished = Signal()
+
+    def __init__(self, api_key):
+        super().__init__()
+        self.api_key = api_key
+
+    @Slot()
+    def run(self):
+        url = "https://gateway.seven.io/api/balance"
+        headers = {"X-Api-Key": self.api_key, "Accept": "application/json"}
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                amount = data.get("amount")
+                currency = data.get("currency", "€")
+                if currency == "EUR":
+                    currency = "€"
+                self.result.emit(f"{amount} {currency}")
+            else:
+                self.result.emit(f"Fehler ({response.status_code})")
+        except requests.exceptions.RequestException:
+            self.result.emit("Netzwerkfehler")
+        finally:
+            self.finished.emit()
 
 
 class SettingsDialog(QDialog):
@@ -71,16 +154,32 @@ class SettingsDialog(QDialog):
         # 1. Einstellungen laden (blockiert Signale)
         self.load_settings()
 
-        # 2. Initialen Status setzen (fragt API 1x ab)
-        self.update_dropbox_status()
-        self.update_custom_dropbox_status()
-
-        # 3. Initiale Sichtbarkeit der Cloud-Gruppen setzen
+        # 2. Initiale Sichtbarkeit der Cloud-Gruppen setzen
         self.on_cloud_service_changed()
 
-        # 4. Initialen SMS-Guthaben-Stand abrufen
-        import PySide6.QtCore as QtCore
-        QtCore.QTimer.singleShot(0, self.refresh_seven_balance)
+        self._status_thread = None
+        self._status_worker = None
+        self._balance_thread = None
+        self._balance_worker = None
+        self._loading_overlay = LoadingOverlay(
+            self, message="Verbindungsstatus wird geladen…"
+        )
+        self._loading_overlay.hide()
+        QTimer.singleShot(0, self._begin_initial_status_load)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_loading_overlay"):
+            self._loading_overlay.setGeometry(self.rect())
+
+    def _begin_initial_status_load(self):
+        self._loading_overlay.setGeometry(self.rect())
+        self._loading_overlay.show_loading()
+        self._load_initial_status_async()
+
+    def _hide_initial_loading_overlay(self):
+        if hasattr(self, "_loading_overlay"):
+            self._loading_overlay.hide_loading()
 
     # --- Tab-Erstellung ---
 
@@ -592,42 +691,89 @@ class SettingsDialog(QDialog):
 
     def refresh_seven_balance(self):
         """Ruft die aktuelle Balance von Seven.io ab."""
-        import requests
-        
         is_sandbox = self.sms_sandbox_check.isChecked()
         if is_sandbox:
             api_key = self.sms_sandbox_api_key_edit.text()
         else:
             api_key = self.sms_api_key_edit.text()
-            
+
         if not api_key:
             self.sms_balance_label.setText("Aktuelle Balance: Fehlender API-Key")
             return
-            
+
         self.sms_balance_label.setText("Aktuelle Balance: Lade...")
         self.sms_balance_refresh_btn.setEnabled(False)
-        
-        def fetch_balance():
-            url = "https://gateway.seven.io/api/balance"
-            headers = {"X-Api-Key": api_key, "Accept": "application/json"}
-            try:
-                response = requests.get(url, headers=headers, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    amount = data.get("amount")
-                    # amount = f"{amount:.2f}"
-                    currency = data.get("currency", "€")
-                    if currency == "EUR":
-                         currency = "€"
-                    return f"{amount} {currency}"
-                else:
-                    return f"Fehler ({response.status_code})"
-            except requests.exceptions.RequestException as e:
-                return "Netzwerkfehler"
+        self._start_balance_worker(api_key)
 
-        balance_str = fetch_balance()
-        self.sms_balance_label.setText(f"Aktuelle Balance: {balance_str}")
+    def _start_balance_worker(self, api_key):
+        existing = getattr(self, "_balance_thread", None)
+        if existing and existing.isRunning():
+            return
+
+        self._balance_thread = QThread(self)
+        self._balance_worker = SmsBalanceWorker(api_key)
+        self._balance_worker.moveToThread(self._balance_thread)
+        self._balance_thread.started.connect(self._balance_worker.run)
+        self._balance_worker.result.connect(self._on_sms_balance_loaded)
+        self._balance_worker.finished.connect(self._balance_thread.quit)
+        self._balance_thread.finished.connect(self._balance_worker.deleteLater)
+        self._balance_thread.finished.connect(self._balance_thread.deleteLater)
+        self._balance_thread.finished.connect(lambda: setattr(self, "_balance_thread", None))
+        self._balance_thread.finished.connect(lambda: setattr(self, "_balance_worker", None))
+        self._balance_thread.start()
+
+    @Slot(str)
+    def _on_sms_balance_loaded(self, balance_str):
+        if balance_str:
+            self.sms_balance_label.setText(f"Aktuelle Balance: {balance_str}")
+        else:
+            self.sms_balance_label.setText("Aktuelle Balance: Fehlender API-Key")
         self.sms_balance_refresh_btn.setEnabled(True)
+
+    def _load_initial_status_async(self):
+        existing = getattr(self, "_status_thread", None)
+        if existing and existing.isRunning():
+            return
+
+        is_sandbox = self.sms_sandbox_check.isChecked()
+        api_key = (
+            self.sms_sandbox_api_key_edit.text()
+            if is_sandbox
+            else self.sms_api_key_edit.text()
+        )
+
+        self._status_thread = QThread(self)
+        self._status_worker = SettingsStatusWorker(self.client, self.custom_api_client, api_key)
+        self._status_worker.moveToThread(self._status_thread)
+        self._status_thread.started.connect(self._status_worker.run)
+        self._status_worker.dropbox_ready.connect(self._apply_dropbox_status)
+        self._status_worker.custom_dropbox_ready.connect(self._apply_custom_dropbox_status)
+        self._status_worker.sms_balance_ready.connect(self._on_sms_balance_loaded)
+        self._status_worker.finished.connect(self._hide_initial_loading_overlay)
+        self._status_worker.finished.connect(self._status_thread.quit)
+        self._status_thread.finished.connect(self._status_worker.deleteLater)
+        self._status_thread.finished.connect(self._status_thread.deleteLater)
+        self._status_thread.finished.connect(lambda: setattr(self, "_status_thread", None))
+        self._status_thread.finished.connect(lambda: setattr(self, "_status_worker", None))
+        self._status_thread.start()
+
+    @Slot(str, bool)
+    def _apply_dropbox_status(self, status, is_connected):
+        self.db_status_label.setText(f"Status: {status}")
+        if is_connected:
+            self.db_connect_button.setText("Verbindung trennen")
+            self.db_app_key_edit.setEnabled(False)
+            self.db_app_secret_edit.setEnabled(False)
+        else:
+            self.db_connect_button.setText("Mit Dropbox verbinden")
+            self.db_app_key_edit.setEnabled(True)
+            self.db_app_secret_edit.setEnabled(True)
+        self.update_connect_button_state(is_connected)
+
+    @Slot(str)
+    def _apply_custom_dropbox_status(self, status):
+        self.custom_db_status_label.setText(f"Status: {status}")
+        self.update_custom_dropbox_connect_button()
 
     # --------------------
 
@@ -929,9 +1075,8 @@ class SettingsDialog(QDialog):
             self.custom_db_status_label.setText("Status: Client nicht verfügbar")
             self.update_custom_dropbox_connect_button()
             return
-        status = client.get_dropbox_connection_status()
-        self.custom_db_status_label.setText(f"Status: {status}")
-        self.update_custom_dropbox_connect_button()
+        status = client.get_dropbox_connection_status(verify=True)
+        self._apply_custom_dropbox_status(status)
 
     def toggle_custom_dropbox_connection(self):
         client = self._resolve_custom_api_client()
@@ -972,22 +1117,9 @@ class SettingsDialog(QDialog):
         Aktualisiert die GUI und ruft update_connect_button_state
         mit dem bereits abgerufenen Status auf.
         """
-        status = self.client.get_connection_status()  # ERSTER UND EINZIGER AUFRUF
-        self.db_status_label.setText(f"Status: {status}")
-
-        is_connected = (status == "Verbunden")
-
-        if is_connected:
-            self.db_connect_button.setText("Verbindung trennen")
-            self.db_app_key_edit.setEnabled(False)
-            self.db_app_secret_edit.setEnabled(False)
-        else:
-            self.db_connect_button.setText("Mit Dropbox verbinden")
-            self.db_app_key_edit.setEnabled(True)
-            self.db_app_secret_edit.setEnabled(True)
-
-        # Ruft die Helferfunktion mit dem Ergebnis auf, um zweiten API-Call zu vermeiden
-        self.update_connect_button_state(is_connected)
+        status = self.client.get_connection_status(verify=True)
+        is_connected = status == "Verbunden"
+        self._apply_dropbox_status(status, is_connected)
 
     # --- Custom API Verbindungslogik ---
 
