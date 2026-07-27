@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
     QMessageBox, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QAbstractItemView, QSplitter,
-    QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QGroupBox,
+    QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QGroupBox, QMenu, QInputDialog,
 )
 
 from PySide6.QtCore import QCoreApplication, QProcess, QThread, QTimer, QRectF, Slot, Qt, Signal, QObject
@@ -23,6 +23,14 @@ from core.uploader import UploaderThread
 from core.upload_queue_registry import UploadQueueRegistry
 from core.retry_upload import retry_upload_from_history, RETRYABLE_STATUSES
 from core.history_status import build_overall_status, history_entry_needs_sms_journal_check
+from core.manual_status import (
+    ACTION_MARK_COMPLETE,
+    ACTION_MARK_SENT,
+    ACTION_RESOLVE_PROBLEM,
+    build_manual_status_update,
+    collect_manual_status_warnings,
+    format_manual_status_summary,
+)
 from core.sms_history_sync import update_history_from_journal
 from core.resend_notifications import (
     can_resend_notifications,
@@ -629,6 +637,27 @@ class MainWindow(QMainWindow):
         )
         self.resend_notifications_btn.clicked.connect(self.on_resend_notifications_clicked)
         hist_top_layout.addWidget(self.resend_notifications_btn)
+
+        self.manual_status_btn = QPushButton("Status setzen")
+        self.manual_status_btn.setEnabled(False)
+        self.manual_status_btn.setToolTip(
+            "Gesamtstatus manuell setzen (Komplett, Versendet oder Problem auflösen)"
+        )
+        manual_status_menu = QMenu(self)
+        manual_status_menu.addAction(
+            "Als Komplett markieren",
+            lambda: self.on_manual_status_action(ACTION_MARK_COMPLETE),
+        )
+        manual_status_menu.addAction(
+            "Als Versendet markieren",
+            lambda: self.on_manual_status_action(ACTION_MARK_SENT),
+        )
+        manual_status_menu.addAction(
+            "Problem auflösen",
+            lambda: self.on_manual_status_action(ACTION_RESOLVE_PROBLEM),
+        )
+        self.manual_status_btn.setMenu(manual_status_menu)
+        hist_top_layout.addWidget(self.manual_status_btn)
 
         self.delete_selected_btn = QPushButton("Ausgewählte löschen")
         self.delete_selected_btn.clicked.connect(self.delete_selected_history)
@@ -1308,6 +1337,7 @@ class MainWindow(QMainWindow):
             self._populate_contact_card(None)
             self._update_retry_upload_button_state()
             self._update_resend_notifications_button_state()
+            self._update_manual_status_button_state()
             return
 
         row = selected_items[0].row()
@@ -1317,6 +1347,7 @@ class MainWindow(QMainWindow):
             self._populate_contact_card(None)
             self._update_retry_upload_button_state()
             self._update_resend_notifications_button_state()
+            self._update_manual_status_button_state()
             return
 
         item_data = date_item.data(Qt.ItemDataRole.UserRole + 1)
@@ -1325,12 +1356,14 @@ class MainWindow(QMainWindow):
             self._populate_contact_card(None)
             self._update_retry_upload_button_state()
             self._update_resend_notifications_button_state()
+            self._update_manual_status_button_state()
             return
 
         self.populate_detail_table(item_data)
         self._populate_contact_card(item_data)
         self._update_retry_upload_button_state(item_data)
         self._update_resend_notifications_button_state(item_data)
+        self._update_manual_status_button_state(item_data)
 
     def _update_retry_upload_button_state(self, item_data=None):
         if item_data is None:
@@ -1406,6 +1439,56 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Erneut hochladen", message)
         self.refresh_history_table(maintain_page=True)
         self._update_retry_upload_button_state()
+
+    def _update_manual_status_button_state(self, item_data=None):
+        self.manual_status_btn.setEnabled(bool(item_data or self.get_selected_history_id()))
+
+    @Slot(str)
+    def on_manual_status_action(self, action: str):
+        entry_id = self.get_selected_history_id()
+        entry = self.get_history_entry_by_id(entry_id)
+        if not entry:
+            return
+
+        warnings = collect_manual_status_warnings(entry, action)
+        if warnings:
+            warning_text = "\n".join(f"• {line}" for line in warnings)
+            reply = QMessageBox.question(
+                self,
+                "Status manuell setzen",
+                f"{warning_text}\n\nFortfahren?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        reason, ok = QInputDialog.getText(
+            self,
+            "Status manuell setzen",
+            f"Aktion: {action}\nOptionaler Grund (leer lassen zum Überspringen):",
+        )
+        if not ok:
+            return
+
+        try:
+            payload = build_manual_status_update(entry, action, reason=reason)
+        except ValueError as exc:
+            QMessageBox.information(self, "Status manuell setzen", str(exc))
+            return
+
+        self.history_manager.add_or_update(payload)
+        self._sync_history_loaded_mtime()
+        self.refresh_history_table(maintain_page=True)
+
+        refreshed = self.get_history_entry_by_id(entry_id)
+        if refreshed:
+            self.populate_detail_table(refreshed)
+            self._populate_contact_card(refreshed)
+            self._update_retry_upload_button_state(refreshed)
+            self._update_resend_notifications_button_state(refreshed)
+
+        new_overall = build_overall_status(refreshed) if refreshed else action
+        self.status_label.setText(f"Status manuell gesetzt: {new_overall}")
 
     def _populate_contact_card(self, item_data):
         """Befüllt die Kontakt-Karte aus einem Historieneintrag."""
@@ -1735,6 +1818,9 @@ class MainWindow(QMainWindow):
         details = []
         details.append(("Verzeichnis", item_data.get("dir_name", "")))
         details.append(("Upload-Status", item_data.get("status", "")))
+        details.append(("E-Mail-Status", item_data.get("email_status", "") or "—"))
+        details.append(("SMS-Status", item_data.get("sms_status", "") or "—"))
+        details.append(("Manueller Status", format_manual_status_summary(item_data)))
         details.append(("Download-Link", item_data.get("share_link", "") or "—"))
         details.append(("Wiederversände", format_resend_history_summary(item_data)))
 
@@ -1758,6 +1844,20 @@ class MainWindow(QMainWindow):
             else:
                 summary = f"{at_display} — {channels} → E-Mail: {email_st}, SMS: {sms_st}"
             details.append((f"Resend {idx + 1}", summary))
+
+        status_change_log = item_data.get("status_change_log") or []
+        for idx, log_entry in enumerate(status_change_log[:5]):
+            at_raw = (log_entry.get("at") or "").strip()
+            at_display = at_raw.replace("T", " ")[:16] if at_raw else "—"
+            action = log_entry.get("action") or "—"
+            reason = (log_entry.get("reason") or "").strip()
+            to_status = (log_entry.get("to") or {}).get("status") or "—"
+            to_email = (log_entry.get("to") or {}).get("email_status") or "—"
+            to_sms = (log_entry.get("to") or {}).get("sms_status") or "—"
+            summary = f"{at_display} — {action} → Upload: {to_status}, E-Mail: {to_email}, SMS: {to_sms}"
+            if reason:
+                summary = f"{summary} ({reason})"
+            details.append((f"Statusänderung {idx + 1}", summary))
 
         self.detail_table.setRowCount(len(details))
         for i, (key, value) in enumerate(details):

@@ -75,6 +75,8 @@ def match_history_entry_to_journal(item: dict, journal_data: list[dict]) -> dict
 
 def apply_journal_message_to_item(item: dict, matched_msg: dict) -> bool:
     """Schreibt DLR-Status, Preis und sms_id in den Historieneintrag."""
+    if item.get("sms_status_locked"):
+        return False
     status_raw = matched_msg.get("dlr") or matched_msg.get("state") or matched_msg.get("status") or ""
     translated_status = translate_sms_dlr_status(status_raw)
     price = matched_msg.get("price")

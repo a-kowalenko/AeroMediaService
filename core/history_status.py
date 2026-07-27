@@ -156,6 +156,8 @@ def build_overall_status(item_data: dict) -> str:
 
 def history_entry_needs_sms_journal_check(item: dict) -> bool:
     """True, wenn ein Journal-Abgleich den SMS-Status noch verbessern könnte."""
+    if item.get("sms_status_locked"):
+        return False
     phone = (item.get("phone") or "").strip()
     if not phone:
         return False
