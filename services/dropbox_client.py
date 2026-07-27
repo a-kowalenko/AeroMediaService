@@ -247,9 +247,9 @@ class DropboxClient(BaseClient):
                     self.log.warning(f"Datei nicht gefunden, überspringe: {local_path}")
 
         if total_size == 0:
-            self.log.warning("Keine Dateien (oder nur leere Dateien) zum Hochladen gefunden.")
+            self.log.error("Keine Dateien (oder nur leere Dateien) zum Hochladen gefunden.")
             signals.upload_progress_total.emit(100, 0, 0)
-            return True  # Technisch gesehen erfolgreich, da nichts zu tun war
+            return False
 
         files_to_upload.sort(key=lambda t: t[3])
         manifest = [{"name": t[3], "size": t[2]} for t in files_to_upload]

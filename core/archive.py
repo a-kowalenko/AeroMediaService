@@ -92,6 +92,36 @@ def is_customer_lookup_failure(exc: BaseException) -> bool:
     return "Customer-Lookup fehlgeschlagen" in str(exc)
 
 
+def is_marker_format_failure(exc: BaseException) -> bool:
+    """True bei dauerhaft ungültigem Marker-Inhalt (nicht API-Lookup)."""
+    return isinstance(exc, ValueError)
+
+
+def handle_marker_failure(
+    config_manager,
+    local_dir_path,
+    exc,
+    log=None,
+    marker_raw: Optional[str] = None,
+):
+    """Archiviert nach fehler bei ungültigem Marker, meldet Status und Historie."""
+    logger = log or logging.getLogger(__name__)
+    dir_name = os.path.basename(local_dir_path)
+    signals.upload_status_update.emit(f"Fehler: {dir_name}")
+
+    raw = (marker_raw or "").strip() or read_marker_raw(local_dir_path)
+    payload = {
+        "dir_name": dir_name,
+        "status": "Fehler",
+        "error_msg": str(exc),
+    }
+    if raw:
+        payload["marker_raw"] = raw
+
+    signals.upload_history_update.emit(payload)
+    archive_directory(config_manager, local_dir_path, "fehler", logger)
+
+
 def handle_customer_lookup_failure(
     config_manager,
     local_dir_path,

@@ -1025,8 +1025,8 @@ class CustomApiClient(BaseClient):
                     self.log.warning(f"Datei nicht gefunden: {local_path}")
 
         if not files_to_upload:
-            self.log.warning("Keine Dateien zum Hochladen gefunden.")
-            return True
+            self.log.error("Keine Dateien zum Hochladen gefunden.")
+            return False
 
         files_to_upload.sort(key=lambda x: x["name"])
         manifest = [{"name": f["name"], "size": f["size"], "type": f["type"]} for f in files_to_upload]
@@ -1927,8 +1927,8 @@ class CustomApiClient(BaseClient):
                 total_size += file_size
 
         if not files_to_upload:
-            self.log.warning("Keine Dateien zum Hochladen gefunden.")
-            return True
+            self.log.error("Keine Dateien zum Hochladen gefunden.")
+            return False
 
         files_to_upload.sort(key=lambda x: x["name"])
         manifest_fp = manifest_fingerprint(

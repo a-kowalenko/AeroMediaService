@@ -7,6 +7,7 @@ import shutil
 from typing import Any, Optional
 
 from core.archive import find_archived_folder
+from core.folder_stability import has_uploadable_files
 from core.monitor import resolve_kunde_from_marker, should_use_dropbox_client_for_marker
 from core.upload_markers import MARKER_PROCESSING, marker_paths
 from core.upload_queue_registry import UploadQueueRegistry
@@ -131,6 +132,11 @@ def retry_upload_from_history(
 
     if upload_registry.is_registered(target_path):
         raise ValueError(f"„{dir_name}“ ist bereits in der Upload-Warteschlange.")
+
+    if not has_uploadable_files(archived_path):
+        raise ValueError(
+            f"Ordner „{dir_name}“ enthält keine Medien-Dateien. Erneuter Upload ist nicht möglich."
+        )
 
     kunde = _resolve_kunde_from_history_entry(config_manager, history_entry)
     marker_raw = (history_entry.get("marker_raw") or "").strip()

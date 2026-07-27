@@ -23,6 +23,7 @@ class _PendingState:
     fingerprint: tuple[int, int]
     stable_since: float
     logged_waiting: bool = False
+    logged_no_media: bool = False
 
 
 def folder_content_fingerprint(dir_path: str) -> tuple[int, int]:
@@ -40,6 +41,11 @@ def folder_content_fingerprint(dir_path: str) -> tuple[int, int]:
             except OSError:
                 continue
     return total_bytes, file_count
+
+
+def has_uploadable_files(dir_path: str) -> bool:
+    """True wenn mindestens eine Datei außer Marker/Checkpoint vorhanden ist."""
+    return folder_content_fingerprint(dir_path)[1] > 0
 
 
 class FolderStabilityTracker:
@@ -67,10 +73,29 @@ class FolderStabilityTracker:
             self._pending.pop(key, None)
             return "removed"
 
+        fingerprint = folder_content_fingerprint(dir_path)
+        file_count = fingerprint[1]
+
+        if file_count == 0:
+            state = self._pending.get(key)
+            if state is None:
+                self._pending[key] = _PendingState(
+                    fingerprint=fingerprint,
+                    stable_since=time.monotonic(),
+                )
+                state = self._pending[key]
+            if not state.logged_no_media:
+                self._log.info(
+                    "Ordner '%s': Marker gefunden, warte auf Medien-Dateien...",
+                    os.path.basename(dir_path),
+                )
+                state.logged_no_media = True
+            return "waiting"
+
         if self._required <= 0:
+            self._pending.pop(key, None)
             return "stable"
 
-        fingerprint = folder_content_fingerprint(dir_path)
         now = time.monotonic()
         state = self._pending.get(key)
 

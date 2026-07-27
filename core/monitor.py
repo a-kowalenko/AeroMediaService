@@ -5,7 +5,12 @@ import requests
 from PySide6.QtCore import QThread, QWaitCondition, QMutex
 
 from models.kunde import Kunde, normalize_phone
-from core.archive import handle_customer_lookup_failure, is_customer_lookup_failure
+from core.archive import (
+    handle_customer_lookup_failure,
+    handle_marker_failure,
+    is_customer_lookup_failure,
+    is_marker_format_failure,
+)
 from core.signals import signals
 from core.upload_markers import (
     discard_stale_fertig_marker,
@@ -14,7 +19,7 @@ from core.upload_markers import (
     read_marker_raw,
 )
 from core.upload_queue_registry import UploadQueueRegistry
-from core.folder_stability import FolderStabilityTracker
+from core.folder_stability import FolderStabilityTracker, has_uploadable_files
 
 
 def _normalize_marker_type(raw_type):
@@ -263,6 +268,10 @@ def attempt_queue_upload_folder(
     if not os.path.isfile(fertig_path):
         return False
 
+    if not has_uploadable_files(full_dir_path):
+        log.debug("'%s': Marker vorhanden, aber keine Medien-Dateien — warte.", dir_name)
+        return False
+
     if not upload_registry.register(full_dir_path):
         log.debug("'%s' bereits in Upload-Warteschlange vorgemerkt.", dir_name)
         return False
@@ -326,6 +335,20 @@ def attempt_queue_upload_folder(
                 marker_raw=marker_raw or read_marker_raw(full_dir_path),
             )
             return False
+        if is_marker_format_failure(exc):
+            log.error(
+                "Ungültiger Marker für '%s', verschiebe nach Archiv/fehler: %s",
+                dir_name,
+                exc,
+            )
+            handle_marker_failure(
+                config_manager,
+                full_dir_path,
+                exc,
+                log,
+                marker_raw=marker_raw,
+            )
+            return False
         raise
 
 
@@ -353,6 +376,19 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
         if not os.path.isfile(processing_path):
             continue
         discard_stale_fertig_marker(full_dir_path, log)
+        if not has_uploadable_files(full_dir_path):
+            log.error(
+                "Recovery: '%s' ohne Medien-Dateien, verschiebe nach Archiv/fehler.",
+                dir_name,
+            )
+            handle_marker_failure(
+                config_manager,
+                full_dir_path,
+                ValueError("Keine Medien-Dateien im Ordner gefunden."),
+                log,
+                marker_raw=read_marker_raw(full_dir_path),
+            )
+            continue
         try:
             marker_raw = read_marker_file(processing_path, log)
             kunde = resolve_kunde_from_marker(config_manager, marker_raw)
@@ -391,6 +427,19 @@ def recover_stalled_upload_folders(config_manager, upload_queue, upload_registry
                     e,
                 )
                 handle_customer_lookup_failure(
+                    config_manager,
+                    full_dir_path,
+                    e,
+                    log,
+                    marker_raw=read_marker_raw(full_dir_path),
+                )
+            elif is_marker_format_failure(e):
+                log.error(
+                    "Recovery: Ungültiger Marker für '%s', verschiebe nach Archiv/fehler: %s",
+                    dir_name,
+                    e,
+                )
+                handle_marker_failure(
                     config_manager,
                     full_dir_path,
                     e,
