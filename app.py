@@ -3,7 +3,10 @@ import sys
 import logging
 import queue
 
-from PySide6.QtGui import QIcon, QPainter, QColor, QPixmap, QPalette, QPen, QFont
+from PySide6.QtGui import (
+    QIcon, QPainter, QColor, QPixmap, QPalette, QPen, QFont,
+    QTextCursor, QTextCharFormat, QKeySequence, QShortcut,
+)
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QProgressBar, QLabel, QStatusBar,
@@ -101,6 +104,188 @@ class HistoryRefreshOverlay(LoadingOverlay):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+
+def _make_selectable_detail_label(text, *, tooltip=None, icon=None) -> QWidget:
+    """Read-only Zelle mit direkt markierbarem Text (ohne Modal)."""
+    text = text or ""
+    tooltip = tooltip if tooltip is not None else text
+
+    text_label = QLabel(text)
+    text_label.setTextInteractionFlags(
+        Qt.TextInteractionFlag.TextSelectableByMouse |
+        Qt.TextInteractionFlag.TextSelectableByKeyboard
+    )
+    text_label.setWordWrap(True)
+    if tooltip:
+        text_label.setToolTip(tooltip)
+
+    if icon is not None and not icon.isNull():
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(6)
+        icon_label = QLabel()
+        icon_label.setPixmap(icon.pixmap(16, 16))
+        icon_label.setFixedSize(16, 16)
+        layout.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(text_label, 1)
+        if tooltip:
+            container.setToolTip(tooltip)
+        return container
+
+    text_label.setContentsMargins(6, 4, 6, 4)
+    return text_label
+
+
+class _MonitorLogFindBar(QWidget):
+    """Chrome-ähnliche Suche (Strg+F) für die Monitor-Log-Anzeige."""
+
+    def __init__(self, log_display: QTextEdit, parent=None):
+        super().__init__(parent)
+        self._log_display = log_display
+        self._match_cursors = []
+        self._current_index = -1
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 4)
+
+        layout.addWidget(QLabel("Suchen:"))
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Text in Logs suchen… (Strg+F)")
+        self.search_input.setClearButtonEnabled(True)
+        layout.addWidget(self.search_input, 1)
+
+        self.prev_btn = QPushButton("▲")
+        self.prev_btn.setFixedWidth(30)
+        self.prev_btn.setToolTip("Vorheriger Treffer (Umschalt+F3)")
+        layout.addWidget(self.prev_btn)
+
+        self.next_btn = QPushButton("▼")
+        self.next_btn.setFixedWidth(30)
+        self.next_btn.setToolTip("Nächster Treffer (F3)")
+        layout.addWidget(self.next_btn)
+
+        self.status_label = QLabel("")
+        self.status_label.setMinimumWidth(110)
+        layout.addWidget(self.status_label)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedWidth(30)
+        self.close_btn.setToolTip("Suche schließen (Esc)")
+        layout.addWidget(self.close_btn)
+
+        self.search_input.textChanged.connect(self._on_search_changed)
+        self.search_input.returnPressed.connect(self.find_next)
+        self.prev_btn.clicked.connect(self.find_previous)
+        self.next_btn.clicked.connect(self.find_next)
+        self.close_btn.clicked.connect(self.hide_bar)
+
+    def show_bar(self):
+        self.show()
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+        if self.search_input.text():
+            self.refresh()
+
+    def hide_bar(self):
+        self.hide()
+        self._match_cursors = []
+        self._current_index = -1
+        self._log_display.setExtraSelections([])
+        self._log_display.setFocus()
+
+    def refresh(self):
+        if not self.isVisible():
+            return
+        previous_query = self.search_input.text()
+        previous_index = self._current_index
+        self._collect_matches()
+        if not self._match_cursors:
+            self._current_index = -1
+        elif previous_query == self.search_input.text() and 0 <= previous_index < len(self._match_cursors):
+            self._current_index = previous_index
+        else:
+            self._current_index = 0
+        self._render_highlights()
+        self._scroll_to_current()
+
+    def find_next(self):
+        if not self.search_input.text():
+            return
+        if not self._match_cursors:
+            self.refresh()
+            return
+        self._current_index = (self._current_index + 1) % len(self._match_cursors)
+        self._render_highlights()
+        self._scroll_to_current()
+
+    def find_previous(self):
+        if not self.search_input.text():
+            return
+        if not self._match_cursors:
+            self.refresh()
+            return
+        self._current_index = (self._current_index - 1) % len(self._match_cursors)
+        self._render_highlights()
+        self._scroll_to_current()
+
+    def _on_search_changed(self, _text):
+        self.refresh()
+
+    def _collect_matches(self):
+        query = self.search_input.text()
+        document = self._log_display.document()
+        self._match_cursors = []
+
+        if not query:
+            self._log_display.setExtraSelections([])
+            self.status_label.setText("")
+            return
+
+        cursor = QTextCursor(document)
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        while True:
+            found = document.find(query, cursor)
+            if found.isNull():
+                break
+            self._match_cursors.append(QTextCursor(found))
+            cursor = found
+
+        if not self._match_cursors:
+            self._log_display.setExtraSelections([])
+            self.status_label.setText("Keine Treffer")
+
+    def _render_highlights(self):
+        if not self._match_cursors:
+            return
+
+        normal_fmt = QTextCharFormat()
+        normal_fmt.setBackground(QColor("#FFE066"))
+
+        current_fmt = QTextCharFormat()
+        current_fmt.setBackground(QColor("#FF9632"))
+
+        selections = []
+        for i, match_cursor in enumerate(self._match_cursors):
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = match_cursor
+            selection.format = current_fmt if i == self._current_index else normal_fmt
+            selections.append(selection)
+
+        self._log_display.setExtraSelections(selections)
+        self.status_label.setText(
+            f"{self._current_index + 1} von {len(self._match_cursors)}"
+        )
+
+    def _scroll_to_current(self):
+        if not (0 <= self._current_index < len(self._match_cursors)):
+            return
+        cursor = self._match_cursors[self._current_index]
+        self._log_display.setTextCursor(cursor)
+        self._log_display.ensureCursorVisible()
+        self._render_highlights()
 
 
 class _HistoryPanelHost(QWidget):
@@ -519,7 +704,23 @@ class MainWindow(QMainWindow):
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+        self.log_find_bar = _MonitorLogFindBar(self.log_display, self.monitor_tab)
+        self.log_find_bar.hide()
+        monitor_layout.addWidget(self.log_find_bar)
         monitor_layout.addWidget(self.log_display)
+
+        find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        find_shortcut.activated.connect(self._show_monitor_log_find_bar)
+
+        self._log_find_next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F3), self)
+        self._log_find_next_shortcut.activated.connect(self._find_next_log_match)
+
+        self._log_find_prev_shortcut = QShortcut(QKeySequence("Shift+F3"), self)
+        self._log_find_prev_shortcut.activated.connect(self._find_previous_log_match)
+
+        self._log_find_esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._log_find_esc_shortcut.activated.connect(self._hide_monitor_log_find_bar)
 
         # 3. Fortschrittsanzeigen
         progress_layout = QVBoxLayout()
@@ -690,7 +891,9 @@ class MainWindow(QMainWindow):
         self.detail_table.setHorizontalHeaderLabels(["Eigenschaft", "Wert"])
         self.detail_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.detail_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.detail_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.detail_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.detail_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.detail_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_details_splitter.addWidget(self.detail_table)
 
@@ -924,6 +1127,8 @@ class MainWindow(QMainWindow):
         formatted_msg = message.replace('\n', '<br>')
         html_message = f"<span style='color:{color};'>{formatted_msg}</span>"
         self.log_display.append(html_message)
+        if hasattr(self, "log_find_bar") and self.log_find_bar.isVisible() and self.log_find_bar.search_input.text():
+            self.log_find_bar.refresh()
         if self.autoscroll_check.isChecked():
             scrollbar = self.log_display.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
@@ -931,6 +1136,32 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_autoscroll_toggled(self, checked):
         self.config.save_setting("monitor_autoscroll", "true" if checked else "false")
+
+    def _show_monitor_log_find_bar(self):
+        """Öffnet die Log-Suche nur im Monitor-Tab (Strg+F)."""
+        if not hasattr(self, "monitor_tab") or self.tabs.currentWidget() != self.monitor_tab:
+            return
+        self.log_find_bar.show_bar()
+
+    def _hide_monitor_log_find_bar(self):
+        if hasattr(self, "log_find_bar") and self.log_find_bar.isVisible():
+            self.log_find_bar.hide_bar()
+
+    def _find_next_log_match(self):
+        if (
+            hasattr(self, "log_find_bar")
+            and self.log_find_bar.isVisible()
+            and self.tabs.currentWidget() == self.monitor_tab
+        ):
+            self.log_find_bar.find_next()
+
+    def _find_previous_log_match(self):
+        if (
+            hasattr(self, "log_find_bar")
+            and self.log_find_bar.isVisible()
+            and self.tabs.currentWidget() == self.monitor_tab
+        ):
+            self.log_find_bar.find_previous()
 
     @Slot(dict)
     def on_history_update(self, data):
@@ -1861,17 +2092,14 @@ class MainWindow(QMainWindow):
 
         self.detail_table.setRowCount(len(details))
         for i, (key, value) in enumerate(details):
-            key_item = QTableWidgetItem(key)
-            val_item = QTableWidgetItem(value)
-            key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            val_item.setFlags(val_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            val_item.setToolTip(value)
+            self.detail_table.setCellWidget(i, 0, _make_selectable_detail_label(key))
 
-            if "Status" in key:
-                val_item.setIcon(self.get_status_icon(value, key))
+            icon = self.get_status_icon(value, key) if "Status" in key else None
+            self.detail_table.setCellWidget(
+                i, 1, _make_selectable_detail_label(value, tooltip=value, icon=icon)
+            )
 
-            self.detail_table.setItem(i, 0, key_item)
-            self.detail_table.setItem(i, 1, val_item)
+        self.detail_table.resizeRowsToContents()
 
     def get_selected_history_id(self):
         """Liest die ID des aktuell selektierten Historien-Eintrags aus."""
@@ -1895,7 +2123,7 @@ class MainWindow(QMainWindow):
 
     @Slot(QTableWidgetItem)
     def on_history_cell_clicked(self, item):
-        """Zeigt den kompletten Zelltext in einem kopierbaren, nicht editierbaren Dialog."""
+        """Zeigt den kompletten Zelltext der Historie-Tabelle in einem kopierbaren Dialog."""
         if not item:
             return
 
